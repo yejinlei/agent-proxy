@@ -1,0 +1,51 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "read_timeout": 30,
+    "write_timeout": 120,
+    "max_header_bytes": 1048576
+  },
+  "providers": {
+    "sensenova": {
+      "base_url": "https://token.sensenova.cn",
+      "api_token": "sk-xxx",
+      "provider_type": "openai",
+      "models": [
+        "sensenova-6.7-flash-lite",
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "sensenova-u1-fast"
+      ],
+      "weight": 100,
+      "timeout_sec": 60,
+      "rate_limit": 100
+    }
+  },
+  "model_router": {
+    "model_to_provider": {
+      "sensenova-": "sensenova",
+      "deepseek-": "sensenova",
+      "glm-": "sensenova"
+    },
+    "default_provider": "sensenova",
+    "prefix_match": true
+  },
+  "monitor": {
+    "enabled": true,
+    "ui_path": "/ui",
+    "log_size": 10000,
+    "metrics_ttl": 3600
+  },
+  "rate_limit": {
+    "enabled": true,
+    "requests_per_second": 100,
+    "burst": 200,
+    "per_provider": false
+  },
+  "auth": {
+    "api_key": "",
+    "multi_key": false,
+    "multi_key_list": []
+  }
+}
