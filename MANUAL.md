@@ -20,15 +20,18 @@
 agent-proxy 是一个 AI 消息协议网关，提供两种启动模式：
 
 ```
-┌── 快速模式（--db N） ── 从 SQLite 选一条记录，立即启动 ──┐
-│  适用：单一端点、快速试用、脚本调用                          │
-│  特点：零配置、开箱即用、自动协议识别                        │
-└────────────────────────────────────────────────────────────┘
+┌── 快速模式（--mode simple）── 从 SQLite 选一条记录，立即启动 ──┐
+│  命令: agent-proxy run --mode simple --db 1                     │
+│  适用：单一端点、快速试用、脚本调用                               │
+│  特点：零配置、开箱即用、自动协议识别                             │
+└────────────────────────────────────────────────────────────────┘
 
-┌── 复杂模式（默认） ── 多 Provider、路由、Web UI ──┐
-│  适用：生产环境、多厂商调度、需要监控                        │
-│  特点：路由前缀匹配、限流、实时指标、美观面板                 │
-└────────────────────────────────────────────────────────────┘
+┌── 复杂模式（--mode complex）── 多 Provider、路由、Web UI ──┐
+│  命令: agent-proxy run --mode complex                          │
+│        agent-proxy run --mode complex --conf config.json       │
+│  适用：生产环境、多厂商调度、需要监控                           │
+│  特点：路由前缀匹配、限流、实时指标、美观面板                   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### 核心设计
@@ -72,12 +75,12 @@ go build -o agent-proxy ./cmd/server
 
 ```powershell
 # ① 添加一个代理（自动嗅探模型列表）
-.\agent-proxy.exe add --url https://token.sensenova.cn/v1 \
-                      --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
-                      --name sensenova
+agent-proxy db add --url https://token.sensenova.cn/v1 \
+                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
+                   --name sensenova
 
-# ② 启动
-.\agent-proxy.exe --db 1
+# ② 快速模式启动
+agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
 
 # ③ 使用（标准 OpenAI Chat Completions）
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -122,23 +125,30 @@ CREATE TABLE proxies (
 # 设置主代理 Key
 $env:AGENT_PROXY_API_KEY = "sk-your-key-here"
 
-# 启动
-.\agent-proxy.exe
+# 复杂模式启动
+agent-proxy run --mode complex --host 0.0.0.0 --port 8080
 ```
 
 控制台输出：
 
 ```
-🔗 Agent-Proxy starting...
-🚀 Agent-Proxy running on http://localhost:8080
+🚀 Agent-Proxy (复杂模式) running on http://0.0.0.0:8080
 📊 Web UI: http://localhost:8080/ui
 📝 Chat Completions: POST http://localhost:8080/v1/chat/completions
 ```
 
+### 配置文件启动
+
+```powershell
+agent-proxy run --mode complex --host 0.0.0.0 --port 8080 --conf config.json
+```
+
+配置文件示例见 `config.example.json`。
+
 ### 自定义监听地址
 
 ```powershell
-.\agent-proxy.exe --host 127.0.0.1 --port 9090
+agent-proxy run --mode complex --host 127.0.0.1 --port 9090
 ```
 
 ### 多 Provider 配置
@@ -177,21 +187,20 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 
 | 命令 | 说明 |
 |------|------|
-| `.\agent-proxy.exe` | 复杂模式启动（默认配置） |
-| `.\agent-proxy.exe --db 1` | 快速模式，使用 DB ID=1 的记录 |
-| `.\agent-proxy.exe --db 1 --port 9090` | 快速模式 + 自定义端口 |
-| `.\agent-proxy.exe --host 0.0.0.0 --port 8080` | 复杂模式 + 自定义地址 |
-| `.\agent-proxy.exe --dbpath ~/.my/proxies.db --db 1` | 指定自定义数据库路径 |
+| `agent-proxy run --mode complex --host 0.0.0.0 --port 8080` | 复杂模式（默认配置） |
+| `agent-proxy run --mode complex --conf config.json` | 复杂模式 + 配置文件 |
+| `agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1` | 快速模式 |
+| `agent-proxy --help` | 显示帮助 |
 
 ### DB 管理
 
 | 命令 | 示例 | 说明 |
 |------|------|------|
-| `list` | `.\agent-proxy.exe list` | 列出所有代理 |
-| `show` | `.\agent-proxy.exe show 1` | 查看 ID=1 详情 |
-| `add` | `.\agent-proxy.exe add --url <url> --key <key>` | 添加代理 |
-| `add` | `.\agent-proxy.exe add --url <url> --key <key> --name my --type anthropic` | 添加（指定类型） |
-| `rm` | `.\agent-proxy.exe rm 1` | 删除（需确认） |
+| `db list` | `agent-proxy db list` | 列出所有代理 |
+| `db show` | `agent-proxy db show 1` | 查看 ID=1 详情 |
+| `db add` | `agent-proxy db add --url <url> --key <key>` | 添加代理 |
+| `db add` | `agent-proxy db add --url <url> --key <key> --name my --type anthropic` | 添加（指定类型） |
+| `db rm` | `agent-proxy db rm 1` | 删除记录 |
 
 ### `add` 参数详解
 
