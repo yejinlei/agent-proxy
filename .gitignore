@@ -16,3 +16,6 @@ agent-proxy
 # Temp
 test-request.json
 test-stream.json
+
+# Release body (generated)
+release_body.json
