@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent-Proxy Monitor</title>
+<link rel="stylesheet" href="dashboard.css">
+<script src="https://cdn.jsdelivr.net/npm/uplot@latest/dist/uplot.iife.min.js"></script>
+</head>
+<body>
+<div class="container">
+<header>
+  <div class="header-left">
+    <h1>🔗 Agent-Proxy Monitor</h1>
+    <span class="subtitle">AI 消息协议网关 · 实时监控</span>
+  </div>
+  <div class="header-right">
+    <span class="badge" id="connection-status">● 已连接</span>
+    <span class="timestamp" id="last-updated"></span>
+  </div>
+</header>
+
+<!-- 指标卡片 -->
+<section class="metrics-grid" id="metrics-cards">
+  <div class="metric-card">
+    <div class="metric-label">QPS</div>
+    <div class="metric-value" id="qps">--</div>
+    <div class="metric-sub">每秒请求</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">P99 延迟</div>
+    <div class="metric-value" id="p99">--</div>
+    <div class="metric-sub">ms</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">错误率</div>
+    <div class="metric-value" id="error-rate">--</div>
+    <div class="metric-sub">%</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">活跃连接</div>
+    <div class="metric-value" id="active-conns">--</div>
+    <div class="metric-sub">条</div>
+  </div>
+</section>
+
+<!-- Provider 健康状态 -->
+<section class="panel">
+  <div class="panel-header">
+    <h2>Provider 状态</h2>
+    <span class="panel-count" id="provider-count"></span>
+  </div>
+  <div class="provider-list" id="provider-list">
+    <div class="provider-item empty">
+      <span class="dot dot-idle"></span>
+      <span class="provider-name">等待数据...</span>
+      <span class="provider-status">idle</span>
+    </div>
+  </div>
+</section>
+
+<!-- 请求量趋势图 -->
+<section class="panel">
+  <div class="panel-header">
+    <h2>请求量趋势</h2>
+    <span class="panel-subtitle">最近 60 秒 · 5秒刷新</span>
+  </div>
+  <div id="chart"></div>
+</section>
+
+<!-- 最近请求日志 -->
+<section class="panel">
+  <div class="panel-header">
+    <h2>最近请求日志</h2>
+    <span class="panel-subtitle" id="log-count">0 条记录</span>
+  </div>
+  <div class="table-wrapper">
+    <table class="log-table" id="log-table">
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>Method</th>
+          <th>Path</th>
+          <th>Model</th>
+          <th>Provider</th>
+          <th>Status</th>
+          <th>延迟</th>
+        </tr>
+      </thead>
+      <tbody id="log-tbody">
+        <tr class="empty-row"><td colspan="7">等待数据...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+</div>
+
+<!-- 错误/重连提示 -->
+<div class="toast" id="toast" hidden></div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>
