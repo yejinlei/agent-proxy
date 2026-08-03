@@ -1,0 +1,14 @@
+# Database
+*.db
+~/.agent-proxy/
+
+# IDE
+.vscode/
+.idea/
+
+# Env (keep .env.example, ignore actual .env)
+.env
+
+# Temp
+test-request.json
+test-stream.json
