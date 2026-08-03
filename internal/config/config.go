@@ -132,6 +132,7 @@ func (pc *ProviderConfig) ToProviderInfo() *schema.ProviderInfo {
 		Weight:     pc.Weight,
 		TimeoutSec: pc.TimeoutSec,
 		RateLimit:  pc.RateLimit,
-		Version:    pc.APIVersion,
+		Version:    pc.ProviderType, // provider 类型
+		APIVersion: pc.APIVersion,   // API 版本号
 	}
 }

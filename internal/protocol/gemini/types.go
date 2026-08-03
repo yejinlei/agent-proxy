@@ -19,22 +19,24 @@ import "encoding/json"
 
 // GenerateContentRequest Gemini 请求
 type GenerateContentRequest struct {
-	Contents          []Content            `json:"contents"`
-	Tools             *ToolConfig          `json:"tools,omitempty"`
-	SystemInstruction *Content             `json:"systemInstruction,omitempty"`
-	GenerationConfig  *GenerationConfig    `json:"generationConfig,omitempty"`
-	SafetySettings    []SafetySetting      `json:"safetySettings,omitempty"`
+	Model             string            `json:"model,omitempty"`
+	Contents          []Content         `json:"contents"`
+	Tools             *ToolConfig       `json:"tools,omitempty"`
+	SystemInstruction *Content          `json:"systemInstruction,omitempty"`
+	GenerationConfig  *GenerationConfig `json:"generationConfig,omitempty"`
+	SafetySettings    []SafetySetting   `json:"safetySettings,omitempty"`
+	Stream            bool              `json:"stream,omitempty"`
 }
 
 type Content struct {
-	Role  string `json:"role"`  // "user" | "model" | "system"
+	Role  string `json:"role"` // "user" | "model" | "system"
 	Parts []Part `json:"parts"`
 }
 
 type Part struct {
-	Text           string          `json:"text,omitempty"`
-	InlineData     *InlineData     `json:"inline_data,omitempty"`
-	FunctionCall   *FunctionCall   `json:"function_call,omitempty"`
+	Text             string            `json:"text,omitempty"`
+	InlineData       *InlineData       `json:"inline_data,omitempty"`
+	FunctionCall     *FunctionCall     `json:"function_call,omitempty"`
 	FunctionResponse *FunctionResponse `json:"function_response,omitempty"`
 }
 
@@ -55,27 +57,27 @@ type FunctionDeclaration struct {
 
 type FunctionCall struct {
 	Name string          `json:"name"`
-	Args json.RawMessage `json:"args"`  // JSON 对象！不是字符串
+	Args json.RawMessage `json:"args"` // JSON 对象！不是字符串
 }
 
 type FunctionResponse struct {
-	Name     string          `json:"name"`
-	Response map[string]interface{} `json:"response"`  // {result: "..."} 或嵌套对象
+	Name     string                 `json:"name"`
+	Response map[string]interface{} `json:"response"` // {result: "..."} 或嵌套对象
 }
 
 type GenerationConfig struct {
-	CandidateCount  int               `json:"candidateCount,omitempty"`
-	MaxOutputTokens int               `json:"maxOutputTokens,omitempty"`
-	StopSequences   []string          `json:"stopSequences,omitempty"`
-	Temperature     *float64          `json:"temperature,omitempty"`
-	TopP            *float64          `json:"topP,omitempty"`
-	TopK            *int              `json:"topK,omitempty"`
-	ResponseMimeType string           `json:"responseMimeType,omitempty"`  // "text/plain" | "application/json"
-	ResponseSchema  *ResponseSchema   `json:"responseSchema,omitempty"`
+	CandidateCount   int             `json:"candidateCount,omitempty"`
+	MaxOutputTokens  int             `json:"maxOutputTokens,omitempty"`
+	StopSequences    []string        `json:"stopSequences,omitempty"`
+	Temperature      *float64        `json:"temperature,omitempty"`
+	TopP             *float64        `json:"topP,omitempty"`
+	TopK             *int            `json:"topK,omitempty"`
+	ResponseMimeType string          `json:"responseMimeType,omitempty"` // "text/plain" | "application/json"
+	ResponseSchema   *ResponseSchema `json:"responseSchema,omitempty"`
 }
 
 type ResponseSchema struct {
-	Type  string                 `json:"type"`  // "OBJECT" | "STRING"
+	Type  string                 `json:"type"` // "OBJECT" | "STRING"
 	Props map[string]interface{} `json:"properties,omitempty"`
 	Keys  []string               `json:"required,omitempty"`
 }
@@ -87,17 +89,17 @@ type SafetySetting struct {
 
 // GenerateContentResponse Gemini 响应
 type GenerateContentResponse struct {
-	Candidates []Candidate `json:"candidates"`
+	Candidates    []Candidate    `json:"candidates"`
 	UsageMetadata *UsageMetadata `json:"usageMetadata,omitempty"`
-	ModelVersion string `json:"modelVersion,omitempty"`
+	ModelVersion  string         `json:"modelVersion,omitempty"`
 }
 
 type Candidate struct {
-	Content           *Content   `json:"content"`
-	FinishReason      string     `json:"finishReason"` // "STOP" | "MAX_TOKENS" | "SAFETY" | "RECITATION"
-	Index             int        `json:"index"`
-	SafetyRatings     []SafetyRating `json:"safetyRatings,omitempty"`
-	FinishMessage     string     `json:"finishMessage,omitempty"`
+	Content       *Content       `json:"content"`
+	FinishReason  string         `json:"finishReason"` // "STOP" | "MAX_TOKENS" | "SAFETY" | "RECITATION"
+	Index         int            `json:"index"`
+	SafetyRatings []SafetyRating `json:"safetyRatings,omitempty"`
+	FinishMessage string         `json:"finishMessage,omitempty"`
 }
 
 type SafetyRating struct {
@@ -114,9 +116,9 @@ type UsageMetadata struct {
 
 // StreamChunk Gemini 流式块（每行一个 JSON）
 type StreamChunk struct {
-	Candidates  []Candidate    `json:"candidates"`
+	Candidates    []Candidate    `json:"candidates"`
 	UsageMetadata *UsageMetadata `json:"usageMetadata"`
-	ModelVersion string         `json:"modelVersion"`
+	ModelVersion  string         `json:"modelVersion"`
 }
 
 // GeminiError
@@ -125,8 +127,8 @@ type GeminiError struct {
 }
 
 type ErrorDetail struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Status  string `json:"status"`
+	Code    int           `json:"code"`
+	Message string        `json:"message"`
+	Status  string        `json:"status"`
 	Details []interface{} `json:"details,omitempty"`
 }

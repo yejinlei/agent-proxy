@@ -1,8 +1,8 @@
-# agent-proxy — AI 消息协议网关
+# agent-proxy — AI 协议网关（4×4 全协议互转）
 
 ## 一句话
 
-agent-proxy 是 AI 协议翻译的中间件：将上游 LLM 端点的 OpenAI / Anthropic / Gemini / Responses API **统一转化为 Chat Completions 格式**，让你用一个接口打通所有厂商。
+agent-proxy 是 **4×4 全协议互转** 的 AI 协议中间件：OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站协议可转换为任意出站协议**，彻底打通不同厂商的 API 格式差异。
 
 三种模式覆盖所有场景：
 
@@ -32,10 +32,27 @@ agent-proxy db add --url https://token.sensenova.cn/v1 \
 # === 2. 快速模式启动（从 DB 选一条记录）===
 agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
 
-# === 3. 测试 ===
+# === 3. 使用任意协议调用 ===
+# 3a. OpenAI Compatible 入站
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hello"}]}'
+
+# 3b. Anthropic Messages 入站（自动翻译为下游 Provider 协议）
+curl -X POST http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: dummy" \
+  -d '{"model":"sensenova-6.7-flash-lite","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
+
+# 3c. Google Gemini 入站
+curl -X POST http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
+
+# 3d. OpenAI Responses 入站
+curl -X POST http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
 ## 命令总览
@@ -72,14 +89,16 @@ agent-proxy <subcommand> [options]
 | 限流 / 监控 | 无 | 有 |
 | 适用场景 | 快速试用、单一端点 | 生产、多厂商调度 |
 
-## 支持的协议
+## 4×4 协议互转矩阵
 
-| 上游协议 | 网关端点 | 自动翻译 |
-|---------|---------|---------|
-| OpenAI Compatible | `POST /v1/chat/completions` | ✅ 透传 |
-| Anthropic Messages | `POST /v1/messages` | ✅ 请求/响应/流式 |
-| Google Gemini | `POST /v1/models/{model}:generateContent` | ✅ 请求/响应/流式 |
-| OpenAI Responses | `POST /v1/responses` | ✅ 请求/响应/流式 |
+任意入站协议（行）可转换为任意出站协议（列），网关自动完成双向翻译：
+
+| 入站 ↓ \ 出站 → | OpenAI Compatible | Anthropic Messages | Google Gemini | OpenAI Responses |
+|----------------|------------------|-------------------|---------------|-----------------|
+| **OpenAI Compatible** `/v1/chat/completions` | ✅ 透传 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 |
+| **Anthropic Messages** `/v1/messages` | ✅ 请求/响应/流式 | ✅ 透传 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 |
+| **Google Gemini** `/v1/models/{model}:generateContent` | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 透传 | ✅ 请求/响应/流式 |
+| **OpenAI Responses** `/v1/responses` | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 透传 |
 
 ## 协议兼容性差异点
 

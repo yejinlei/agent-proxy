@@ -277,7 +277,8 @@ type ProviderInfo struct {
 	TimeoutSec int             // 请求超时秒数
 	RateLimit  int             // QPS 限制
 	Status     string          // "healthy" | "degraded" | "down"
-	Version    string          // API 版本 (v1 / beta)
+	Version    string          // Provider 类型 (openai/anthropic/gemini/responses)
+	APIVersion string          // API 版本号 (如 anthropic 2023-06-01)
 }
 
 // ─── Monitor ─────────────────────────────────────────────────────────
