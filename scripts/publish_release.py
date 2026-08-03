@@ -106,36 +106,82 @@ def main():
         "tag_name": TAG,
         "target_commitish": "master",
         "name": f"agent-proxy {TAG}",
-        "body": f"""## agent-proxy {TAG}
+        "body": f"""## agent-proxy {TAG} — 4×4 全协议互转 AI 网关
 
-### 下载
+### ✨ 核心功能
+
+**4×4 协议互转矩阵**：OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站协议可转换为任意出站协议**。
+
+| 入站 ↓ \\ 出站 → | OpenAI Compatible | Anthropic Messages | Google Gemini | OpenAI Responses |
+|----------------|------------------|-------------------|---------------|-----------------|
+| OpenAI Compatible `/v1/chat/completions` | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 |
+| Anthropic Messages `/v1/messages` | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 |
+| Google Gemini `/v1/models/{{model}}:generateContent` | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 |
+| OpenAI Responses `/v1/responses` | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 |
+
+翻译链路（N 协议只需 N 翻译器，而非 N×N）：
+```
+入站协议 TranslateRequest → InternalRequest → 路由 Provider
+→ TranslateToProvider → Provider 调用
+→ TranslateFromProvider → InternalResponse
+→ 入站协议 TranslateResponse → 出站响应
+```
+
+### 🚀 两种运行模式
+
+| 模式 | 命令 | 适用场景 |
+|------|------|---------|
+| **快速模式** | `agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1` | 单一端点、快速试用 |
+| **复杂模式** | `agent-proxy run --mode complex --conf config.json` | 生产环境、多厂商调度、Web UI 监控 |
+
+### 📥 下载
 
 {download_table}
 
 > 下载地址：{html_url}
 
-### 校验
+### 🔑 校验
 
 ```
 SHA256: {checksum}
 ```
 
-### 快速开始
+### 💻 快速开始
 
 ```powershell
-# 复杂模式
-$env:AGENT_PROXY_API_KEY = "sk-your-key"
-.\\agent-proxy.exe
+# === 1. 添加一个代理 ===
+agent-proxy db add --url https://token.sensenova.cn/v1 `
+                  --key sk-xxx --name sensenova
 
-# 快速模式
-.\\agent-proxy.exe add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
-.\\agent-proxy.exe --db 1
+# === 2. 快速模式启动 ===
+agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
+
+# === 3. 4 种协议任意调用 ===
+# OpenAI Compatible
+curl -X POST http://localhost:8080/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{{"model":"sensenova-6.7-flash-lite","messages":[{{"role":"user","content":"hello"}}]}}'
+
+# Anthropic Messages
+curl -X POST http://localhost:8080/v1/messages `
+  -H "Content-Type: application/json" `
+  -d '{{"model":"sensenova-6.7-flash-lite","max_tokens":1024,"messages":[{{"role":"user","content":"hello"}}]}}'
+
+# Google Gemini
+curl -X POST "http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent" `
+  -H "Content-Type: application/json" `
+  -d '{{"contents":[{{"role":"user","parts":[{{"text":"hello"}}]}}]}}'
+
+# OpenAI Responses
+curl -X POST http://localhost:8080/v1/responses `
+  -H "Content-Type: application/json" `
+  -d '{{"model":"sensenova-6.7-flash-lite","input":[{{"type":"message","role":"user","content":"hello"}}]}}'
 ```
 
-### 文档
+### 📚 文档
 
 - [README.md](https://github.com/{REPO}/blob/master/README.md)
-- [MANUAL.md](https://github.com/{REPO}/blob/master/MANUAL.md)
+- [MANUAL.md](https://github.com/{REPO}/blob/master/MANUAL.md) — 完整用户手册（协议兼容性、CLI 参考、Web UI、故障排查）
 """,
         "draft": False,
         "prerelease": False,
