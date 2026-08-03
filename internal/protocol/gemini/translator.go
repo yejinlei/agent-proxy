@@ -69,6 +69,336 @@ func NewGeminiTranslator() *GeminiTranslator {
 func (t *GeminiTranslator) Protocol() string { return "gemini" }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  REQUEST: Gemini GenerateContentRequest → InternalRequest (入站解析)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *GeminiTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+	var req GenerateContentRequest
+	if err := json.Unmarshal(rawReq, &req); err != nil {
+		return nil, err
+	}
+
+	// --- 1. systemInstruction → SystemPrompt ---
+	var systemContent json.RawMessage
+	if req.SystemInstruction != nil {
+		systemContent = json.RawMessage(fmt.Sprintf(`"%s"`, req.SystemInstruction.Parts[0].Text))
+	}
+
+	// --- 2. Contents → Messages ---
+	messages := contentsToMessages(req.Contents)
+
+	// --- 3. Tools → InternalTools ---
+	var tools []schema.InternalTool
+	if req.Tools != nil {
+		for _, decl := range req.Tools.FunctionDeclarations {
+			tools = append(tools, schema.InternalTool{
+				Type: "function",
+				Function: &schema.InternalFunction{
+					Name:        decl.Name,
+					Description: decl.Description,
+					Parameters:  decl.Parameters,
+				},
+			})
+		}
+	}
+
+	// --- 4. GenerationConfig → params ---
+	cfg := req.GenerationConfig
+	maxTokens := 0
+	if cfg != nil {
+		maxTokens = cfg.MaxOutputTokens
+	}
+
+	// 提取模型名
+	model := req.Model
+	if model == "" {
+		model = "gemini-1.5-flash"
+	}
+
+	return &schema.InternalRequest{
+		Model:         model,
+		Messages:      messages,
+		SystemPrompt:  systemContent,
+		Tools:         tools,
+		Stream:        req.Stream,
+		Temperature:   cfgToFloatPtr(req.GenerationConfig, "temperature"),
+		TopP:          cfgToFloatPtr(req.GenerationConfig, "top_p"),
+		TopK:          cfgToIntPtr(req.GenerationConfig, "top_k"),
+		MaxTokens:     maxTokens,
+		StopSequences: extractStopSequences(req.GenerationConfig),
+		UserID:        "",
+		RawRequest:    rawReq,
+		Protocol:      "gemini",
+	}, nil
+}
+
+func contentsToMessages(contents []Content) []schema.InternalMessage {
+	var msgs []schema.InternalMessage
+	for _, c := range contents {
+		msg := schema.InternalMessage{}
+		switch c.Role {
+		case "user":
+			msg.Role = schema.RoleUser
+		case "model":
+			msg.Role = schema.RoleAssistant
+		default:
+			msg.Role = schema.RoleUser
+		}
+
+		var textParts []string
+		var toolCalls []schema.InternalToolCall
+		var functionResponses []FunctionResponse
+
+		for _, part := range c.Parts {
+			if part.Text != "" {
+				textParts = append(textParts, part.Text)
+			}
+			if part.FunctionCall != nil {
+				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				toolCalls = append(toolCalls, schema.InternalToolCall{
+					ID:   fmt.Sprintf("gc_%d", len(toolCalls)),
+					Type: "function",
+					Function: struct {
+						Name         string          `json:"name"`
+						Arguments    string          `json:"arguments"`
+						RawArguments json.RawMessage `json:"-"`
+					}{
+						Name:         part.FunctionCall.Name,
+						Arguments:    string(argsJSON),
+						RawArguments: part.FunctionCall.Args,
+					},
+				})
+			}
+			if part.FunctionResponse != nil {
+				functionResponses = append(functionResponses, *part.FunctionResponse)
+			}
+		}
+
+		msg.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+		if len(toolCalls) > 0 {
+			msg.ToolCalls = toolCalls
+		}
+		msgs = append(msgs, msg)
+
+		// tool_result 归入后续 user 消息
+		for _, fr := range functionResponses {
+			var resultText string
+			if v, ok := fr.Response["result"]; ok {
+				resultText, _ = v.(string)
+			}
+			msgs = append(msgs, schema.InternalMessage{
+				Role:       schema.RoleTool,
+				Content:    json.RawMessage(`"` + resultText + `"`),
+				ToolCallID: fr.Name,
+				Name:       resultText,
+			})
+		}
+	}
+	return msgs
+}
+
+func cfgToFloatPtr(cfg *GenerationConfig, field string) *float64 {
+	if cfg == nil {
+		return nil
+	}
+	// 字段名从配置中获取
+	switch field {
+	case "temperature":
+		if cfg.Temperature != nil {
+			return cfg.Temperature
+		}
+	case "top_p":
+		if cfg.TopP != nil {
+			return cfg.TopP
+		}
+	}
+	return nil
+}
+
+func cfgToIntPtr(cfg *GenerationConfig, field string) *int {
+	if cfg == nil || field != "top_k" || cfg.TopK == nil {
+		return nil
+	}
+	return cfg.TopK
+}
+
+func extractStopSequences(cfg *GenerationConfig) []string {
+	if cfg != nil {
+		return cfg.StopSequences
+	}
+	return nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RESPONSE: InternalResponse → Gemini GenerateContentResponse (出站)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *GeminiTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
+	var parts []Part
+	var toolCalls []schema.InternalToolCall
+
+	for _, choice := range resp.Choices {
+		var text string
+		if choice.Message.Content != nil {
+			json.Unmarshal(choice.Message.Content, &text)
+		}
+		if text != "" {
+			parts = append(parts, Part{Text: text})
+		}
+		toolCalls = choice.Message.ToolCalls
+	}
+
+	for _, tc := range toolCalls {
+		parts = append(parts, Part{
+			FunctionCall: &FunctionCall{
+				Name: tc.Function.Name,
+				Args: tc.Function.RawArguments,
+			},
+		})
+	}
+
+	var usage *UsageMetadata
+	if resp.Usage != nil {
+		usage = &UsageMetadata{
+			PromptTokenCount:     resp.Usage.PromptTokens,
+			CandidatesTokenCount: resp.Usage.CompletionTokens,
+			TotalTokenCount:      resp.Usage.TotalTokens,
+		}
+	}
+
+	content := &Content{Role: "model", Parts: parts}
+	if len(parts) == 0 {
+		content.Parts = []Part{{Text: ""}}
+	}
+
+	finishReason := mapFinishReasonReverse(resp.Choices[0].FinishReason)
+
+	gemResp := GenerateContentResponse{
+		Candidates: []Candidate{
+			{
+				Index:        resp.Choices[0].Index,
+				Content:      content,
+				FinishReason: finishReason,
+			},
+		},
+		UsageMetadata: usage,
+	}
+
+	return json.Marshal(gemResp)
+}
+
+func mapFinishReasonReverse(reason string) string {
+	switch reason {
+	case "stop":
+		return "STOP"
+	case "length":
+		return "MAX_TOKENS"
+	case "tool_calls":
+		return "STOP"
+	case "content_filter":
+		return "SAFETY"
+	default:
+		return "STOP"
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STREAM: InternalStreamEvents → Gemini SSE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	for {
+		select {
+		case <-ctx.Done():
+			fn([]byte("data: [DONE]\n\n"), true)
+			return
+		case event, ok := <-events:
+			if !ok {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+
+			switch event.Type {
+			case "error":
+				errData := t.TranslateError(event.Error)
+				fn(append([]byte("data: "), errData...), false)
+				fn([]byte("\n\n"), false)
+				continue
+
+			case "delta":
+				if event.Data != nil && len(event.Data.Choices) > 0 {
+					choice := event.Data.Choices[0]
+					var parts []Part
+
+					if choice.Message.Content != nil {
+						var text string
+						json.Unmarshal(choice.Message.Content, &text)
+						if text != "" {
+							parts = append(parts, Part{Text: text})
+						}
+					}
+					for _, tc := range choice.Message.ToolCalls {
+						parts = append(parts, Part{
+							FunctionCall: &FunctionCall{
+								Name: tc.Function.Name,
+								Args: tc.Function.RawArguments,
+							},
+						})
+					}
+
+					content := &Content{Role: "model", Parts: parts}
+					if len(parts) == 0 {
+						content.Parts = []Part{{Text: ""}}
+					}
+
+					var usage *UsageMetadata
+					if event.Data.Usage != nil {
+						usage = &UsageMetadata{
+							PromptTokenCount:     event.Data.Usage.PromptTokens,
+							CandidatesTokenCount: event.Data.Usage.CompletionTokens,
+							TotalTokenCount:      event.Data.Usage.TotalTokens,
+						}
+					}
+
+					chunk := StreamChunk{
+						Candidates:    []Candidate{{Index: choice.Index, Content: content}},
+						ModelVersion:  event.Data.Model,
+						UsageMetadata: usage,
+					}
+					raw, _ := json.Marshal(chunk)
+					fn(append([]byte("data: "), raw...), false)
+					fn([]byte("\n\n"), false)
+				}
+				continue
+
+			case "done":
+				finishReason := "STOP"
+				if event.Data != nil && len(event.Data.Choices) > 0 {
+					finishReason = mapFinishReasonReverse(event.Data.Choices[0].FinishReason)
+				}
+				var usage *UsageMetadata
+				if event.Data != nil && event.Data.Usage != nil {
+					usage = &UsageMetadata{
+						PromptTokenCount:     event.Data.Usage.PromptTokens,
+						CandidatesTokenCount: event.Data.Usage.CompletionTokens,
+						TotalTokenCount:      event.Data.Usage.TotalTokens,
+					}
+				}
+				chunk := StreamChunk{
+					Candidates:    []Candidate{{Index: 0, FinishReason: finishReason, Content: &Content{Role: "model", Parts: []Part{{Text: ""}}}}},
+					UsageMetadata: usage,
+				}
+				raw, _ := json.Marshal(chunk)
+				fn(append([]byte("data: "), raw...), false)
+				fn([]byte("\n\n"), false)
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  REQUEST: InternalRequest → Gemini GenerateContentRequest
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -89,98 +419,98 @@ func (t *GeminiTranslator) TranslateToProvider(req *schema.InternalRequest) (*Ge
 	var tools *ToolConfig
 	if len(req.Tools) > 0 {
 		tools = &ToolConfig{
-            FunctionDeclarations: toolsToGemini(req.Tools),
-        }
+			FunctionDeclarations: toolsToGemini(req.Tools),
+		}
 	}
 
 	// --- 4. GenerationConfig ---
 	generationConfig := buildGenerationConfig(req)
 
 	return &GenerateContentRequest{
-        Contents:          contents,
-        SystemInstruction: systemInstruction,
-        Tools:             tools,
-        GenerationConfig:  generationConfig,
-    }, nil
+		Contents:          contents,
+		SystemInstruction: systemInstruction,
+		Tools:             tools,
+		GenerationConfig:  generationConfig,
+	}, nil
 }
 
 func buildSystemInstruction(raw json.RawMessage) *Content {
 	var text string
 	if err := json.Unmarshal(raw, &text); err == nil {
 		return &Content{
-            Role: "user", // Gemini systemInstruction 的 role 固定为 user
-            Parts: []Part{{Text: text}},
-        }
+			Role:  "user", // Gemini systemInstruction 的 role 固定为 user
+			Parts: []Part{{Text: text}},
+		}
 	}
 	// 兜底：透传原始 JSON 作为 text
 	return &Content{
-        Role: "user",
-        Parts: []Part{{Text: string(raw)}},
-    }
+		Role:  "user",
+		Parts: []Part{{Text: string(raw)}},
+	}
 }
 
 func messagesToGemini(msgs []schema.InternalMessage) ([]Content, error) {
 	var contents []Content
 
 	for _, msg := range msgs {
-        content := Content{
-            Parts: make([]Part, 0, 2), // 预留 text + function_call
-        }
+		content := Content{
+			Parts: make([]Part, 0, 2), // 预留 text + function_call
+		}
 
-        switch msg.Role {
-        case schema.RoleUser:
-            content.Role = "user"
-            // 提取文本
-            var text string
-            if msg.Content != nil {
-                if err := json.Unmarshal(msg.Content, &text); err == nil {
-                    content.Parts = append(content.Parts, Part{Text: text})
-                }
-            }
+		switch msg.Role {
+		case schema.RoleUser:
+			content.Role = "user"
+			// 提取文本
+			var text string
+			if msg.Content != nil {
+				if err := json.Unmarshal(msg.Content, &text); err == nil {
+					content.Parts = append(content.Parts, Part{Text: text})
+				}
+			}
 
-        case schema.RoleAssistant:
-            content.Role = "model" // ⚠️ Gemini 用 model 不是 assistant
-            var text string
-            if msg.Content != nil {
-                json.Unmarshal(msg.Content, &text)
-                if text != "" {
-                    content.Parts = append(content.Parts, Part{Text: text})
-                }
-            }
+		case schema.RoleAssistant:
+			content.Role = "model" // ⚠️ Gemini 用 model 不是 assistant
+			var text string
+			if msg.Content != nil {
+				json.Unmarshal(msg.Content, &text)
+				if text != "" {
+					content.Parts = append(content.Parts, Part{Text: text})
+				}
+			}
 
-            // ⚠️ tool_calls → function_call parts
-            for _, tc := range msg.ToolCalls {
-                part := Part{
-                    FunctionCall: &FunctionCall{
-                        Name: tc.Function.Name,
-                        Args: tc.Function.RawArguments, // 已是 JSON 对象
-                    },
-                }
-                content.Parts = append(content.Parts, part)
-            }
+			// ⚠️ tool_calls → function_call parts
+			for _, tc := range msg.ToolCalls {
+				part := Part{
+					FunctionCall: &FunctionCall{
+						Name: tc.Function.Name,
+						Args: tc.Function.RawArguments, // 已是 JSON 对象
+					},
+				}
+				content.Parts = append(content.Parts, part)
+			}
 
-        case schema.RoleTool:
-            // ⚠️ Gemini 将 tool 结果归为 user 消息
-            content.Role = "user"
-            // msg.Name 是 tool 结果文本，msg.ToolCallID 是 function 名
-            funcResp := &FunctionResponse{
-                Name: msg.ToolCallID, // 这里存 function 名
-                Response: map[string]interface{}{
-                    "result": msg.Name, // 结果文本
-                },
-            }
-            content.Parts = append(content.Parts, Part{
-                FunctionResponse: funcResp,
-            })
-        }
+		case schema.RoleTool:
+			// ⚠️ Gemini 将 tool 结果归为 user 消息
+			content.Role = "user"
+			// msg.Name 是 tool 结果文本，msg.ToolCallID 是 function 名
+			funcResp := &FunctionResponse{
+				Name: msg.ToolCallID, // 这里存 function 名
+				Response: map[string]interface{}{
+					"result": msg.Name, // 结果文本
+				},
+			}
+			content.Parts = append(content.Parts, Part{
+				FunctionResponse: funcResp,
+			})
+		}
 
-        if len(content.Parts) == 0 {
-            // 空消息，添加空文本避免非法
-            content.Parts = append(content.Parts, Part{Text: ""})
-        }
+		if len(content.Parts) == 0 {
+			// 空消息，添加空文本避免非法
+			content.Parts = append(content.Parts, Part{Text: ""})
+		}
 
-        contents = append(contents, content)
-    }
+		contents = append(contents, content)
+	}
 
 	return contents, nil
 }
@@ -191,32 +521,32 @@ func toolsToGemini(tools []schema.InternalTool) []FunctionDeclaration {
 		if tool.Function == nil {
 			continue
 		}
-        declarations = append(declarations, FunctionDeclaration{
-            Name:        tool.Function.Name,
-            Description: tool.Function.Description,
-            Parameters:  tool.Function.Parameters,
-        })
+		declarations = append(declarations, FunctionDeclaration{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+		})
 	}
 	return declarations
 }
 
 func buildGenerationConfig(req *schema.InternalRequest) *GenerationConfig {
 	cfg := &GenerationConfig{
-        MaxOutputTokens: req.MaxOutputTokens,
-        StopSequences:   req.StopSequences,
-        Temperature:     req.Temperature,
-        TopP:            req.TopP,
-        TopK:            req.TopK,
-    }
+		MaxOutputTokens: req.MaxOutputTokens,
+		StopSequences:   req.StopSequences,
+		Temperature:     req.Temperature,
+		TopP:            req.TopP,
+		TopK:            req.TopK,
+	}
 
-    if req.ResponseFormat != nil {
-        switch req.ResponseFormat.Type {
-        case "json_object", "json_schema":
-            cfg.ResponseMimeType = "application/json"
-        case "text":
-            cfg.ResponseMimeType = "text/plain"
-        }
-    }
+	if req.ResponseFormat != nil {
+		switch req.ResponseFormat.Type {
+		case "json_object", "json_schema":
+			cfg.ResponseMimeType = "application/json"
+		case "text":
+			cfg.ResponseMimeType = "text/plain"
+		}
+	}
 
 	return cfg
 }
@@ -250,21 +580,21 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 				textParts = append(textParts, part.Text)
 			}
 			if part.FunctionCall != nil {
-                // ⚠️ args 是对象，需 Marshal 为字符串
-                argsJSON, _ := json.Marshal(part.FunctionCall.Args)
-                toolCalls = append(toolCalls, schema.InternalToolCall{
-                    ID:   fmt.Sprintf("gc_%d", len(toolCalls)), // Gemini 无 ID，网关生成
-                    Type: "function",
-                    Function: struct {
-                        Name         string          `json:"name"`
-                        Arguments    string          `json:"arguments"`
-                        RawArguments json.RawMessage `json:"-"`
-                    }{
-                        Name:         part.FunctionCall.Name,
-                        Arguments:    string(argsJSON),
-                        RawArguments: part.FunctionCall.Args,
-                    },
-                })
+				// ⚠️ args 是对象，需 Marshal 为字符串
+				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				toolCalls = append(toolCalls, schema.InternalToolCall{
+					ID:   fmt.Sprintf("gc_%d", len(toolCalls)), // Gemini 无 ID，网关生成
+					Type: "function",
+					Function: struct {
+						Name         string          `json:"name"`
+						Arguments    string          `json:"arguments"`
+						RawArguments json.RawMessage `json:"-"`
+					}{
+						Name:         part.FunctionCall.Name,
+						Arguments:    string(argsJSON),
+						RawArguments: part.FunctionCall.Args,
+					},
+				})
 			}
 		}
 	}
@@ -279,10 +609,10 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 	var usage *schema.InternalUsage
 	if resp.UsageMetadata != nil {
 		usage = &schema.InternalUsage{
-            PromptTokens:     resp.UsageMetadata.PromptTokenCount,
-            CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
-            TotalTokens:      resp.UsageMetadata.TotalTokenCount,
-        }
+			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
+			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
+			TotalTokens:      resp.UsageMetadata.TotalTokenCount,
+		}
 	}
 
 	// --- 3. FinishReason 映射（兼容性 8） ---
@@ -292,15 +622,15 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 		ID:    "",
 		Model: candidate.Content.Role,
 		Choices: []schema.InternalChoice{
-            {
-                Index:        candidate.Index,
-                Message:      choiceMessage,
-                FinishReason: finishReason,
-            },
-        },
-        Usage:  usage,
-        Object: "chat.completion",
-    }, nil
+			{
+				Index:        candidate.Index,
+				Message:      choiceMessage,
+				FinishReason: finishReason,
+			},
+		},
+		Usage:  usage,
+		Object: "chat.completion",
+	}, nil
 }
 
 func mapFinishReason(reason string) string {
@@ -338,12 +668,12 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 	var chunk StreamChunk
 	if err := json.Unmarshal(raw, &chunk); err != nil {
 		return &schema.InternalStreamEvent{
-            Type: "error",
-            Error: &schema.StreamError{
-                Message: "parse error: " + err.Error(),
-                Code:    400,
-            },
-        }
+			Type: "error",
+			Error: &schema.StreamError{
+				Message: "parse error: " + err.Error(),
+				Code:    400,
+			},
+		}
 	}
 
 	if len(chunk.Candidates) == 0 {
@@ -355,16 +685,16 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 	// --- 检查结束条件 ---
 	if candidate.FinishReason != "" {
 		return &schema.InternalStreamEvent{
-            Type: "done",
-            Data: &schema.InternalStreamChunk{
-                Choices: []schema.InternalChoice{
-                    {
-                        Index:        candidate.Index,
-                        FinishReason: mapFinishReason(candidate.FinishReason),
-                    },
-                },
-            },
-        }
+			Type: "done",
+			Data: &schema.InternalStreamChunk{
+				Choices: []schema.InternalChoice{
+					{
+						Index:        candidate.Index,
+						FinishReason: mapFinishReason(candidate.FinishReason),
+					},
+				},
+			},
+		}
 	}
 
 	// --- 提取文本和 function_calls ---
@@ -373,25 +703,25 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 
 	if candidate.Content != nil {
 		for _, part := range candidate.Content.Parts {
-            if part.Text != "" {
-                deltaContent = json.RawMessage(`"` + part.Text + `"`)
-            }
-            if part.FunctionCall != nil {
-                argsJSON, _ := json.Marshal(part.FunctionCall.Args)
-                toolCalls = append(toolCalls, schema.InternalToolCall{
-                    ID:   fmt.Sprintf("gc_%d", len(toolCalls)),
-                    Type: "function",
-                    Function: struct {
-                        Name         string          `json:"name"`
-                        Arguments    string          `json:"arguments"`
-                        RawArguments json.RawMessage `json:"-"`
-                    }{
-                        Name:         part.FunctionCall.Name,
-                        Arguments:    string(argsJSON),
-                        RawArguments: part.FunctionCall.Args,
-                    },
-                })
-            }
+			if part.Text != "" {
+				deltaContent = json.RawMessage(`"` + part.Text + `"`)
+			}
+			if part.FunctionCall != nil {
+				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				toolCalls = append(toolCalls, schema.InternalToolCall{
+					ID:   fmt.Sprintf("gc_%d", len(toolCalls)),
+					Type: "function",
+					Function: struct {
+						Name         string          `json:"name"`
+						Arguments    string          `json:"arguments"`
+						RawArguments json.RawMessage `json:"-"`
+					}{
+						Name:         part.FunctionCall.Name,
+						Arguments:    string(argsJSON),
+						RawArguments: part.FunctionCall.Args,
+					},
+				})
+			}
 		}
 	}
 
@@ -408,10 +738,10 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 	var usage *schema.InternalUsage
 	if chunk.UsageMetadata != nil {
 		usage = &schema.InternalUsage{
-            PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
-            CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
-            TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
-        }
+			PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
+			CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
+			TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
+		}
 	}
 
 	return &schema.InternalStreamEvent{
@@ -420,53 +750,53 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 			ID:    "",
 			Model: chunk.ModelVersion,
 			Choices: []schema.InternalChoice{
-                {
-                    Index:        candidate.Index,
-                    Message:      msg,
-                    FinishReason: "",
-                },
-            },
-            Usage: usage,
-        },
+				{
+					Index:        candidate.Index,
+					Message:      msg,
+					FinishReason: "",
+				},
+			},
+			Usage: usage,
+		},
 	}
 }
 
 func (t *GeminiTranslator) TranslateStreamToCCSSE(ctx context.Context, events <-chan json.RawMessage, fn func(data []byte, isDone bool)) {
 	for {
 		select {
-        case <-ctx.Done():
-            fn([]byte("data: [DONE]\n\n"), true)
-            return
-        case raw, ok := <-events:
-            if !ok {
-                fn([]byte("data: [DONE]\n\n"), true)
-                return
-            }
+		case <-ctx.Done():
+			fn([]byte("data: [DONE]\n\n"), true)
+			return
+		case raw, ok := <-events:
+			if !ok {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
 
-            event := t.TranslateStreamEvent(raw)
-            if event == nil {
-                continue
-            }
+			event := t.TranslateStreamEvent(raw)
+			if event == nil {
+				continue
+			}
 
-            if event.Type == "done" {
-                fn([]byte("data: [DONE]\n\n"), true)
-                return
-            }
+			if event.Type == "done" {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
 
-            data := ToCCStreamChunk(event.Data)
-            fn(append([]byte("data: "), data...), false)
-            fn([]byte("\n\n"), false)
-        }
+			data := ToCCStreamChunk(event.Data)
+			fn(append([]byte("data: "), data...), false)
+			fn([]byte("\n\n"), false)
+		}
 	}
 }
 
 func (t *GeminiTranslator) TranslateError(err *schema.StreamError) json.RawMessage {
 	gemErr := GeminiError{
 		Error: &ErrorDetail{
-            Code:    err.Code,
-            Message: err.Message,
-            Status:  err.Type,
-        },
+			Code:    err.Code,
+			Message: err.Message,
+			Status:  err.Type,
+		},
 	}
 	data, _ := json.Marshal(gemErr)
 	return data
@@ -479,30 +809,30 @@ func ToCCStreamChunk(chunk *schema.InternalStreamChunk) json.RawMessage {
 
 	for i, choice := range chunk.Choices {
 		if choice.FinishReason != "" {
-            choices[i] = map[string]interface{}{
-                "index":         choice.Index,
-                "finish_reason": choice.FinishReason,
-            }
-            continue
-        }
+			choices[i] = map[string]interface{}{
+				"index":         choice.Index,
+				"finish_reason": choice.FinishReason,
+			}
+			continue
+		}
 
-        delta := map[string]interface{}{}
-        if choice.Message.Role != "" {
-            delta["role"] = string(choice.Message.Role)
-        }
-        if choice.Message.Content != nil {
-            var text string
-            json.Unmarshal(choice.Message.Content, &text)
-            delta["content"] = text
-        }
-        if len(choice.Message.ToolCalls) > 0 {
-            delta["tool_calls"] = choice.Message.ToolCalls
-        }
+		delta := map[string]interface{}{}
+		if choice.Message.Role != "" {
+			delta["role"] = string(choice.Message.Role)
+		}
+		if choice.Message.Content != nil {
+			var text string
+			json.Unmarshal(choice.Message.Content, &text)
+			delta["content"] = text
+		}
+		if len(choice.Message.ToolCalls) > 0 {
+			delta["tool_calls"] = choice.Message.ToolCalls
+		}
 
-        choices[i] = map[string]interface{}{
-            "index": choice.Index,
-            "delta": delta,
-        }
+		choices[i] = map[string]interface{}{
+			"index": choice.Index,
+			"delta": delta,
+		}
 	}
 
 	raw, _ := json.Marshal(map[string]interface{}{

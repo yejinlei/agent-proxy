@@ -17,27 +17,47 @@
 
 ## 概述
 
-agent-proxy 是一个 AI 消息协议网关，提供两种启动模式：
+agent-proxy 是一个 **4×4 全协议互转** 的 AI 消息协议网关，提供两种启动模式：
 
 ```
 ┌── 快速模式（--mode simple）── 从 SQLite 选一条记录，立即启动 ──┐
 │  命令: agent-proxy run --mode simple --db 1                     │
 │  适用：单一端点、快速试用、脚本调用                               │
-│  特点：零配置、开箱即用、自动协议识别                             │
+│  特点：零配置、开箱即用、4×4 协议自动识别与互转                   │
 └────────────────────────────────────────────────────────────────┘
 
 ┌── 复杂模式（--mode complex）── 多 Provider、路由、Web UI ──┐
 │  命令: agent-proxy run --mode complex                          │
 │        agent-proxy run --mode complex --conf config.json       │
 │  适用：生产环境、多厂商调度、需要监控                           │
-│  特点：路由前缀匹配、限流、实时指标、美观面板                   │
+│  特点：路由前缀匹配、限流、实时指标、4×4 全协议互转、美观面板   │
 └────────────────────────────────────────────────────────────────┘
+```
+
+### 4×4 全协议互转
+
+OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站可转任意出站**：
+
+| 入站 ↓ \ 出站 → | OpenAI Compatible | Anthropic Messages | Google Gemini | OpenAI Responses |
+|----------------|------------------|-------------------|---------------|-----------------|
+| OpenAI Compatible | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 |
+| Anthropic Messages | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 |
+| Google Gemini | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 |
+| OpenAI Responses | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 |
+
+翻译链路（N 协议只需 N 翻译器，而非 N×N）：
+
+```
+入站协议 TranslateRequest → InternalRequest → 路由 Provider
+→ TranslateToProvider → Provider 调用
+→ TranslateFromProvider → InternalResponse
+→ 入站协议 TranslateResponse → 出站响应
 ```
 
 ### 核心设计
 
 - **Central Schema 中枢模型**：定义与所有外部协议无关的统一消息结构
-- **双向翻译器**：每个协议实现 请求→中枢、中枢→请求、响应→中枢、中枢→响应、流式→中枢
+- **CombinedTranslator 接口**：每个协议实现 `TranslateRequest` / `TranslateResponse` / `TranslateStream` 双向翻译
 - **Provider 统一接口**：`Call()` / `CallStream()` 屏蔽下游差异
 
 ---
@@ -82,10 +102,27 @@ agent-proxy db add --url https://token.sensenova.cn/v1 \
 # ② 快速模式启动
 agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
 
-# ③ 使用（标准 OpenAI Chat Completions）
+# ③ 使用任意入站协议调用（4 种协议全支持，自动翻译到下游）
+# 3a. OpenAI Compatible 入站
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hello"}]}'
+
+# 3b. Anthropic Messages 入站
+curl -X POST http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"sensenova-6.7-flash-lite","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
+
+# 3c. Google Gemini 入站
+curl -X POST "http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
+
+# 3d. OpenAI Responses 入站
+curl -X POST http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
 ### 数据库存储
@@ -285,9 +322,22 @@ type InternalMessage struct {
 | 7 | Stop reason | `stop` / `length` | `end_turn` → `stop`；`max_tokens` → `length` | 同 |
 | 8 | SSE 流式 | 无 `event:` 行 | `type` 字段区分 | 标准 SSE |
 
-### 流式请求
+### 流式请求（SSE 翻译链路）
 
-网关支持透传 SSE 流，下游事件原样转发（不翻译每一行）。元数据事件（`_type: "headers"`）会被解析并透传响应头。
+流式请求同样经过完整的翻译链路，不是简单透传：
+
+```
+下游 Provider SSE 行 → TranslateStreamEvent → InternalStreamEvent
+→ 入站协议 TranslateStream → 上游 SSE 输出（匹配入站协议格式）
+```
+
+各协议 SSE 格式差异在网关内自动适配：
+- **CC 格式**：纯 `data: {...}\n\n`，无 event 行，以 `data: [DONE]` 结尾
+- **Anthropic 格式**：每行带 `type` 字段（`message_start` / `content_block_delta` / `message_delta`）
+- **Gemini 格式**：每行是完整 `StreamChunk` 对象，带 `candidates` 数组
+- **Responses 格式**：带 named events（`event: response.output_delta` 等）
+
+元数据事件（`_type: "headers"`）会被解析并透传响应头。
 
 ---
 

@@ -66,6 +66,282 @@ func NewResponsesTranslator() *ResponsesTranslator {
 func (t *ResponsesTranslator) Protocol() string { return "responses" }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  REQUEST: Responses ResponseRequest → InternalRequest (入站解析)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *ResponsesTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+	var req ResponseRequest
+	if err := json.Unmarshal(rawReq, &req); err != nil {
+		return nil, err
+	}
+
+	// --- 1. Instructions → SystemPrompt ---
+	var systemContent json.RawMessage
+	if req.Instructions != "" {
+		systemContent = json.RawMessage(`"` + req.Instructions + `"`)
+	}
+
+	// --- 2. Input → Messages ---
+	messages := inputToMessages(req.Input)
+
+	// --- 3. Tools → InternalTools ---
+	var tools []schema.InternalTool
+	for _, tool := range req.Tools {
+		tools = append(tools, schema.InternalTool{
+			Type: "function",
+			Function: &schema.InternalFunction{
+				Name:       tool.Name,
+				Parameters: tool.Parameters,
+			},
+		})
+	}
+
+	// --- 4. Metadata ---
+	var userID string
+	var seed *int
+	if req.Metadata != nil {
+		userID = req.Metadata.UserID
+		seed = req.Metadata.Seed
+	}
+
+	return &schema.InternalRequest{
+		Model:         req.Model,
+		Messages:      messages,
+		SystemPrompt:  systemContent,
+		Tools:         tools,
+		Stream:        req.Stream,
+		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		MaxTokens:     req.MaxOutputTokens,
+		StopSequences: req.StopSequences,
+		UserID:        userID,
+		Seed:          seed,
+		RawRequest:    rawReq,
+		Protocol:      "responses",
+	}, nil
+}
+
+func inputToMessages(items []InputItem) []schema.InternalMessage {
+	var msgs []schema.InternalMessage
+	for _, item := range items {
+		if item.Type != "message" {
+			continue
+		}
+
+		msg := schema.InternalMessage{Role: schema.Role(item.Role)}
+
+		// 提取 text
+		var text string
+		switch c := item.Content.(type) {
+		case string:
+			text = c
+		case []interface{}:
+			// content blocks
+			var textParts []string
+			for _, cb := range c {
+				block, ok := cb.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if block["type"] == "output_text" {
+					if t, ok := block["text"].(string); ok {
+						textParts = append(textParts, t)
+					}
+				}
+			}
+			text = joinText(textParts)
+		}
+		msg.Content = json.RawMessage(`"` + text + `"`)
+
+		// Tool calls
+		for _, tc := range item.ToolCalls {
+			argsJSON, _ := json.Marshal(tc.Input)
+			msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
+				ID:   tc.ID,
+				Type: tc.Type,
+				Function: struct {
+					Name         string          `json:"name"`
+					Arguments    string          `json:"arguments"`
+					RawArguments json.RawMessage `json:"-"`
+				}{
+					Name:         tc.Name,
+					Arguments:    string(argsJSON),
+					RawArguments: argsJSON,
+				},
+			})
+		}
+
+		msgs = append(msgs, msg)
+	}
+	return msgs
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RESPONSE: InternalResponse → Responses Response (出站)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
+	var contentBlocks []ContentBlock
+
+	for _, choice := range resp.Choices {
+		var text string
+		if choice.Message.Content != nil {
+			json.Unmarshal(choice.Message.Content, &text)
+		}
+		if text != "" {
+			contentBlocks = append(contentBlocks, ContentBlock{Type: "output_text", Text: text})
+		}
+
+		for _, tc := range choice.Message.ToolCalls {
+			contentBlocks = append(contentBlocks, ContentBlock{
+				Type: "tool_call",
+				ID:   tc.ID,
+				Name: tc.Function.Name,
+				Input: func() map[string]interface{} {
+					m := make(map[string]interface{})
+					json.Unmarshal(tc.Function.RawArguments, &m)
+					return m
+				}(),
+			})
+		}
+	}
+
+	var usage *Usage
+	if resp.Usage != nil {
+		usage = &Usage{
+			InputTokens:         resp.Usage.PromptTokens,
+			OutputTokens:        resp.Usage.CompletionTokens,
+			TotalTokens:         resp.Usage.TotalTokens,
+			CacheCreationTokens: resp.Usage.CacheCreationTokens,
+			CacheReadTokens:     resp.Usage.CacheReadTokens,
+		}
+	}
+
+	respObj := Response{
+		ID:         resp.ID,
+		Object:     "response",
+		Status:     "completed",
+		Model:      resp.Model,
+		StopReason: mapStopReasonReverse(resp.Choices[0].FinishReason),
+		Output: []OutputItem{
+			{
+				Type:    "message",
+				Role:    "assistant",
+				Content: contentBlocks,
+			},
+		},
+		Usage: usage,
+	}
+
+	return json.Marshal(respObj)
+}
+
+func mapStopReasonReverse(reason string) string {
+	switch reason {
+	case "stop":
+		return "stop"
+	case "length":
+		return "max_output_tokens"
+	case "tool_calls":
+		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STREAM: InternalStreamEvents → Responses SSE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	for {
+		select {
+		case <-ctx.Done():
+			fn([]byte("data: [DONE]\n\n"), true)
+			return
+		case event, ok := <-events:
+			if !ok {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+
+			switch event.Type {
+			case "error":
+				errData := t.TranslateError(event.Error)
+				fn(append([]byte("event: response.failed\ndata: "), errData...), false)
+				fn([]byte("\n\n"), false)
+				continue
+
+			case "start":
+				if event.Data != nil && event.Data.ID != "" {
+					eventData := EventData{ID: event.Data.ID, Type: "response"}
+					raw, _ := json.Marshal(StreamEvent{Type: "response.created", Data: &eventData})
+					fn(append([]byte("event: response.created\ndata: "), raw...), false)
+					fn([]byte("\n\n"), false)
+				}
+				continue
+
+			case "delta":
+				if event.Data != nil && len(event.Data.Choices) > 0 {
+					choice := event.Data.Choices[0]
+					eventData := EventData{OutputIndex: choice.Index}
+
+					if choice.Message.Content != nil {
+						var text string
+						json.Unmarshal(choice.Message.Content, &text)
+						if text != "" {
+							eventData.OutputDelta = &OutputDelta{
+								Type:    "message",
+								Role:    "assistant",
+								Content: []ContentDelta{{Type: "delta", Text: text}},
+							}
+						}
+					}
+
+					for _, tc := range choice.Message.ToolCalls {
+						eventData.OutputDelta = &OutputDelta{
+							Type: "message",
+							ToolCalls: []ToolCallDelta{{
+								ID:   tc.ID,
+								Type: "function",
+								Name: tc.Function.Name,
+								Input: func() map[string]interface{} {
+									m := make(map[string]interface{})
+									json.Unmarshal(tc.Function.RawArguments, &m)
+									return m
+								}(),
+							}},
+						}
+					}
+
+					if eventData.OutputDelta != nil {
+						raw, _ := json.Marshal(StreamEvent{Type: "response.output_delta", Data: &eventData})
+						fn(append([]byte("event: response.output_delta\ndata: "), raw...), false)
+						fn([]byte("\n\n"), false)
+					}
+				}
+				continue
+
+			case "done":
+				eventData := EventData{Type: "response"}
+				if event.Data != nil && event.Data.Usage != nil {
+					eventData.Usage = &Usage{
+						InputTokens:  event.Data.Usage.PromptTokens,
+						OutputTokens: event.Data.Usage.CompletionTokens,
+						TotalTokens:  event.Data.Usage.TotalTokens,
+					}
+				}
+				raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &eventData})
+				fn(append([]byte("event: response.completed\ndata: "), raw...), false)
+				fn([]byte("\n\n"), false)
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  REQUEST: InternalRequest → Responses ResponseRequest
 // ═══════════════════════════════════════════════════════════════════════════════
 

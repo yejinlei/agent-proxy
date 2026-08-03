@@ -21,6 +21,360 @@ func NewAnthropicTranslator(version string) *AnthropicTranslator {
 func (t *AnthropicTranslator) Protocol() string { return "anthropic" }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  REQUEST: Anthropic MessageRequest → InternalRequest (入站解析)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TranslateRequest 将 Anthropic 原生请求解析为 InternalRequest
+func (t *AnthropicTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+	var antReq MessageRequest
+	if err := json.Unmarshal(rawReq, &antReq); err != nil {
+		return nil, err
+	}
+
+	// --- 1. System → SystemPrompt ---
+	var systemContent json.RawMessage
+	if len(antReq.System) > 0 {
+		// 透传原始 JSON（string 或 []SystemBlock）
+		systemContent = antReq.System
+	}
+
+	// --- 2. Messages → InternalMessages ---
+	var messages []schema.InternalMessage
+	for _, msg := range antReq.Messages {
+		switch msg.Role {
+		case "assistant":
+			msg, err := messageToInternal(msg)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, msg)
+		case "user":
+			msgs, err := messagesToInternal(msg)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, msgs...)
+		case "system":
+			// 部分 Anthropic 版本允许 system 在 messages 数组中
+			if len(systemContent) == 0 {
+				systemContent = msg.Content
+			}
+		}
+	}
+
+	// --- 3. Tools → InternalTools ---
+	var tools []schema.InternalTool
+	for _, tool := range antReq.Tools {
+		tools = append(tools, schema.InternalTool{
+			Type: "function",
+			Function: &schema.InternalFunction{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.InputSchema,
+			},
+		})
+	}
+
+	// --- 4. MaxTokens（最小 1024） ---
+	maxTokens := antReq.MaxTokens
+	if maxTokens > 0 && maxTokens < 1024 {
+		maxTokens = 1024
+	}
+
+	return &schema.InternalRequest{
+		Model:         antReq.Model,
+		Messages:      messages,
+		SystemPrompt:  systemContent,
+		Tools:         tools,
+		Stream:        antReq.Stream,
+		Temperature:   antReq.Temperature,
+		TopP:          antReq.TopP,
+		TopK:          antReq.TopK,
+		MaxTokens:     maxTokens,
+		StopSequences: antReq.StopSequences,
+		UserID:        userIDFromMetadata(antReq.Metadata),
+		RawRequest:    rawReq,
+		Protocol:      "anthropic",
+	}, nil
+}
+
+// messageToInternal 将 Anthropic assistant message → InternalMessage
+func messageToInternal(msg Message) (schema.InternalMessage, error) {
+	var im schema.InternalMessage
+	im.Role = schema.RoleAssistant
+
+	var blocks []ContentBlock
+	if len(msg.Content) > 0 {
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			return im, err
+		}
+	}
+
+	var textParts []string
+	var toolCalls []schema.InternalToolCall
+
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			textParts = append(textParts, block.Text)
+		case "tool_use":
+			toolCalls = append(toolCalls, schema.InternalToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: struct {
+					Name         string          `json:"name"`
+					Arguments    string          `json:"arguments"`
+					RawArguments json.RawMessage `json:"-"`
+				}{
+					Name:         block.Name,
+					Arguments:    string(block.Input),
+					RawArguments: block.Input,
+				},
+			})
+		}
+	}
+
+	im.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+	if len(toolCalls) > 0 {
+		im.ToolCalls = toolCalls
+	}
+	return im, nil
+}
+
+// messagesToInternal 将 Anthropic user message 解析（含 tool_result）
+func messagesToInternal(msg Message) ([]schema.InternalMessage, error) {
+	var result []schema.InternalMessage
+
+	var blocks []ContentBlock
+	if len(msg.Content) > 0 {
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			// 回退：纯字符串
+			var text string
+			if err := json.Unmarshal(msg.Content, &text); err == nil {
+				return []schema.InternalMessage{
+					{Role: schema.RoleUser, Content: json.RawMessage(msg.Content)},
+				}, nil
+			}
+			return nil, err
+		}
+	}
+
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+
+	// 混合 blocks：text 合并到一个 user 消息，tool_result 单独
+	var textParts []string
+	var userMsg *schema.InternalMessage
+
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			textParts = append(textParts, block.Text)
+			if userMsg == nil {
+				userMsg = &schema.InternalMessage{Role: schema.RoleUser}
+			}
+		case "tool_result":
+			// tool_result 归为 tool 角色
+			var contentText string
+			if len(block.Content) > 0 {
+				contentText = string(block.Content)
+				// 去掉外层 JSON 数组包装，取第一个 text
+				var arr []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(block.Content, &arr) == nil && len(arr) > 0 && arr[0].Type == "text" {
+					contentText = arr[0].Text
+				}
+			}
+			result = append(result, schema.InternalMessage{
+				Role:       schema.RoleTool,
+				Content:    json.RawMessage(`"` + contentText + `"`),
+				ToolCallID: block.ToolUseID,
+			})
+		}
+	}
+
+	if userMsg != nil {
+		userMsg.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+		result = append(result, *userMsg)
+	}
+
+	return result, nil
+}
+
+func userIDFromMetadata(m *Metadata) string {
+	if m != nil {
+		return m.UserID
+	}
+	return ""
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RESPONSE: InternalResponse → Anthropic MessageResponse (出站)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TranslateResponse 将 InternalResponse 翻译为 Anthropic 原生响应
+func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
+	var contentBlocks []ContentBlock
+
+	for _, choice := range resp.Choices {
+		// Text
+		var text string
+		if choice.Message.Content != nil {
+			json.Unmarshal(choice.Message.Content, &text)
+		}
+		if text != "" {
+			contentBlocks = append(contentBlocks, ContentBlock{Type: "text", Text: text})
+		}
+
+		// Tool calls
+		for _, tc := range choice.Message.ToolCalls {
+			contentBlocks = append(contentBlocks, ContentBlock{
+				Type:  "tool_use",
+				ID:    tc.ID,
+				Name:  tc.Function.Name,
+				Input: tc.Function.RawArguments,
+			})
+		}
+	}
+
+	stopReason := mapStopReasonReverse(resp.Choices[0].FinishReason)
+
+	usage := (*Usage)(nil)
+	if resp.Usage != nil {
+		usage = &Usage{
+			InputTokens:  resp.Usage.PromptTokens,
+			OutputTokens: resp.Usage.CompletionTokens,
+			TotalTokens:  resp.Usage.TotalTokens,
+		}
+	}
+
+	antResp := MessageResponse{
+		ID:         resp.ID,
+		Type:       "message",
+		Role:       "assistant",
+		Content:    contentBlocks,
+		Model:      resp.Model,
+		StopReason: stopReason,
+		Usage:      usage,
+	}
+	return json.Marshal(antResp)
+}
+
+func mapStopReasonReverse(reason string) string {
+	switch reason {
+	case "stop":
+		return "end_turn"
+	case "length":
+		return "max_tokens"
+	case "tool_calls":
+		return "tool_use"
+	default:
+		return "end_turn"
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STREAM: InternalStreamEvents → Anthropic SSE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TranslateStream 将内部流式事件翻译为 Anthropic 格式 SSE
+func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	for {
+		select {
+		case <-ctx.Done():
+			fn([]byte("data: [DONE]\n\n"), true)
+			return
+		case event, ok := <-events:
+			if !ok {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+
+			switch event.Type {
+			case "error":
+				errData := t.TranslateError(event.Error)
+				fn(append([]byte("event: error\ndata: "), errData...), false)
+				fn([]byte("\n\n"), false)
+				continue
+
+			case "start":
+				if event.Data != nil {
+					msg := EventMessage{ID: event.Data.ID, Type: "message", Role: "assistant"}
+					if event.Data.Model != "" {
+						msg.Model = event.Data.Model
+					}
+					raw, _ := json.Marshal(StreamEvent{Type: "message_start", Message: &msg})
+					fn(append([]byte("data: "), raw...), false)
+					fn([]byte("\n\n"), false)
+				}
+				continue
+
+			case "delta":
+				if event.Data != nil && len(event.Data.Choices) > 0 {
+					choice := event.Data.Choices[0]
+					var delta *Delta
+					if choice.Message.Content != nil {
+						var text string
+						json.Unmarshal(choice.Message.Content, &text)
+						delta = &Delta{Type: "text_delta", Text: text}
+					}
+					if len(choice.Message.ToolCalls) > 0 {
+						tc := choice.Message.ToolCalls[0]
+						delta = &Delta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}
+					}
+					if delta != nil {
+						raw, _ := json.Marshal(StreamEvent{
+							Type:  "content_block_delta",
+							Index: choice.Index,
+							Delta: delta,
+						})
+						fn(append([]byte("data: "), raw...), false)
+						fn([]byte("\n\n"), false)
+					}
+				}
+				continue
+
+			case "done":
+				stopReason := "end_turn"
+				if event.Data != nil && len(event.Data.Choices) > 0 {
+					stopReason = mapStopReasonReverse(event.Data.Choices[0].FinishReason)
+				}
+				var usage *Usage
+				if event.Data != nil && event.Data.Usage != nil {
+					usage = &Usage{
+						InputTokens:  event.Data.Usage.PromptTokens,
+						OutputTokens: event.Data.Usage.CompletionTokens,
+						TotalTokens:  event.Data.Usage.TotalTokens,
+					}
+				}
+				raw, _ := json.Marshal(StreamEvent{
+					Type:         "message_delta",
+					MessageDelta: &MessageDelta{StopReason: stopReason},
+				})
+				fn(append([]byte("data: "), raw...), false)
+				fn([]byte("\n\n"), false)
+
+				// 最后发送 usage 行
+				if usage != nil {
+					usageRaw, _ := json.Marshal(map[string]interface{}{
+						"type":  "message_stop",
+						"usage": usage,
+					})
+					fn(append([]byte("data: "), usageRaw...), false)
+					fn([]byte("\n\n"), false)
+				}
+
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  REQUEST: InternalRequest → Anthropic MessageRequest
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -104,29 +458,29 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 			})
 
 		case schema.RoleTool:
-            // ⚠️ Anthropic 将 tool 结果归为 user 消息
-            toolContent, _ := json.Marshal([]ContentBlock{
-                {
-                    Type: "tool_result",
-                    ToolUseID: msg.ToolCallID,
-                    Content: json.RawMessage(`[{"type":"text","text":"` + msg.Name + `"}]`),
-                },
-            })
+			// ⚠️ Anthropic 将 tool 结果归为 user 消息
+			toolContent, _ := json.Marshal([]ContentBlock{
+				{
+					Type:      "tool_result",
+					ToolUseID: msg.ToolCallID,
+					Content:   json.RawMessage(`[{"type":"text","text":"` + msg.Name + `"}]`),
+				},
+			})
 			result = append(result, Message{
-                Role:    "user",
-                Content: toolContent,
-            })
+				Role:    "user",
+				Content: toolContent,
+			})
 
-        case schema.RoleUser:
-            // content 用原始字符串
-            var text string
-            if msg.Content != nil {
-                json.Unmarshal(msg.Content, &text)
-            }
-            result = append(result, Message{
-                Role:    "user",
-                Content: json.RawMessage(`"` + text + `"`),
-            })
+		case schema.RoleUser:
+			// content 用原始字符串
+			var text string
+			if msg.Content != nil {
+				json.Unmarshal(msg.Content, &text)
+			}
+			result = append(result, Message{
+				Role:    "user",
+				Content: json.RawMessage(`"` + text + `"`),
+			})
 		}
 	}
 
@@ -146,11 +500,11 @@ func assistantContentToAnthropic(msg schema.InternalMessage) (json.RawMessage, e
 
 	for _, tc := range msg.ToolCalls {
 		blocks = append(blocks, ContentBlock{
-            Type:     "tool_use",
-            ID:       tc.ID,
-            Name:     tc.Function.Name,
-            Input:    tc.Function.RawArguments,
-        })
+			Type:  "tool_use",
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: tc.Function.RawArguments,
+		})
 	}
 
 	return json.Marshal(blocks)
@@ -165,15 +519,15 @@ func toolsToAnthropic(tools []schema.InternalTool) []Tool {
 		inputSchema := tool.Function.Parameters
 		if inputSchema == nil {
 			inputSchema = map[string]interface{}{
-                "type":       "object",
-                "properties": map[string]interface{}{},
-            }
-        }
-        result = append(result, Tool{
-            Name:        tool.Function.Name,
-            Description: tool.Function.Description,
-            InputSchema: inputSchema,
-        })
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+		}
+		result = append(result, Tool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			InputSchema: inputSchema,
+		})
 	}
 	return result
 }
@@ -197,22 +551,22 @@ func (t *AnthropicTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 	for _, block := range resp.Content {
 		switch block.Type {
 		case "text":
-            textParts = append(textParts, block.Text)
-        case "tool_use":
-            // ⚠️ tool_use 混在 content blocks 中
-            toolCalls = append(toolCalls, schema.InternalToolCall{
-                ID:   block.ID,
-                Type: "function",
-                Function: struct {
-                    Name         string          `json:"name"`
-                    Arguments    string          `json:"arguments"`
-                    RawArguments json.RawMessage `json:"-"`
-                }{
-                    Name:         block.Name,
-                    Arguments:    string(block.Input),
-                    RawArguments: block.Input,
-                },
-            })
+			textParts = append(textParts, block.Text)
+		case "tool_use":
+			// ⚠️ tool_use 混在 content blocks 中
+			toolCalls = append(toolCalls, schema.InternalToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: struct {
+					Name         string          `json:"name"`
+					Arguments    string          `json:"arguments"`
+					RawArguments json.RawMessage `json:"-"`
+				}{
+					Name:         block.Name,
+					Arguments:    string(block.Input),
+					RawArguments: block.Input,
+				},
+			})
 		}
 	}
 
@@ -225,25 +579,25 @@ func (t *AnthropicTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 	var usage *schema.InternalUsage
 	if resp.Usage != nil {
 		usage = &schema.InternalUsage{
-            PromptTokens:     resp.Usage.InputTokens,
-            CompletionTokens: resp.Usage.OutputTokens,
-            TotalTokens:      resp.Usage.TotalTokens,
-        }
+			PromptTokens:     resp.Usage.InputTokens,
+			CompletionTokens: resp.Usage.OutputTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+		}
 	}
 
 	return &schema.InternalResponse{
 		ID:    resp.ID,
 		Model: resp.Model,
 		Choices: []schema.InternalChoice{
-            {
-                Index:        0,
-                Message:      choiceMessage,
-                FinishReason: mapStopReason(resp.StopReason),
-            },
-        },
-        Usage:  usage,
-        Object: "chat.completion",
-    }, nil
+			{
+				Index:        0,
+				Message:      choiceMessage,
+				FinishReason: mapStopReason(resp.StopReason),
+			},
+		},
+		Usage:  usage,
+		Object: "chat.completion",
+	}, nil
 }
 
 func mapStopReason(reason string) string {
@@ -277,63 +631,63 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 	var event StreamEvent
 	if err := json.Unmarshal(raw, &event); err != nil {
 		return &schema.InternalStreamEvent{
-            Type: "error",
-            Error: &schema.StreamError{
-                Message: "parse error: " + err.Error(),
-                Code:    400,
-            },
-        }
+			Type: "error",
+			Error: &schema.StreamError{
+				Message: "parse error: " + err.Error(),
+				Code:    400,
+			},
+		}
 	}
 
 	switch event.Type {
 	case "content_block_delta":
-        deltaText := ""
-        if event.Delta != nil {
-            deltaText = event.Delta.Text
-        }
-        return &schema.InternalStreamEvent{
-            Type: "delta",
-            Data: &schema.InternalStreamChunk{
-                Choices: []schema.InternalChoice{
-                    {
-                        Index: event.Index,
-                        Message: schema.InternalMessage{
-                            Role:    schema.RoleAssistant,
-                            Content: json.RawMessage(`"` + deltaText + `"`),
-                        },
-                    },
-                },
-            },
-        }
+		deltaText := ""
+		if event.Delta != nil {
+			deltaText = event.Delta.Text
+		}
+		return &schema.InternalStreamEvent{
+			Type: "delta",
+			Data: &schema.InternalStreamChunk{
+				Choices: []schema.InternalChoice{
+					{
+						Index: event.Index,
+						Message: schema.InternalMessage{
+							Role:    schema.RoleAssistant,
+							Content: json.RawMessage(`"` + deltaText + `"`),
+						},
+					},
+				},
+			},
+		}
 
-    case "message_delta":
-        return &schema.InternalStreamEvent{
-            Type: "done",
-            Data: &schema.InternalStreamChunk{
-                Choices: []schema.InternalChoice{
-                    {
-                        Index:        0,
-                        FinishReason: mapStopReason(event.MessageDelta.StopReason),
-                    },
-                },
-            },
-        }
+	case "message_delta":
+		return &schema.InternalStreamEvent{
+			Type: "done",
+			Data: &schema.InternalStreamChunk{
+				Choices: []schema.InternalChoice{
+					{
+						Index:        0,
+						FinishReason: mapStopReason(event.MessageDelta.StopReason),
+					},
+				},
+			},
+		}
 
-    case "message_start":
-        model := ""
-        if event.Message != nil {
-            model = event.Message.Model
-        }
-        return &schema.InternalStreamEvent{
-            Type: "start",
-            Data: &schema.InternalStreamChunk{
-                ID:    event.Message.ID,
-                Model: model,
-            },
-        }
+	case "message_start":
+		model := ""
+		if event.Message != nil {
+			model = event.Message.Model
+		}
+		return &schema.InternalStreamEvent{
+			Type: "start",
+			Data: &schema.InternalStreamChunk{
+				ID:    event.Message.ID,
+				Model: model,
+			},
+		}
 
-    default:
-        return nil // 忽略中间事件
+	default:
+		return nil // 忽略中间事件
 	}
 }
 
@@ -341,28 +695,28 @@ func (t *AnthropicTranslator) TranslateStreamToCCSSE(ctx context.Context, events
 	for {
 		select {
 		case <-ctx.Done():
-            fn([]byte("data: [DONE]\n\n"), true)
-            return
-        case raw, ok := <-events:
-            if !ok {
-                fn([]byte("data: [DONE]\n\n"), true)
-                return
-            }
+			fn([]byte("data: [DONE]\n\n"), true)
+			return
+		case raw, ok := <-events:
+			if !ok {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
 
-            event := t.TranslateStreamEvent(raw)
-            if event == nil {
-                continue
-            }
+			event := t.TranslateStreamEvent(raw)
+			if event == nil {
+				continue
+			}
 
-            if event.Type == "done" {
-                fn([]byte("data: [DONE]\n\n"), true)
-                return
-            }
+			if event.Type == "done" {
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
+			}
 
-            data := ToCCStreamChunk(event.Data)
-            fn(append([]byte("data: "), data...), false)
-            fn([]byte("\n\n"), false)
-        }
+			data := ToCCStreamChunk(event.Data)
+			fn(append([]byte("data: "), data...), false)
+			fn([]byte("\n\n"), false)
+		}
 	}
 }
 
@@ -375,36 +729,36 @@ func (t *AnthropicTranslator) TranslateError(err *schema.StreamError) json.RawMe
 	return data
 }
 
-// ToCCStreamChunk 将 InternalStreamChunk 构建为 CC 格式流式块
+// ToCCStreamChunk 复用 responses 包中的通用函数
 func ToCCStreamChunk(chunk *schema.InternalStreamChunk) json.RawMessage {
 	choices := make([]map[string]interface{}, len(chunk.Choices))
 
 	for i, choice := range chunk.Choices {
 		if choice.FinishReason != "" {
-            choices[i] = map[string]interface{}{
-                "index":         choice.Index,
-                "finish_reason": choice.FinishReason,
-            }
-            continue
-        }
+			choices[i] = map[string]interface{}{
+				"index":         choice.Index,
+				"finish_reason": choice.FinishReason,
+			}
+			continue
+		}
 
-        delta := map[string]interface{}{}
-        if choice.Message.Role != "" {
-            delta["role"] = string(choice.Message.Role)
-        }
-        if choice.Message.Content != nil {
-            var text string
-            json.Unmarshal(choice.Message.Content, &text)
-            delta["content"] = text
-        }
-        if len(choice.Message.ToolCalls) > 0 {
-            delta["tool_calls"] = choice.Message.ToolCalls
-        }
+		delta := map[string]interface{}{}
+		if choice.Message.Role != "" {
+			delta["role"] = string(choice.Message.Role)
+		}
+		if choice.Message.Content != nil {
+			var text string
+			json.Unmarshal(choice.Message.Content, &text)
+			delta["content"] = text
+		}
+		if len(choice.Message.ToolCalls) > 0 {
+			delta["tool_calls"] = choice.Message.ToolCalls
+		}
 
-        choices[i] = map[string]interface{}{
-            "index": choice.Index,
-            "delta": delta,
-        }
+		choices[i] = map[string]interface{}{
+			"index": choice.Index,
+			"delta": delta,
+		}
 	}
 
 	raw, _ := json.Marshal(map[string]interface{}{
