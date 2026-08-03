@@ -129,7 +129,11 @@ func startQuickMode(dbID int, dbPath string) (http.Handler, error) {
 	fmt.Printf("  Type:     %s\n", record.ProviderType)
 	if record.ModelsJSON != "" {
 		models := record.Models()
-		fmt.Printf("  Models:   %d (%s, ...)\n", len(models), models[0])
+		if len(models) > 0 {
+			fmt.Printf("  Models:   %d (%s, ...)\n", len(models), models[0])
+		} else {
+			fmt.Printf("  Models:   (JSON 解析失败)\n")
+		}
 	}
 
 	// Sensenova 的 URL 默认带了 /v1，OpenAIClient 会追加 /v1/chat/completions
@@ -218,11 +222,11 @@ func runCLI(args []string) {
 		}
 
 	case "show":
-		if len(args) < 1 {
+		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy show <id>\n")
 			os.Exit(1)
 		}
-		id, _ := strconv.Atoi(args[0])
+		id, _ := strconv.Atoi(args[1])
 		if err := cmd.RunDBShow(id); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
@@ -250,11 +254,11 @@ func runCLI(args []string) {
 		}
 
 	case "rm", "delete":
-		if len(args) < 1 {
+		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy rm <id>\n")
 			os.Exit(1)
 		}
-		id, _ := strconv.Atoi(args[0])
+		id, _ := strconv.Atoi(args[1])
 		if err := cmd.RunDBDelete(id); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)

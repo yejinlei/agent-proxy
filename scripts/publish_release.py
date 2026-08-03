@@ -46,18 +46,31 @@ def gh_api(method, url, body=None):
         sys.exit(1)
 
 def upload_asset(url, path):
-    """Upload release asset."""
+    """Upload release asset using multipart form-data."""
     content = open(path, "rb").read()
+    fname = os.path.basename(path)
+    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+
+    # Build multipart body
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="file"; filename="'
+    body += fname.encode()
+    body += b'"\r\n'
+    body += b"Content-Type: application/octet-stream\r\n\r\n"
+    body += content
+    body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    print(f"  Uploading {fname} ({len(content):,} bytes / {len(content)//1024//1024} MB)...")
     headers = {
         "Authorization": f"token {TOKEN}",
-        "Content-Type": "application/octet-stream",
-        "Content-Length": str(len(content)),
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(body)),
     }
-    req = urllib.request.Request(url, data=content, headers=headers, method="POST")
-    fname = os.path.basename(path)
-    print(f"  Uploading {fname} ({len(content):,} bytes / {len(content)//1024//1024} MB)...")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         print(f"  Upload failed HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
