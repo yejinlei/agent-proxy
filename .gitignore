@@ -9,6 +9,10 @@
 # Env (keep .env.example, ignore actual .env)
 .env
 
+# Binaries (released via GitHub Releases)
+*.exe
+agent-proxy
+
 # Temp
 test-request.json
 test-stream.json
