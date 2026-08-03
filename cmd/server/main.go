@@ -19,54 +19,169 @@ import (
 
 func main() {
 	args := os.Args[1:]
-
-	// CLI 子命令检测
-	cliCommands := map[string]bool{
-		"list": true, "show": true, "add": true,
-		"rm": true, "delete": true, "--help": true, "-h": true, "db": true,
+	if len(args) == 0 {
+		printUsage()
+		os.Exit(0)
 	}
-	if len(args) > 0 && cliCommands[args[0]] {
-		runCLI(args)
-		return
-	}
-
-	// ========== 启动模式解析 ==========
-	// 超简易模式: --db N  从 DB 选一条记录
-	// 复杂模式: 默认（使用配置）
-
-	dbID := -1
-	dbPath := ""
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--db" {
-			dbID, _ = strconv.Atoi(args[i+1])
+	command := args[0]
+	switch command {
+	case "run":
+		runServer(args[1:])
+	case "list":
+		runDBList()
+	case "show":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy show <id>\n")
+			os.Exit(1)
 		}
-		if args[i] == "--dbpath" {
-			dbPath = args[i+1]
+		id, _ := strconv.Atoi(args[1])
+		if err := cmd.RunDBShow(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
 		}
+	case "add":
+		runDBAdd(args[1:])
+	case "rm", "delete":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy rm <id>\n")
+			os.Exit(1)
+		}
+		id, _ := strconv.Atoi(args[1])
+		if err := cmd.RunDBDelete(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "db":
+		runDBCommand(args[1:])
+	case "--help", "-h":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "未知命令: %s\n\n", command)
+		printUsage()
+		os.Exit(1)
 	}
+}
 
+// runDBCommand 处理 agent-proxy db <subcommand> [args]
+func runDBCommand(args []string) {
+	command := "list"
+	if len(args) > 0 {
+		command = args[0]
+		args = args[1:]
+	}
+	switch command {
+	case "list":
+		if err := cmd.RunDBList(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "show":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy db show <id>\n")
+			os.Exit(1)
+		}
+		id, _ := strconv.Atoi(args[0])
+		if err := cmd.RunDBShow(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "add":
+		runDBAdd(args)
+	case "rm", "delete":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy db rm <id>\n")
+			os.Exit(1)
+		}
+		id, _ := strconv.Atoi(args[0])
+		if err := cmd.RunDBDelete(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "--help", "-h":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "未知子命令: db %s\n\n", command)
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func runDBList() {
+	if err := cmd.RunDBList(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runDBAdd 添加代理配置
+func runDBAdd(args []string) {
+	fs := flag.NewFlagSet("add", flag.ExitOnError)
+	name := fs.String("name", "", "Provider 名称")
+	url := fs.String("url", "", "Provider URL (必选)")
+	key := fs.String("key", "", "API Key (必选)")
+	providerType := fs.String("type", "openai", "Provider 类型: openai/anthropic/gemini")
+	fs.Parse(args)
+
+	if *url == "" || *key == "" {
+		fmt.Fprintf(os.Stderr, "❌ --url 和 --key 为必填参数\n")
+		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>] [--type <t>]\n")
+		os.Exit(1)
+	}
+	if *name == "" {
+		*name = *url
+	}
+	if err := cmd.RunDBAdd(*name, *url, *key, *providerType); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ 已保存代理配置: %s (%s)\n", *name, *url)
+}
+
+// runServer 解析启动参数并启动服务
+func runServer(args []string) {
 	host := "0.0.0.0"
 	port := 8080
+	mode := ""
+	dbID := -1
+	conf := ""
 	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--host" {
+		switch args[i] {
+		case "--host":
 			host = args[i+1]
-		}
-		if args[i] == "--port" {
+		case "--port":
 			port, _ = strconv.Atoi(args[i+1])
+		case "--mode":
+			mode = args[i+1]
+		case "--db":
+			dbID, _ = strconv.Atoi(args[i+1])
+		case "--conf":
+			conf = args[i+1]
 		}
+	}
+
+	// --mode simple --db N   → 快速模式
+	// --mode complex [--conf] → 复杂模式
+	// 无 --mode 也无 --db     → 默认复杂模式
+	quickMode := mode == "simple" || dbID > 0
+	if mode == "complex" {
+		quickMode = false
+	}
+
+	if quickMode && dbID <= 0 {
+		fmt.Fprintf(os.Stderr, "❌ 快速模式需要指定 --db <id>\n")
+		os.Exit(1)
 	}
 
 	var handler http.Handler
-
-	if dbID > 0 {
-		quickHandler, err := startQuickMode(dbID, dbPath)
+	if quickMode {
+		quickHandler, err := startQuickMode(dbID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ 启动快速模式失败: %v\n", err)
 			os.Exit(1)
 		}
 		handler = quickHandler
 	} else {
-		handler = startComplexMode()
+		handler = startComplexMode(conf)
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -88,12 +203,12 @@ func main() {
 		srv.Shutdown(ctx)
 	}()
 
-	if dbID > 0 {
-		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://localhost:%d\n", port)
+	if quickMode {
+		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://%s:%d\n", host, port)
 		fmt.Printf("📝 POST http://localhost:%d/v1/chat/completions\n", port)
 		fmt.Printf("🏥 http://localhost:%d/health\n", port)
 	} else {
-		fmt.Printf("\n🚀 Agent-Proxy running on http://localhost:%d\n", port)
+		fmt.Printf("\n🚀 Agent-Proxy (复杂模式) running on http://%s:%d\n", host, port)
 		fmt.Printf("📊 Web UI: http://localhost:%d/ui\n", port)
 		fmt.Printf("📝 Chat Completions: POST http://localhost:%d/v1/chat/completions\n", port)
 	}
@@ -105,13 +220,12 @@ func main() {
 }
 
 // startQuickMode 从 DB 读取一条记录启动快速网关
-func startQuickMode(dbID int, dbPath string) (http.Handler, error) {
-	store, err := db.New(dbPath)
+func startQuickMode(dbID int) (http.Handler, error) {
+	store, err := db.New("")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	defer store.Close()
-
 	if err := store.Init(); err != nil {
 		return nil, fmt.Errorf("init db: %w", err)
 	}
@@ -121,37 +235,24 @@ func startQuickMode(dbID int, dbPath string) (http.Handler, error) {
 		return nil, fmt.Errorf("get record: %w", err)
 	}
 	if record == nil {
-		return nil, fmt.Errorf("未找到 ID=%d 的代理配置。使用 'list' 查看现有配置", dbID)
+		return nil, fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db list' 查看现有配置", dbID)
 	}
 
 	fmt.Printf("⚡ 快速模式: 使用 DB 记录 #%d\n", dbID)
 	fmt.Printf("  Provider: %s (%s)\n", record.Name, record.URL)
 	fmt.Printf("  Type:     %s\n", record.ProviderType)
-	if record.ModelsJSON != "" {
-		models := record.Models()
-		if len(models) > 0 {
-			fmt.Printf("  Models:   %d (%s, ...)\n", len(models), models[0])
-		} else {
-			fmt.Printf("  Models:   (JSON 解析失败)\n")
-		}
-	}
 
-	// Sensenova 的 URL 默认带了 /v1，OpenAIClient 会追加 /v1/chat/completions
-	// 需要去掉 /v1 前缀
 	baseURL := record.URL
 	if record.ProviderType == "openai" {
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	// Sensenova 兼容模式：URL 是 https://token.sensenova.cn/v1
-	// 实际 endpoint 是 https://token.sensenova.cn/v1/chat/completions
-	// 所以 baseURL 应该去掉末尾 /v1
 	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.ProviderType, 60)
 	return quick.Routes(), nil
 }
 
 // startComplexMode 使用配置启动完整网关
-func startComplexMode() http.Handler {
+func startComplexMode(confPath string) http.Handler {
 	cfg := config.DefaultConfig()
 	cfg.Providers = make(map[string]*config.ProviderConfig)
 
@@ -193,10 +294,19 @@ func startComplexMode() http.Handler {
 	}
 	cfg.ModelRouter.DefaultProvider = "sensenova"
 
+	if confPath != "" {
+		file, err := config.Load(confPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ 加载配置文件失败: %v\n", err)
+			os.Exit(1)
+		}
+		cfg = file
+	}
+
 	return server.NewGateway(cfg).Routes()
 }
 
-// normalizeBaseURL 去掉 URL 末尾的 /v1（如果存在），因为 BuildURL 会追加
+// normalizeBaseURL 去掉 URL 末尾的 /v1
 func normalizeBaseURL(url string) string {
 	if len(url) >= 4 && url[len(url)-3:] == "/v1" {
 		return url[:len(url)-3]
@@ -204,105 +314,33 @@ func normalizeBaseURL(url string) string {
 	return url
 }
 
-// runCLI 处理 CLI 子命令
-func runCLI(args []string) {
-	command := args[0]
-
-	// 兼容 agent-proxy db list/show/rm 风格
-	if command == "db" && len(args) > 1 {
-		command = args[1]
-		args = args[2:]
-	}
-
-	switch command {
-	case "list", "":
-		if err := cmd.RunDBList(); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
-
-	case "show":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "用法: agent-proxy show <id>\n")
-			os.Exit(1)
-		}
-		id, _ := strconv.Atoi(args[1])
-		if err := cmd.RunDBShow(id); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
-
-	case "add":
-		addArgs := flag.NewFlagSet("add", flag.ExitOnError)
-		name := addArgs.String("name", "", "Provider 名称")
-		url := addArgs.String("url", "", "Provider URL (必选)")
-		key := addArgs.String("key", "", "API Key (必选)")
-		providerType := addArgs.String("type", "openai", "Provider 类型: openai/anthropic/gemini")
-		addArgs.Parse(args[1:])
-
-		if *url == "" || *key == "" {
-			fmt.Fprintf(os.Stderr, "❌ --url 和 --key 为必填参数\n")
-			fmt.Fprintf(os.Stderr, "用法: agent-proxy add --url <url> --key <key> [--name <n>] [--type <t>]\n")
-			os.Exit(1)
-		}
-		if *name == "" {
-			*name = *url
-		}
-		if err := cmd.RunDBAdd(*name, *url, *key, *providerType); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
-
-	case "rm", "delete":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "用法: agent-proxy rm <id>\n")
-			os.Exit(1)
-		}
-		id, _ := strconv.Atoi(args[1])
-		if err := cmd.RunDBDelete(id); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
-
-	case "--help", "-h":
-		printUsage()
-
-	default:
-		fmt.Fprintf(os.Stderr, "未知命令: %s\n\n", command)
-		printUsage()
-		os.Exit(1)
-	}
-}
-
 func printUsage() {
 	fmt.Println(`
+
 🔗 Agent-Proxy — AI 消息协议网关
 
-用法:
-  agent-proxy                           # 复杂模式启动（默认配置）
-  agent-proxy --db <id>                 # 快速模式：从 DB 选一条记录
-  agent-proxy --host <h> --port <p>     # 指定监听地址
-  agent-proxy --dbpath <path>           # 指定数据库路径
+启动命令:
+  agent-proxy run --mode simple --host <h> --port <p> --db <id>   快速模式
+  agent-proxy run --mode complex --host <h> --port <p>             复杂模式（默认配置）
+  agent-proxy run --mode complex --host <h> --port <p> --conf <f>  复杂模式（配置文件）
 
-CLI 命令（DB 管理）:
-  agent-proxy list                      # 列出所有代理配置
-  agent-proxy show <id>                 # 显示指定代理详情
-  agent-proxy add --url <url> --key <key> [--name <n>] [--type <t>]
-                                        # 添加代理配置（自动嗅探模型列表）
-  agent-proxy rm <id>                   # 删除代理配置
+数据库命令:
+  agent-proxy db list                                              列出所有记录
+  agent-proxy db show <id>                                         显示详情
+  agent-proxy db add --url <u> --key <k> [--name <n>] [--type <t>] 添加记录
+  agent-proxy db rm <id>                                           删除记录
 
 示例:
-  # 添加 Sensenova 代理
-  agent-proxy add --url https://token.sensenova.cn/v1 \
-                  --key sk-xxx --name sensenova
+  # 添加 Sensenova
+  agent-proxy db add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
 
-  # 查看所有记录
-  agent-proxy list
+  # 快速启动
+  agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
 
-  # 快速模式启动（使用 DB 第 1 条记录）
-  agent-proxy --db 1
+  # 复杂模式
+  agent-proxy run --mode complex --host 0.0.0.0 --port 8080
 
-  # 复杂模式启动（带自定义端口）
-  agent-proxy --host 0.0.0.0 --port 9090
+  # 复杂模式 + 配置文件
+  agent-proxy run --mode complex --host 0.0.0.0 --port 8080 --conf config.json
 `)
 }
