@@ -4,10 +4,11 @@
 
 agent-proxy 是 AI 协议翻译的中间件：将上游 LLM 端点的 OpenAI / Anthropic / Gemini / Responses API **统一转化为 Chat Completions 格式**，让你用一个接口打通所有厂商。
 
-两种模式覆盖所有场景：
+三种模式覆盖所有场景：
 
-- **快速模式**：`--db N` 一条命令启动，从 SQLite 选一个记录，直接转发
-- **复杂模式**：多 Provider 路由、前缀匹配、Web UI 实时监控
+- **快速模式**：`agent-proxy run --mode simple --db N` 一条命令从 SQLite 选记录启动
+- **复杂模式**：`agent-proxy run --mode complex` 多 Provider 路由、Web UI 实时监控
+- **配置文件**：`agent-proxy run --mode complex --conf config.json` 完整 JSON 配置
 
 ## 架构
 
@@ -24,66 +25,47 @@ agent-proxy 是 AI 协议翻译的中间件：将上游 LLM 端点的 OpenAI / A
 ## 快速开始
 
 ```powershell
-# === 复杂模式（默认） ===
-# 设置环境变量
-$env:AGENT_PROXY_API_KEY = "sk-your-key-here"
+# === 1. 添加一个代理 ===
+agent-proxy db add --url https://token.sensenova.cn/v1 \
+                  --key sk-xxx --name sensenova
 
-# 启动（默认 0.0.0.0:8080）
-.\agent-proxy.exe
+# === 2. 快速模式启动（从 DB 选一条记录）===
+agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
 
-# 自定义端口
-.\agent-proxy.exe --host 0.0.0.0 --port 9090
-
-
-# === 快速模式：先添加代理，再启动 ===
-
-# 1. 添加代理（自动嗅探模型列表）
-.\agent-proxy.exe add --url https://token.sensenova.cn/v1 \
-                      --key sk-xxx \
-                      --name sensenova \
-                      --type openai
-
-# 2. 查看已保存的代理
-.\agent-proxy.exe list
-
-# 3. 快速启动（使用 DB 第 1 条记录）
-.\agent-proxy.exe --db 1
-
-# 4. 测试
+# === 3. 测试 ===
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"sensenova-6.7-flash-lite\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"
+  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 ## 命令总览
 
 ```
-agent-proxy [command] [options]
+agent-proxy <subcommand> [options]
 
-启动模式：
-  agent-proxy                           # 复杂模式启动（默认配置）
-  agent-proxy --db <id>                 # 快速模式：从 DB 选一条记录
-  agent-proxy --host <h> --port <p>     # 指定监听地址
-  agent-proxy --dbpath <path>           # 指定数据库路径
+启动命令:
+  agent-proxy run --mode simple --host <h> --port <p> --db <id>   快速模式
+  agent-proxy run --mode complex --host <h> --port <p>             复杂模式（默认配置）
+  agent-proxy run --mode complex --host <h> --port <p> --conf <f>  复杂模式（JSON 配置文件）
 
-CLI 命令（SQLite DB 管理）：
-  agent-proxy list                      # 列出所有代理配置
-  agent-proxy show <id>                 # 显示指定代理详情
-  agent-proxy add --url <url> --key <key> [--name <n>] [--type <t>]
-                                        # 添加代理配置（自动嗅探模型列表）
-  agent-proxy rm <id>                   # 删除代理配置
+数据库命令:
+  agent-proxy db list                                              列出所有记录
+  agent-proxy db show <id>                                         显示详情
+  agent-proxy db add --url <u> --key <k> [--name <n>] [--type <t>] 添加记录
+  agent-proxy db rm <id>                                           删除记录
 
-  --help  /  -h                         # 显示帮助
+帮助:
+  agent-proxy --help  /  -h                                        显示帮助
 ```
 
 详细用法见 [MANUAL.md](MANUAL.md)。
 
 ## 快速模式 vs 复杂模式
 
-| 维度 | 快速模式（`--db N`） | 复杂模式（默认） |
-|------|---------------------|-----------------|
-| 启动方式 | `.\agent-proxy.exe --db 1` | `.\agent-proxy.exe` |
-| Provider 来源 | SQLite 数据库一条记录 | 内置配置（可改） |
+| 维度 | 快速模式（`--mode simple`） | 复杂模式（`--mode complex`） |
+|------|---------------------------|----------------------------|
+| 启动方式 | `agent-proxy run --mode simple --db 1` | `agent-proxy run --mode complex` |
+| Provider 来源 | SQLite 数据库一条记录 | 内置配置 或 `--conf` 配置文件 |
 | 多 Provider | 不支持 | 支持（路由前缀匹配） |
 | 协议翻译 | 支持（自动按 Provider 类型） | 支持（完整 4 协议） |
 | Web UI | 无 | 有（`/ui`） |
@@ -114,68 +96,28 @@ agent-proxy 处理以下 8 大协议差异：
 | 7 | Stop reason | end_turn → stop；max_tokens → length |
 | 8 | SSE 事件格式 | CC 无 event 行；Anthropic 用 type 字段 |
 
-## CLI 命令速查
+## 配置文件
 
-### 添加代理
+复杂模式支持 `--conf` 指定 JSON 配置文件（参见 [`config.example.json`](config.example.json)）：
 
-```powershell
-# 自动嗅探模型并保存到 DB（推荐）
-.\agent-proxy.exe add --url https://api.example.com/v1 \
-                      --key sk-xxx \
-                      --name my-provider \
-                      --type openai
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8080 },
+  "providers": {
+    "sensenova": {
+      "base_url": "https://token.sensenova.cn",
+      "api_token": "sk-xxx",
+      "provider_type": "openai",
+      "models": ["sensenova-6.7-flash-lite", "deepseek-v4-flash"]
+    }
+  },
+  "model_router": {
+    "model_to_provider": { "sensenova-": "sensenova" },
+    "default_provider": "sensenova",
+    "prefix_match": true
+  }
+}
 ```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--url` | （必填） | Provider API 地址 |
-| `--key` | （必填） | API Key |
-| `--name` | URL 值 | 别名 |
-| `--type` | `openai` | `openai` / `anthropic` / `gemini` |
-
-### 查询 / 管理
-
-```powershell
-# 列出所有
-.\agent-proxy.exe list
-
-# 查看详情
-.\agent-proxy.exe show 1
-
-# 删除（需确认）
-.\agent-proxy.exe rm 1
-```
-
-## 配置
-
-复杂模式下通过环境变量配置 Provider：
-
-```powershell
-# 主代理（Sensenova / OpenAI 兼容）
-$env:AGENT_PROXY_API_KEY = "sk-your-key"
-
-# Anthropic（可选）
-$env:ANTHROPIC_API_KEY = "sk-ant-xxx"
-```
-
-默认配置（`cmd/server/main.go` 中可自定义）：
-
-| Provider | URL | 类型 | 默认模型 |
-|----------|-----|------|---------|
-| sensenova | `https://token.sensenova.cn` | openai | sensenova-6.7-flash-lite 等 |
-| anthropic | `https://api.anthropic.com` | anthropic | claude-3-5-sonnet 等 |
-
-## 模型路由
-
-复杂模式通过模型前缀匹配 Provider：
-
-| 前缀 | 路由到 |
-|------|--------|
-| `sensenova-` | sensenova |
-| `deepseek-` | sensenova |
-| `glm-` | sensenova |
-| `claude-` | anthropic |
-| `gemini-` | gemini（需配置） |
 
 ## Web UI
 
@@ -190,7 +132,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-xxx"
 ## 性能与部署
 
 - 单二进制部署（`embed.FS` 嵌入静态资源）
-- 零外部依赖运行时（除 SQLite 为纯 Go 实现）
+- 零外部依赖运行时（SQLite 为纯 Go 实现）
 - 连接池 / 限流器（令牌桶）
 - 优雅关闭（SIGINT / SIGTERM）
 
@@ -198,45 +140,41 @@ $env:ANTHROPIC_API_KEY = "sk-ant-xxx"
 
 ```
 agent-proxy/
-├── main.go (cmd/server/)           # 入口 + 双模式启动
-├── cli.go (cmd/)                   # CLI 命令实现
-├── agent-proxy                     # Windows 二进制
+├── cmd/
+│   ├── server/main.go         # 入口：run/db/list/show/add/rm 子命令
+│   └── cli.go                 # DB 管理实现
+├── config.example.json        # 复杂模式配置文件示例
 ├── go.mod / go.sum
-├── .env.example                    # 环境变量示例
+├── .env.example
+├── README.md
+├── MANUAL.md                  # 完整用户手册
 └── internal/
-    ├── config/config.go            # 配置结构
-    ├── db/db.go                    # SQLite 持久化
-    ├── middleware/middleware.go    # 中间件（Logger/CORS/Auth）
-    ├── monitor/store.go            # 监控指标存储
+    ├── config/config.go       # 配置结构 + JSON 加载
+    ├── db/db.go               # SQLite 持久化
+    ├── middleware/middleware.go
+    ├── monitor/store.go
     ├── protocol/
-    │   ├── schema/internal.go      # 中枢消息模型
-    │   ├── chatcompletion/         # CC 协议定义 + 翻译器
-    │   ├── anthropic/              # Anthropic Messages
-    │   ├── gemini/                 # Google Gemini
-    │   └── responses/              # OpenAI Responses
+    │   ├── schema/internal.go
+    │   ├── chatcompletion/
+    │   ├── anthropic/
+    │   ├── gemini/
+    │   └── responses/
     ├── provider/
-    │   ├── provider.go             # Provider 接口
-    │   └── openai.go               # 客户端实现
-    ├── router/router.go            # 模型路由器
+    │   ├── provider.go
+    │   └── openai.go
+    ├── router/router.go
     ├── server/
-    │   ├── gateway.go              # 复杂模式网关
-    │   ├── quick.go                # 快速模式网关
-    │   └── ratelimiter.go          # 令牌桶限流
-    ├── translator/interfaces.go    # 翻译器接口
+    │   ├── gateway.go
+    │   ├── quick.go
+    │   └── ratelimiter.go
+    ├── translator/interfaces.go
     └── web/
-        ├── server.go               # Web UI + API
-        └── static/                 # 嵌入静态资源
+        ├── server.go
+        └── static/
             ├── index.html
             ├── dashboard.css
             └── dashboard.js
 ```
-
-## 扩展新协议
-
-1. 在 `internal/protocol/` 下新建目录，定义 `types.go`
-2. 实现 `translator.go`，注册到 `CombinedTranslator` 接口
-3. 在 `internal/provider/` 下添加对应的 Client
-4. 在 `internal/translator/interfaces.go` 注册
 
 ## License
 
