@@ -15,7 +15,8 @@ def api(method, url, data=None):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
+            text = resp.read().decode()
+            return json.loads(text) if text else None
     except urllib.error.HTTPError as e:
         print(f"  HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
         return None
