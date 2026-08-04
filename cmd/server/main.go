@@ -139,7 +139,7 @@ func runDBAdd(args []string) {
 
 // runServer 解析启动参数并启动服务
 func runServer(args []string) {
-	host := "0.0.0.0"
+	host := "127.0.0.1"
 	port := 8080
 	mode := ""
 	dbID := -1
@@ -159,9 +159,9 @@ func runServer(args []string) {
 		}
 	}
 
-	// --mode simple --db N   → 快速模式
+	// --db N        → 快速模式（默认，需指定 --db）
 	// --mode complex [--conf] → 复杂模式
-	// 无 --mode 也无 --db     → 默认复杂模式
+	// 无 --db 也无 --mode → 默认复杂模式
 	quickMode := mode == "simple" || dbID > 0
 	if mode == "complex" {
 		quickMode = false
@@ -205,12 +205,19 @@ func runServer(args []string) {
 
 	if quickMode {
 		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://%s:%d\n", host, port)
-		fmt.Printf("📝 POST http://localhost:%d/v1/chat/completions\n", port)
-		fmt.Printf("🏥 http://localhost:%d/health\n", port)
+		fmt.Printf("📝 Chat Completions: POST http://localhost:%d/v1/chat/completions\n", port)
+		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
+		fmt.Printf("🔮 Gemini:            POST http://localhost:%d/v1/models/{model}:generateContent\n", port)
+		fmt.Printf("🤖 OpenAI Responses: POST http://localhost:%d/v1/responses\n", port)
+		fmt.Printf("🏥 Health check:      GET  http://localhost:%d/health\n", port)
 	} else {
 		fmt.Printf("\n🚀 Agent-Proxy (复杂模式) running on http://%s:%d\n", host, port)
 		fmt.Printf("📊 Web UI: http://localhost:%d/ui\n", port)
 		fmt.Printf("📝 Chat Completions: POST http://localhost:%d/v1/chat/completions\n", port)
+		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
+		fmt.Printf("🔮 Gemini:            POST http://localhost:%d/v1/models/{model}:generateContent\n", port)
+		fmt.Printf("🤖 OpenAI Responses: POST http://localhost:%d/v1/responses\n", port)
+		fmt.Printf("🏥 Health check:      GET  http://localhost:%d/health\n", port)
 	}
 
 	if err := srv.ListenAndServe(); err != nil {
@@ -320,22 +327,33 @@ func printUsage() {
 🔗 Agent-Proxy — AI 消息协议网关
 
 启动命令:
-  agent-proxy run --mode simple --host <h> --port <p> --db <id>   快速模式
-  agent-proxy run --mode complex --host <h> --port <p>             复杂模式（默认配置）
+  agent-proxy run --db <id>                           快速模式（默认，只监听本机）
+  agent-proxy run --db <id> --host <h> --port <p>    快速模式（可指定监听地址/端口）
+  agent-proxy run --mode complex                       复杂模式（默认配置）
   agent-proxy run --mode complex --host <h> --port <p> --conf <f>  复杂模式（配置文件）
 
+  参数说明:
+    --db <id>    从数据库选一条记录启动（快速模式）
+    --host       监听地址（默认 127.0.0.1，用 0.0.0.0 允许远程访问）
+    --port       监听端口（默认 8080）
+    --mode       simple / complex（默认由 --db 自动判断）
+    --conf       复杂模式配置文件路径
+
 数据库命令:
-  agent-proxy db list                                              列出所有记录
-  agent-proxy db show <id>                                         显示详情
-  agent-proxy db add --url <u> --key <k> [--name <n>] [--type <t>] 添加记录
-  agent-proxy db rm <id>                                           删除记录
+  agent-proxy db list                                    列出所有记录
+  agent-proxy db show <id>                               显示详情
+  agent-proxy db add --url <u> --key <k> [--name <n>]    添加记录
+  agent-proxy db rm <id>                                 删除记录
 
 示例:
   # 添加 Sensenova
   agent-proxy db add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
 
-  # 快速启动
-  agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
+  # 快速启动（本机）
+  agent-proxy run --db 1
+
+  # 快速启动（允许远程访问）
+  agent-proxy run --db 1 --host 0.0.0.0 --port 8080
 
   # 复杂模式
   agent-proxy run --mode complex --host 0.0.0.0 --port 8080
