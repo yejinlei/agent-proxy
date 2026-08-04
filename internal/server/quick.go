@@ -21,13 +21,13 @@ import (
 
 // QuickGateway 超简易模式：从 DB 选一条记录，支持 4×4 全协议互转
 type QuickGateway struct {
-	proxyName     string
-	info          *schema.ProviderInfo
-	provider      provider.Provider
+	proxyName          string
+	info               *schema.ProviderInfo
+	provider           provider.Provider
 	translatorRegistry *translator.TranslatorRegistry
 	// 透传上游 /v1/models 用的
-	proxyBaseURL  string // 带 /v1 后缀的上游 base URL
-	proxyKey      string
+	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
+	proxyKey     string
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -60,7 +60,7 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int) *Q
 		},
 		provider:           p,
 		translatorRegistry: registry,
-		proxyBaseURL:       strings.TrimSuffix(baseURL, "/") + "/v1",
+		proxyBaseURL:       strings.TrimSuffix(baseURL, "/"),
 		proxyKey:           apiKey,
 	}
 }
@@ -339,7 +339,7 @@ func (q *QuickGateway) sendError(w http.ResponseWriter, code int, typ, msg strin
 
 // handleModels 透传上游 /v1/models，实时获取模型列表
 func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
-	modelsURL := q.proxyBaseURL + "/models"
+	modelsURL := q.proxyBaseURL + "/v1/models"
 	req, err := http.NewRequest("GET", modelsURL, nil)
 	if err != nil {
 		q.sendError(w, http.StatusInternalServerError, "proxy_error", err.Error())
