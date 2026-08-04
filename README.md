@@ -22,6 +22,32 @@ agent-proxy 是 **4×4 全协议互转** 的 AI 协议中间件：OpenAI Compati
 - **Model Router**：模型前缀匹配到 Provider
 - **Web UI**：嵌入静态资源（embed.FS），实时指标推送
 
+## 编译
+
+> 本项目使用 Go 编写，编译后为单二进制文件，零外部依赖。
+
+### Windows（本地编译）
+
+```powershell
+go build -o agent-proxy.exe -ldflags="-s -w" ./cmd/server/main.go
+```
+
+### 跨平台编译
+
+```bash
+# 编译 Windows amd64
+GOOS=windows GOARCH=amd64 go build -o agent-proxy.exe -ldflags="-s -w" ./cmd/server/main.go
+
+# 编译 Linux amd64
+GOOS=linux GOARCH=amd64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
+
+# 编译 macOS amd64 / arm64
+GOOS=darwin GOARCH=amd64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
+GOOS=darwin GOARCH=arm64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
+```
+
+`-ldflags="-s -w"` 剥离调试信息，减小二进制体积。
+
 ## 快速开始
 
 ```powershell
