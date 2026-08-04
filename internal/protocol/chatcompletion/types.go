@@ -28,19 +28,28 @@ type Message struct {
 	Name       string     `json:"name,omitempty"`
 }
 
+// Content 支持字符串或 content block 数组，通过 json.RawMessage 保留原始 JSON
 type Content struct {
-	r typeDiscriminator
+	raw json.RawMessage
 }
 
-type typeDiscriminator struct{}
+// Raw 返回 Content 的原始 JSON
+func (c Content) Raw() json.RawMessage { return c.raw }
 
-// UnmarshalJSON 多态解析 content
+// MarshalJSON 输出保留的原始 JSON
+func (c Content) MarshalJSON() ([]byte, error) {
+	if c.raw != nil {
+		return c.raw, nil
+	}
+	return nil, nil
+}
+
+// UnmarshalJSON 多态解析 content（保留原始 JSON）
 func (c *Content) UnmarshalJSON(data []byte) error {
+	c.raw = data
 	// 先尝试 string
 	var s string
 	if err := json.Unmarshal(data, &s); err == nil {
-		c.r = typeDiscriminator{}
-		_ = s
 		return nil
 	}
 	// 再尝试 []ContentBlock（通用 content block 格式）
