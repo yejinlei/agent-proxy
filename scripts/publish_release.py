@@ -10,7 +10,7 @@ REPO = "yejinlei/agent-proxy"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 BINARY = os.path.join(PROJECT_DIR, "agent-proxy.exe")
-TAG = "v0.1.0"
+TAG = "v0.2.0"
 
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
@@ -131,7 +131,7 @@ def main():
 
 | 模式 | 命令 | 适用场景 |
 |------|------|---------|
-| **快速模式** | `agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1` | 单一端点、快速试用 |
+| **快速模式** | `agent-proxy run --db 1` | 单一端点、快速试用 |
 | **复杂模式** | `agent-proxy run --mode complex --conf config.json` | 生产环境、多厂商调度、Web UI 监控 |
 
 ### 📥 下载
@@ -153,8 +153,11 @@ SHA256: {checksum}
 agent-proxy db add --url https://token.sensenova.cn/v1 `
                   --key sk-xxx --name sensenova
 
-# === 2. 快速模式启动 ===
-agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
+# === 2. 快速启动（本机） ===
+agent-proxy run --db 1
+
+# === 2b. 允许远程访问 ===
+agent-proxy run --db 1 --host 0.0.0.0
 
 # === 3. 4 种协议任意调用 ===
 # OpenAI Compatible
