@@ -34,10 +34,7 @@ func (t *ChatCompletionTranslator) TranslateRequest(rawReq json.RawMessage) (*sc
 
 	for _, msg := range ccReq.Messages {
 		if msg.Role == "system" {
-			// 提取原始 content JSON（保留多模态信息）
-			if raw, err := json.Marshal(msg.Content); err == nil {
-				systemContent = raw
-			}
+			systemContent = msg.Content.Raw()
 			continue
 		}
 		messages = append(messages, messageToInternal(msg))
@@ -103,7 +100,7 @@ func messageToInternal(msg Message) schema.InternalMessage {
 
 	return schema.InternalMessage{
 		Role:       schema.Role(msg.Role),
-		Content:    nil, // content 是简单 string，不需要 RawMessage 包装
+		Content:    msg.Content.Raw(),
 		ToolCalls:  toolCalls,
 		ToolCallID: msg.ToolCallID,
 		Name:       msg.Name,
@@ -172,10 +169,7 @@ func InternalToCCResponse(resp *schema.InternalResponse) *ChatCompletionResponse
 	}
 
 	for i, choice := range resp.Choices {
-		var content string
-		if choice.Message.Content != nil {
-			json.Unmarshal(choice.Message.Content, &content)
-		}
+		content := unmarshalJSONString(choice.Message.Content)
 		toolCalls := make([]ToolCall, len(choice.Message.ToolCalls))
 		for j, tc := range choice.Message.ToolCalls {
 			toolCalls[j] = ToolCall{
@@ -222,4 +216,16 @@ func (t *ChatCompletionTranslator) TranslateError(err *schema.StreamError) json.
 	resp := ErrorResponse{Error: &ccErr}
 	data, _ := json.Marshal(resp)
 	return data
+}
+
+// unmarshalJSONString 将 json.RawMessage 解析为 string
+func unmarshalJSONString(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
 }

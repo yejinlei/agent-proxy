@@ -508,7 +508,8 @@ func chatCompletionToInternal(ccResp *chatcompletion.ChatCompletionResponse) *sc
 			Role: schema.Role(c.Message.Role),
 		}
 		if c.Message.Content != "" {
-			msg.Content = json.RawMessage(`"` + c.Message.Content + `"`)
+			// 裸字符串 → 合法 JSON 字符串（带外层引号）
+			msg.Content, _ = json.Marshal(c.Message.Content)
 		}
 		for _, tc := range c.Message.ToolCalls {
 			msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
