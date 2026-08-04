@@ -143,7 +143,7 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 				if !ok {
 					continue
 				}
-				if block["type"] == "output_text" {
+				if block["type"] == "output_text" || block["type"] == "input_text" {
 					if t, ok := block["text"].(string); ok {
 						textParts = append(textParts, t)
 					}
@@ -383,6 +383,27 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 			continue // system 已提取到 instructions
 		}
 
+		// ⚠️ RoleTool: 在 Responses 入站中必须构造为 tool_result 内容块
+		if msg.Role == schema.RoleTool {
+			var contentText string
+			if msg.Content != nil {
+				json.Unmarshal(msg.Content, &contentText)
+			}
+			// tool_result 的 content 是嵌套的 content block 数组
+			toolResultContent, _ := json.Marshal([]ContentBlock{
+				{Type: "input_text", Text: contentText},
+			})
+			items = append(items, InputItem{
+				Type: "message",
+				Role: "user",
+				Content: json.RawMessage(toolResultContent),
+				ToolCalls: []ToolCall{
+					{Type: "function", ID: msg.ToolCallID, Name: msg.Name},
+				},
+			})
+			continue
+		}
+
 		item := InputItem{
 			Type: "message",
 			Role: string(msg.Role),
@@ -397,7 +418,7 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 		// 如果有 tool_calls，需要转换为 Responses tool_call blocks
 		if len(msg.ToolCalls) > 0 {
 			contentBlocks := []ContentBlock{
-				{Type: "output_text", Text: text},
+				{Type: "input_text", Text: text},
 			}
 			for _, tc := range msg.ToolCalls {
 				// ⚠️ input 是 JSON 对象
@@ -414,8 +435,8 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 			}
 			item.Content = contentBlocks
 		} else {
-			// 简单文本
-			item.Content = ContentBlock{Type: "output_text", Text: text}
+			// 简单文本（请求侧用 input_text）
+			item.Content = ContentBlock{Type: "input_text", Text: text}
 		}
 
 		items = append(items, item)

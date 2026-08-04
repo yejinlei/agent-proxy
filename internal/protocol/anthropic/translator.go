@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
@@ -458,12 +459,17 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 			})
 
 		case schema.RoleTool:
-			// ⚠️ Anthropic 将 tool 结果归为 user 消息
+			// ⚠️ Anthropic 将 tool 结果归为 user 消息；结果文本从 msg.Content 读取
+			var contentText string
+			if msg.Content != nil {
+				json.Unmarshal(msg.Content, &contentText)
+			}
+			escaped := strings.ReplaceAll(contentText, `"`, `\"`)
 			toolContent, _ := json.Marshal([]ContentBlock{
 				{
 					Type:      "tool_result",
 					ToolUseID: msg.ToolCallID,
-					Content:   json.RawMessage(`[{"type":"text","text":"` + msg.Name + `"}]`),
+					Content:   json.RawMessage(`[{"type":"text","text":"` + escaped + `"}]`),
 				},
 			})
 			result = append(result, Message{

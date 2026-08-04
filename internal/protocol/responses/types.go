@@ -68,11 +68,12 @@ type OutputItem struct {
 }
 
 type ContentBlock struct {
-	Type  string                 `json:"type"`  // "output_text" | "refusal" | "tool_call"
-	Text  string                 `json:"text"`
-	ID    string                 `json:"id,omitempty"`
-	Name  string                 `json:"name,omitempty"`
-	Input map[string]interface{} `json:"input,omitempty"`
+	Type      string                 `json:"type"`  // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text"
+	Text      string                 `json:"text"`
+	ID        string                 `json:"id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Input     map[string]interface{} `json:"input,omitempty"`
+	ToolUseID string                 `json:"tool_call_id,omitempty"` // tool_result 引用
 }
 
 type Usage struct {

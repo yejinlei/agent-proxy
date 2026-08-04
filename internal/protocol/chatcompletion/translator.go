@@ -56,9 +56,11 @@ func (t *ChatCompletionTranslator) TranslateRequest(rawReq json.RawMessage) (*sc
 	// --- 3. ResponseFormat ---
 	var respFmt *schema.InternalResponseFormat
 	if ccReq.ResponseFormat != nil {
-		respFmt = &schema.InternalResponseFormat{
-			Type: ccReq.ResponseFormat.Type,
+		jf := &schema.InternalResponseFormat{Type: ccReq.ResponseFormat.Type}
+		if ccReq.ResponseFormat.JSONSchema != nil {
+			jf.JsonSchema = ccReq.ResponseFormat.JSONSchema.Schema
 		}
+		respFmt = jf
 	}
 
 	return &schema.InternalRequest{
@@ -142,19 +144,76 @@ func (t *ChatCompletionTranslator) TranslateStream(ctx context.Context, events <
 				return
 			}
 			if event.Type == "error" {
-				errData, _ := json.Marshal(event.Error)
-				fn(append([]byte(`data: {"error":`), errData...), false)
-				fn([]byte("}\n\n"), false)
-				continue
+				errObj := map[string]interface{}{
+					"error": map[string]interface{}{
+						"message": event.Error.Message,
+						"type":    "invalid_request_error",
+						"code":    event.Error.Code,
+					},
+				}
+				errData, _ := json.Marshal(errObj)
+				fn(append([]byte("data: "), append(errData, '\n', '\n')...), false)
+				fn([]byte("data: [DONE]\n\n"), true)
+				return
 			}
 			if event.Type == "done" {
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
-			chunkData, _ := json.Marshal(event.Data)
-			fn(append([]byte("data: "), chunkData...), false)
-			fn([]byte("\n\n"), false)
+			// 将 InternalStreamChunk 转换为 CC 格式 delta chunk
+			if event.Data == nil {
+				continue
+			}
+			chunk := buildCCStreamChunk(event.Data)
+			chunkData, _ := json.Marshal(chunk)
+			fn(append([]byte("data: "), append(chunkData, '\n', '\n')...), false)
 		}
+	}
+}
+
+// buildCCStreamChunk 将 InternalStreamChunk 转为 CC SSE 格式（含 delta 字段）
+func buildCCStreamChunk(chunk *schema.InternalStreamChunk) *ChatCompletionStreamChunk {
+	choices := make([]StreamChoice, len(chunk.Choices))
+	for i, c := range chunk.Choices {
+		if c.FinishReason != "" {
+			choices[i] = StreamChoice{Index: c.Index, FinishReason: c.FinishReason}
+			continue
+		}
+		delta := StreamDelta{}
+		if c.Message.Role != "" {
+			delta.Role = string(c.Message.Role)
+		}
+		if c.Message.Content != nil {
+			var text string
+			if json.Unmarshal(c.Message.Content, &text) == nil {
+				delta.Content = text
+			}
+		}
+		for _, tc := range c.Message.ToolCalls {
+			delta.ToolCalls = append(delta.ToolCalls, ToolCall{
+				ID:   tc.ID,
+				Type: tc.Type,
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: tc.Function.Name, Arguments: tc.Function.Arguments},
+			})
+		}
+		choices[i] = StreamChoice{Index: c.Index, Delta: delta, FinishReason: c.FinishReason}
+	}
+	usage := &Usage{}
+	if chunk.Usage != nil {
+		usage.PromptTokens = chunk.Usage.PromptTokens
+		usage.CompletionTokens = chunk.Usage.CompletionTokens
+		usage.TotalTokens = chunk.Usage.TotalTokens
+	}
+	return &ChatCompletionStreamChunk{
+		ID:      chunk.ID,
+		Object:  "chat.completion.chunk",
+		Model:   chunk.Model,
+		Created: chunk.Created,
+		Choices: choices,
+		Usage:   usage,
 	}
 }
 
@@ -227,5 +286,6 @@ func unmarshalJSONString(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
-	return ""
+	// 非纯字符串（如内容块数组），回退为原始 JSON 字符串，避免静默丢弃
+	return string(raw)
 }
