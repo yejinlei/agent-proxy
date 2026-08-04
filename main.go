@@ -324,7 +324,7 @@ func normalizeBaseURL(url string) string {
 }
 
 func printUsage() {
-	fmt.Println(`
+	fmt.Print(`
 
 🔗 Agent-Proxy — AI 消息协议网关
 

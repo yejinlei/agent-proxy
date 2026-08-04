@@ -130,7 +130,7 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		})
 		linesCh <- meta
 
-		reader := lineReader(resp.Body)
+		reader := lineReader(ctx, resp.Body)
 
 		for {
 			select {
@@ -163,7 +163,7 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 }
 
 // lineReader 从 io.Reader 中逐行读取，返回 []byte（不含换行符）
-func lineReader(r io.Reader) func() ([]byte, error) {
+func lineReader(ctx context.Context, r io.Reader) func() ([]byte, error) {
 	buf := make([]byte, 4096)
 	pos := 0
 	needFlush := false
@@ -171,8 +171,8 @@ func lineReader(r io.Reader) func() ([]byte, error) {
 	return func() ([]byte, error) {
 		for {
 			select {
-			case <-context.Background().Done():
-				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			default:
 			}
 
@@ -317,7 +317,7 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 		})
 		linesCh <- meta
 
-		reader := lineReader(resp.Body)
+		reader := lineReader(ctx, resp.Body)
 		for {
 			select {
 			case <-ctx.Done():
@@ -448,7 +448,7 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 		})
 		linesCh <- meta
 
-		reader := lineReader(resp.Body)
+		reader := lineReader(ctx, resp.Body)
 		for {
 			select {
 			case <-ctx.Done():

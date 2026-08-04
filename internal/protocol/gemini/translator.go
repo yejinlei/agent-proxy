@@ -531,8 +531,13 @@ func toolsToGemini(tools []schema.InternalTool) []FunctionDeclaration {
 }
 
 func buildGenerationConfig(req *schema.InternalRequest) *GenerationConfig {
+	// ⚠️ 优先使用 MaxOutputTokens（Responses 协议），否则回退到 MaxTokens（CC/Anthropic 协议）
+	maxTokens := req.MaxOutputTokens
+	if maxTokens == 0 {
+		maxTokens = req.MaxTokens
+	}
 	cfg := &GenerationConfig{
-		MaxOutputTokens: req.MaxOutputTokens,
+		MaxOutputTokens: maxTokens,
 		StopSequences:   req.StopSequences,
 		Temperature:     req.Temperature,
 		TopP:            req.TopP,
@@ -618,9 +623,13 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 	// --- 3. FinishReason 映射（兼容性 8） ---
 	finishReason := mapFinishReason(candidate.FinishReason)
 
+	model := candidate.Content.Role
+	if model == "" {
+		model = resp.ModelVersion
+	}
 	return &schema.InternalResponse{
 		ID:    "",
-		Model: candidate.Content.Role,
+		Model: model,
 		Choices: []schema.InternalChoice{
 			{
 				Index:        candidate.Index,
@@ -682,22 +691,7 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 
 	candidate := chunk.Candidates[0]
 
-	// --- 检查结束条件 ---
-	if candidate.FinishReason != "" {
-		return &schema.InternalStreamEvent{
-			Type: "done",
-			Data: &schema.InternalStreamChunk{
-				Choices: []schema.InternalChoice{
-					{
-						Index:        candidate.Index,
-						FinishReason: mapFinishReason(candidate.FinishReason),
-					},
-				},
-			},
-		}
-	}
-
-	// --- 提取文本和 function_calls ---
+	// --- 提取文本和 function_calls（即使有 finish_reason 也要提取，末 chunk 可能含文本） ---
 	var deltaContent json.RawMessage
 	var toolCalls []schema.InternalToolCall
 
@@ -741,6 +735,25 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 			PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
 			CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
 			TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
+		}
+	}
+
+	// --- 结束条件 ---
+	if candidate.FinishReason != "" {
+		return &schema.InternalStreamEvent{
+			Type: "done",
+			Data: &schema.InternalStreamChunk{
+				ID:    "",
+				Model: chunk.ModelVersion,
+				Choices: []schema.InternalChoice{
+					{
+						Index:        candidate.Index,
+						Message:      msg,
+						FinishReason: mapFinishReason(candidate.FinishReason),
+					},
+				},
+				Usage: usage,
+			},
 		}
 	}
 

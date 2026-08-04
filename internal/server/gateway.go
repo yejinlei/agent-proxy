@@ -338,17 +338,42 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 					events <- *event
 				}
 			} else {
-				// OpenAI 兼容：透传，构建 delta 事件
+				// OpenAI 兼容：解析 SSE delta 行
+				var ccChunk chatcompletion.ChatCompletionStreamChunk
+				if json.Unmarshal(line, &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+					continue
+				}
+				choice := ccChunk.Choices[0]
+				msg := schema.InternalMessage{Role: schema.RoleAssistant}
+				if choice.Delta.Content != "" {
+					msg.Content, _ = json.Marshal(choice.Delta.Content)
+				}
+				for _, tc := range choice.Delta.ToolCalls {
+					msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
+						ID:   tc.ID,
+						Type: tc.Type,
+						Function: struct {
+							Name         string          `json:"name"`
+							Arguments    string          `json:"arguments"`
+							RawArguments json.RawMessage `json:"-"`
+						}{
+							Name:         tc.Function.Name,
+							Arguments:    tc.Function.Arguments,
+							RawArguments: json.RawMessage(tc.Function.Arguments),
+						},
+					})
+				}
 				events <- schema.InternalStreamEvent{
 					Type: "delta",
 					Data: &schema.InternalStreamChunk{
+						ID:    ccChunk.ID,
+						Model: ccChunk.Model,
 						Choices: []schema.InternalChoice{{
-							Index: 0,
-							Message: schema.InternalMessage{
-								Role:    schema.RoleAssistant,
-								Content: line,
-							},
+							Index:        choice.Index,
+							Message:      msg,
+							FinishReason: choice.FinishReason,
 						}},
+						Usage: mapInternalUsage(ccChunk.Usage),
 					},
 				}
 			}
@@ -567,6 +592,18 @@ func (g *Gateway) sendError(w http.ResponseWriter, protocol string, code int, er
 	w.Write(data)
 }
 
+// mapInternalUsage 将 CC Usage 映射为 InternalUsage
+func mapInternalUsage(u *chatcompletion.Usage) *schema.InternalUsage {
+	if u == nil {
+		return nil
+	}
+	return &schema.InternalUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+}
+
 // recordRequest 记录请求到监控
 func (g *Gateway) recordRequest(r *http.Request, startTime time.Time, provider string, statusCode int, latencyMs int64, errorMsg string) {
 	g.store.Record(schema.RequestRecord{
@@ -606,7 +643,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
-		"uptime":         time.Since(time.Now()).String(),
+		"uptime":         time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		"active_conns":   g.store.GetSummary()["active_conns"],
 		"total_requests": g.store.GetSummary()["total_requests"],
 		"providers":      g.router.GetProviderNames(),

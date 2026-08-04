@@ -259,17 +259,42 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 					events <- *event
 				}
 			} else {
-				// OpenAI 兼容：透传，构建 delta 事件
+				// OpenAI 兼容：解析 SSE delta 行
+				var ccChunk chatcompletion.ChatCompletionStreamChunk
+				if json.Unmarshal(line, &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+					continue
+				}
+				choice := ccChunk.Choices[0]
+				msg := schema.InternalMessage{Role: schema.RoleAssistant}
+				if choice.Delta.Content != "" {
+					msg.Content, _ = json.Marshal(choice.Delta.Content)
+				}
+				for _, tc := range choice.Delta.ToolCalls {
+					msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
+						ID:   tc.ID,
+						Type: tc.Type,
+						Function: struct {
+							Name         string          `json:"name"`
+							Arguments    string          `json:"arguments"`
+							RawArguments json.RawMessage `json:"-"`
+						}{
+							Name:         tc.Function.Name,
+							Arguments:    tc.Function.Arguments,
+							RawArguments: json.RawMessage(tc.Function.Arguments),
+						},
+					})
+				}
 				events <- schema.InternalStreamEvent{
 					Type: "delta",
 					Data: &schema.InternalStreamChunk{
+						ID:    ccChunk.ID,
+						Model: ccChunk.Model,
 						Choices: []schema.InternalChoice{{
-							Index: 0,
-							Message: schema.InternalMessage{
-								Role:    schema.RoleAssistant,
-								Content: line,
-							},
+							Index:        choice.Index,
+							Message:      msg,
+							FinishReason: choice.FinishReason,
 						}},
+						Usage: mapInternalUsage(ccChunk.Usage),
 					},
 				}
 			}

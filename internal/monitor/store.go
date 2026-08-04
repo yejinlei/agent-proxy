@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,7 +78,7 @@ func (s *Store) Record(record schema.RequestRecord) {
 
 func (s *Store) aggregateMetrics(record schema.RequestRecord) {
 	now := time.Now().Unix()
-	key := record.Provider + "|" + record.Model + "|" + string(now)
+	key := record.Provider + "|" + record.Model + "|" + fmt.Sprintf("%d", now)
 
 	s.metricsLock.Lock()
 	defer s.metricsLock.Unlock()
@@ -222,7 +224,7 @@ type ProviderStatus struct {
 }
 
 func contains(s, substr string) bool {
-	return len(s) > 0 && (s == substr || len(s) > len(substr))
+	return strings.Contains(s, substr)
 }
 
 // MarshalJSON 为 SSE 推送格式
