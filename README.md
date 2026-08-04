@@ -4,9 +4,9 @@
 
 agent-proxy 是 **4×4 全协议互转** 的 AI 协议中间件：OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站协议可转换为任意出站协议**，彻底打通不同厂商的 API 格式差异。
 
-三种模式覆盖所有场景：
+两种模式覆盖所有场景：
 
-- **快速模式**：`agent-proxy run --mode simple --db N` 一条命令从 SQLite 选记录启动
+- **快速模式**（默认）：`agent-proxy run --db 1` 一条命令从 SQLite 选记录启动，4×4 全协议互转
 - **复杂模式**：`agent-proxy run --mode complex` 多 Provider 路由、Web UI 实时监控
 - **配置文件**：`agent-proxy run --mode complex --conf config.json` 完整 JSON 配置
 
@@ -55,8 +55,11 @@ GOOS=darwin GOARCH=arm64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/m
 agent-proxy db add --url https://token.sensenova.cn/v1 \
                   --key sk-xxx --name sensenova
 
-# === 2. 快速模式启动（从 DB 选一条记录）===
-agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
+# === 2. 快速启动（只需 --db）===
+agent-proxy run --db 1
+
+# 如需允许远程访问
+agent-proxy run --db 1 --host 0.0.0.0 --port 8080
 
 # === 3. 使用任意协议调用 ===
 # 3a. OpenAI Compatible 入站
@@ -87,27 +90,35 @@ curl -X POST http://localhost:8080/v1/responses \
 agent-proxy <subcommand> [options]
 
 启动命令:
-  agent-proxy run --mode simple --host <h> --port <p> --db <id>   快速模式
-  agent-proxy run --mode complex --host <h> --port <p>             复杂模式（默认配置）
-  agent-proxy run --mode complex --host <h> --port <p> --conf <f>  复杂模式（JSON 配置文件）
+  agent-proxy run --db <id>                    快速模式（默认，只监听本机 127.0.0.1）
+  agent-proxy run --db <id> --host 0.0.0.0     快速模式（允许远程访问）
+  agent-proxy run --mode complex                复杂模式（默认配置）
+  agent-proxy run --mode complex --conf <f>     复杂模式（JSON 配置文件）
+
+参数说明:
+  --db <id>   从数据库选一条记录启动（触发快速模式）
+  --host      监听地址（默认 127.0.0.1，用 0.0.0.0 允许远程访问）
+  --port      监听端口（默认 8080）
+  --mode      complex（显式进入复杂模式）
+  --conf      复杂模式配置文件路径
 
 数据库命令:
-  agent-proxy db list                                              列出所有记录
-  agent-proxy db show <id>                                         显示详情
-  agent-proxy db add --url <u> --key <k> [--name <n>] [--type <t>] 添加记录
-  agent-proxy db rm <id>                                           删除记录
+  agent-proxy db list                            列出所有记录
+  agent-proxy db show <id>                       显示详情
+  agent-proxy db add --url <u> --key <k> [--name <n>] 添加记录
+  agent-proxy db rm <id>                         删除记录
 
 帮助:
-  agent-proxy --help  /  -h                                        显示帮助
+  agent-proxy --help  /  -h                      显示帮助
 ```
 
 详细用法见 [MANUAL.md](MANUAL.md)。
 
 ## 快速模式 vs 复杂模式
 
-| 维度 | 快速模式（`--mode simple`） | 复杂模式（`--mode complex`） |
-|------|---------------------------|----------------------------|
-| 启动方式 | `agent-proxy run --mode simple --db 1` | `agent-proxy run --mode complex` |
+| 维度 | 快速模式（`--db`） | 复杂模式（`--mode complex`） |
+|------|-------------------|----------------------------|
+| 启动方式 | `agent-proxy run --db 1` | `agent-proxy run --mode complex` |
 | Provider 来源 | SQLite 数据库一条记录 | 内置配置 或 `--conf` 配置文件 |
 | 多 Provider | 不支持 | 支持（路由前缀匹配） |
 | 协议翻译 | 支持（自动按 Provider 类型） | 支持（完整 4 协议） |
