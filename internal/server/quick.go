@@ -21,10 +21,13 @@ import (
 
 // QuickGateway 超简易模式：从 DB 选一条记录，支持 4×4 全协议互转
 type QuickGateway struct {
-	proxyName          string
-	info               *schema.ProviderInfo
-	provider           provider.Provider
+	proxyName     string
+	info          *schema.ProviderInfo
+	provider      provider.Provider
 	translatorRegistry *translator.TranslatorRegistry
+	// 透传上游 /v1/models 用的
+	proxyBaseURL  string // 带 /v1 后缀的上游 base URL
+	proxyKey      string
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -57,6 +60,8 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int) *Q
 		},
 		provider:           p,
 		translatorRegistry: registry,
+		proxyBaseURL:       strings.TrimSuffix(baseURL, "/") + "/v1",
+		proxyKey:           apiKey,
 	}
 }
 
@@ -83,6 +88,8 @@ func (q *QuickGateway) Routes() chi.Router {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"ok","mode":"quick","provider":"%s"}`, q.proxyName)
 	})
+
+	mux.Get("/v1/models", q.handleModels)
 
 	// 4 个协议端点全部走统一的中枢翻译
 	mux.Post("/v1/chat/completions", q.handleChatCompletion)
@@ -328,4 +335,38 @@ func (q *QuickGateway) sendError(w http.ResponseWriter, code int, typ, msg strin
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	w.Write(data)
+}
+
+// handleModels 透传上游 /v1/models，实时获取模型列表
+func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
+	modelsURL := q.proxyBaseURL + "/models"
+	req, err := http.NewRequest("GET", modelsURL, nil)
+	if err != nil {
+		q.sendError(w, http.StatusInternalServerError, "proxy_error", err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+q.proxyKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		q.sendError(w, http.StatusBadGateway, "upstream_unreachable", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		q.sendError(w, resp.StatusCode, "upstream_error", string(body))
+		return
+	}
+
+	// 透传上游响应头
+	for k, v := range resp.Header {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }

@@ -209,6 +209,7 @@ func runServer(args []string) {
 		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
 		fmt.Printf("🔮 Gemini:            POST http://localhost:%d/v1/models/{model}:generateContent\n", port)
 		fmt.Printf("🤖 OpenAI Responses: POST http://localhost:%d/v1/responses\n", port)
+		fmt.Printf("🔍 Model list:        GET  http://localhost:%d/v1/models\n", port)
 		fmt.Printf("🏥 Health check:      GET  http://localhost:%d/health\n", port)
 	} else {
 		fmt.Printf("\n🚀 Agent-Proxy (复杂模式) running on http://%s:%d\n", host, port)
@@ -217,6 +218,7 @@ func runServer(args []string) {
 		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
 		fmt.Printf("🔮 Gemini:            POST http://localhost:%d/v1/models/{model}:generateContent\n", port)
 		fmt.Printf("🤖 OpenAI Responses: POST http://localhost:%d/v1/responses\n", port)
+		fmt.Printf("🔍 Model list:        GET  http://localhost:%d/v1/models\n", port)
 		fmt.Printf("🏥 Health check:      GET  http://localhost:%d/health\n", port)
 	}
 
