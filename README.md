@@ -29,24 +29,24 @@ agent-proxy 是 **4×4 全协议互转** 的 AI 协议中间件：OpenAI Compati
 ### Windows（本地编译）
 
 ```powershell
-go build -o agent-proxy.exe -ldflags="-s -w" ./cmd/server/main.go
+go build -o agent-proxy.exe .
 ```
 
 ### 跨平台编译
 
 ```bash
 # 编译 Windows amd64
-GOOS=windows GOARCH=amd64 go build -o agent-proxy.exe -ldflags="-s -w" ./cmd/server/main.go
+GOOS=windows GOARCH=amd64 go build -o agent-proxy.exe .
 
 # 编译 Linux amd64
-GOOS=linux GOARCH=amd64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
+GOOS=linux GOARCH=amd64 go build -o agent-proxy .
 
 # 编译 macOS amd64 / arm64
-GOOS=darwin GOARCH=amd64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
-GOOS=darwin GOARCH=arm64 go build -o agent-proxy -ldflags="-s -w" ./cmd/server/main.go
+GOOS=darwin GOARCH=amd64 go build -o agent-proxy .
+GOOS=darwin GOARCH=arm64 go build -o agent-proxy .
 ```
 
-`-ldflags="-s -w"` 剥离调试信息，减小二进制体积。
+`-ldflags="-s -w"` 可添加以剥离调试信息，进一步减小二进制体积。
 
 ## 快速开始
 
@@ -196,14 +196,14 @@ agent-proxy 处理以下 8 大协议差异：
 
 ```
 agent-proxy/
+├── main.go                  # 入口：run/db/list/show/add/rm 子命令
 ├── cmd/
-│   ├── server/main.go         # 入口：run/db/list/show/add/rm 子命令
-│   └── cli.go                 # DB 管理实现
-├── config.example.json        # 复杂模式配置文件示例
+│   └── cli.go               # DB 管理实现
+├── config.example.json      # 复杂模式配置文件示例
 ├── go.mod / go.sum
 ├── .env.example
 ├── README.md
-├── MANUAL.md                  # 完整用户手册
+├── MANUAL.md                # 完整用户手册
 └── internal/
     ├── config/config.go       # 配置结构 + JSON 加载
     ├── db/db.go               # SQLite 持久化
