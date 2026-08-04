@@ -3,7 +3,7 @@
 import json, os, sys, urllib.request, urllib.error
 
 REPO = "yejinlei/agent-proxy"
-TAG = "v0.1.0"
+TAG = "v0.2.0"
 BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent-proxy.exe")
 TOKEN = os.environ.get("GH_TOKEN", "")
 
