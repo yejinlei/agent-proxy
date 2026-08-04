@@ -85,7 +85,7 @@ def main():
 
     if not os.path.exists(BINARY):
         print(f"Binary not found: {BINARY}")
-        print("Run: go build -o agent-proxy.exe ./cmd/server")
+        print("Run: go build -o agent-proxy.exe .")
         sys.exit(1)
 
     checksum = sha256(BINARY)
