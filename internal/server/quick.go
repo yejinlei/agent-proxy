@@ -38,6 +38,8 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int) *Q
 		p = provider.NewAnthropicClient(name, baseURL, apiKey, "2023-06-01", timeout)
 	case "gemini":
 		p = provider.NewGeminiClient(name, baseURL, timeout)
+	case "responses":
+		p = provider.NewResponsesClient(name, baseURL, timeout)
 	default:
 		p = provider.NewOpenAIClient(name, baseURL, timeout)
 	}
@@ -95,7 +97,9 @@ func (q *QuickGateway) Routes() chi.Router {
 	mux.Post("/v1/chat/completions", q.handleChatCompletion)
 	mux.Post("/v1/messages", q.handleMessages)
 	mux.Post("/v1/responses", q.handleResponses)
-	mux.Post("/v1/models/{model}/generateContent", q.handleGenerateContent)
+
+	// Gemini: /v1/models/{model}:generateContent — chi * wildcard for colon separator
+	mux.Post("/v1/models/*", q.handleModelsCatchAll)
 
 	return mux
 }
@@ -151,6 +155,17 @@ func (q *QuickGateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 func (q *QuickGateway) handleGenerateContent(w http.ResponseWriter, r *http.Request) {
 	q.handleRequest(w, r, "gemini")
+}
+
+// handleModelsCatchAll 通配 /v1/models/*，处理冒号分隔的 Gemini 路径
+// 格式：/v1/models/{model}:generateContent
+func (q *QuickGateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Request) {
+	suffix := chi.URLParam(r, "*")
+	if !strings.HasSuffix(suffix, ":generateContent") {
+		http.NotFound(w, r)
+		return
+	}
+	q.handleGenerateContent(w, r)
 }
 
 // handleNonStreamResponse 非流式响应
