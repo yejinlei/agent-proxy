@@ -78,6 +78,8 @@ func NewGateway(cfg *config.Config) *Gateway {
 			providerRegistry.Register(provider.NewAnthropicClient(name, pc.BaseURL, pc.APIToken, pc.APIVersion, pc.TimeoutSec))
 		case "gemini":
 			providerRegistry.Register(provider.NewGeminiClient(name, pc.BaseURL, pc.TimeoutSec))
+		case "responses":
+			providerRegistry.Register(provider.NewResponsesClient(name, pc.BaseURL, pc.TimeoutSec))
 		}
 	}
 
@@ -137,7 +139,10 @@ func (g *Gateway) Routes() chi.Router {
 	mux.Post("/v1/messages", g.handleMessages)
 	mux.Post("/v1/responses", g.handleResponses)
 	mux.Post("/v1/models", g.handleModels)
-	mux.Post("/v1/models/{model}/generateContent", g.handleGenerateContent)
+
+	// Gemini: /v1/models/{model}:generateContent
+	// chi * wildcard to handle the colon separator, dispatch inside handler
+	mux.Post("/v1/models/*", g.handleModelsCatchAll)
 
 	mux.Get("/health", g.handleHealth)
 	mux.Get("/status", g.handleStatus)
@@ -227,6 +232,18 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 // handleGenerateContent 入口：Google Gemini GenerateContent 协议
 func (g *Gateway) handleGenerateContent(w http.ResponseWriter, r *http.Request) {
 	g.handleRequest(w, r, "gemini")
+}
+
+// handleModelsCatchAll 通配 /v1/models/*，用于处理带冒号分隔的 Gemini 路径
+// 请求格式：/v1/models/{model}:generateContent
+// chi 不识别冒号作为路径分隔符，因此用 * 通配 + 应用层判断
+func (g *Gateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Request) {
+	suffix := chi.URLParam(r, "*")
+	if !strings.HasSuffix(suffix, ":generateContent") {
+		http.NotFound(w, r)
+		return
+	}
+	g.handleGenerateContent(w, r)
 }
 
 // handleNonStreamResponse 非流式响应

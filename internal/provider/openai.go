@@ -13,18 +13,41 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
 
-// OpenAIClient OpenAI 兼容 API 客户端
-// 同时支持 OpenAI Chat Completions / Responses 两种端点
-type OpenAIClient struct {
-	name    string
-	baseURL string
-	client  *http.Client
+// openaiClient 内部表示，支持可配置端点
+type openaiClient struct {
+	name     string
+	baseURL  string
+	endpoint string
+	client   *http.Client
 }
 
+// OpenAIClient OpenAI Chat Completions 客户端
+type OpenAIClient openaiClient
+
+// NewOpenAIClient OpenAI 兼容 API 客户端（Chat Completions 端点）
 func NewOpenAIClient(name, baseURL string, timeout int) *OpenAIClient {
 	return &OpenAIClient{
-		name:    name,
-		baseURL: strings.TrimRight(baseURL, "/"),
+		name:     name,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		endpoint: "/v1/chat/completions",
+		client: &http.Client{
+			Timeout: time.Duration(timeout) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+	}
+}
+
+// NewResponsesClient OpenAI Responses API 客户端（/v1/responses 端点）
+// 与 OpenAIClient 共享所有传输和认证逻辑，仅端点不同
+func NewResponsesClient(name, baseURL string, timeout int) *OpenAIClient {
+	return &OpenAIClient{
+		name:     name,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		endpoint: "/v1/responses",
 		client: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
 			Transport: &http.Transport{
@@ -48,13 +71,7 @@ func (c *OpenAIClient) DefaultHeaders(info *schema.ProviderInfo) http.Header {
 }
 
 func (c *OpenAIClient) BuildURL(info *schema.ProviderInfo, model string, stream bool) string {
-	// 默认 Chat Completions 端点
-	endpoint := "/v1/chat/completions"
-
-	// 如果配置中指定了自定义端点路径，使用自定义路径
-	// 注意：此处可根据 config 扩展
-
-	return c.baseURL + endpoint
+	return c.baseURL + c.endpoint
 }
 
 func (c *OpenAIClient) Endpoint(model string, stream bool) (method string, url string, err error) {

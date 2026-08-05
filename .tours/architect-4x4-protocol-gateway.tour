@@ -1,0 +1,112 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "agent-proxy — 4×4 Protocol Gateway Architecture Tour",
+  "description": "Walkthrough of the central-schema architecture that lets any of 4 AI API protocols (OpenAI CC, Anthropic, Gemini, Responses) translate into any other. Trace a request from inbound HTTP through ingress translation → central schema → provider routing → egress translation → outbound, then back on the streaming path.",
+  "steps": [
+    {
+      "directory": "internal",
+      "title": "The internal/ Package Map",
+      "description": "All runtime code lives under internal/. Read it left to right by concern: config → schema (the heart) → translator + protocol/* (the adapters) → provider + router (where the request goes) → server (the HTTP layer that wires it all together) → web + monitor + middleware (observability). The tour follows a single request through that stack. Start here to orient yourself before diving in."
+    },
+    {
+      "file": "main.go",
+      "line": 20,
+      "title": "Entry: run / db / show / add / rm",
+      "description": "The binary is one Go main. It exposes a CLI (run, db, show, add, rm) plus two modes: quick mode (--db N, one SQLite record, single provider) at line 232 and complex mode (--mode complex, multi-provider with optional JSON config) at line 264. After wiring a handler, it starts an http.Server with 30s read / 120s write timeouts (line 188) and a graceful-shutdown goroutine on SIGINT/SIGTERM (line 196). Gotcha: the mode split is purely about how the provider config is sourced — the protocol-translation stack downstream is shared."
+    },
+    {
+      "file": "internal/protocol/schema/internal.go",
+      "line": 8,
+      "title": "Central Schema — the translation spine",
+      "description": "The most important file. Three design principles (top comment): (1) any protocol can translate into this model losslessly, and back to any protocol; (2) use interface{} and json.RawMessage to keep raw structure so nothing is lost; (3) every compatibility quirk lives in the Translator layer, never here. It defines the shared models — InternalMessage, InternalTool, InternalRequest, InternalResponse, InternalChoice, InternalUsage, InternalStreamEvent, ProviderInfo. Every file in protocol/*/translator.go is just 'how do I turn X into these types and back'. Understand this file and you understand the project."
+    },
+    {
+      "file": "internal/protocol/schema/internal.go",
+      "line": 147,
+      "title": "InternalRequest — every inbound message lands here",
+      "description": "The canonical request shape. Key decisions: system prompt is extracted to its own SystemPrompt field and kept out of Messages (because Anthropic uses a top-level system field, Gemini uses systemInstruction, Responses uses instructions, only CC keeps it in the messages array — lines 138-146 document it). StopSequences, ResponseFormat, Tools, and the model string are all normalized here. Gotcha: MaxTokens AND MaxOutputTokens both exist because Responses uses a different field name; the Responses translator stores both so the egress translator can pick the right one."
+    },
+    {
+      "file": "internal/protocol/schema/internal.go",
+      "line": 78,
+      "title": "Tool calling — the hardest compatibility surface",
+      "description": "Lines 78-104 are the densest comments in the file because every protocol disagrees most here. Definition names differ (parameters vs input_schema vs functionDeclarations). Call output differs (CC has a separate tool_calls field; Anthropic and Gemini mix tool_use / functionCall into content blocks; Responses uses a tool_call input object). Arguments are a JSON STRING in CC but a JSON OBJECT everywhere else. InternalToolCall.RawArguments (line 125) holds the pre-Marshalled object so egress translators can Marshal it back to a string for CC without a round-trip. Gotcha: if tool calls are broken, the bug is almost always a Marshal/Unmarshal on this field."
+    },
+    {
+      "file": "internal/protocol/schema/internal.go",
+      "line": 210,
+      "title": "Streaming — four SSE dialects, one event type",
+      "description": "Lines 210-267 document the four SSE formats (CC's event-less data chunks, Responses' named events, Anthropic's type-tagged events, Gemini's per-line arrays). The central type InternalStreamEvent has Type 'start|delta|tool_call|done|error|usage' plus Data *InternalStreamChunk. The whole abstraction is: each protocol's stream translator parses its dialect into this, then the ingress translator renders it back as its own SSE. Contract (line 243): everything normalizes to CC-style SSE at the user-facing edge, with [DONE] appended by the gateway."
+    },
+    {
+      "file": "internal/translator/interfaces.go",
+      "line": 22,
+      "title": "The Translator interface contract",
+      "description": "Three interfaces define what every protocol adapter must implement: RequestTranslator.TranslateRequest(raw json → *InternalRequest), ResponseTranslator.TranslateResponse(*InternalResponse → raw json), and StreamTranslator.TranslateStream(ctx, events chan, fn). CombinedTranslator embeds all three (line 44). TranslatorRegistry (line 51) is a simple name-keyed map wired up in NewGateway. There is also an ErrorTranslator for per-protocol error formatting. Gotcha: the interface is deliberately small and symmetric — adding a 5th protocol is just implementing these methods and registering them."
+    },
+    {
+      "file": "internal/protocol/chatcompletion/translator.go",
+      "line": 25,
+      "title": "Example translator: ChatCompletion (the reference)",
+      "description": "ChatCompletion is the natural identity translator and the easiest to read. TranslateRequest (line 25) walks Messages, pulls out role:'system' into SystemPrompt (line 31-39), normalizes Tools and ResponseFormat, and stores the raw request for debug. TranslateResponse (line 129) is a one-liner through InternalToCCResponse. TranslateStream (line 135) iterates events, builds a CC-format delta chunk per delta event, writes 'data: [DONE]' on close. Read this one first to internalize the pattern; the others are variations on these three methods."
+    },
+    {
+      "file": "internal/router/router.go",
+      "line": 64,
+      "title": "ModelRouter — where does the request go?",
+      "description": "After a request is translated to InternalRequest, this decides which provider serves it. Resolve(model) (line 64) does longest-prefix-match over the model-to-provider table by default (prefixMatch); if no prefix hits it falls through to defaultProvider. AddProvider/AddRoute register the routing table (thread-safe via RWMutex). WeightedRoundRobin (line 122) exists for load-balancing. Gotcha: a model string like 'sensenova-6.7-flash-lite' matches prefix 'sensenova-' → provider 'sensenova'. The prefix map is populated from config.ModelRouter.ModelToProvider."
+    },
+    {
+      "file": "internal/server/gateway.go",
+      "line": 61,
+      "title": "Gateway — the wiring point for complex mode",
+      "description": "NewGateway (line 61) assembles every moving part: TranslatorRegistry gets all 4 translators (line 65-69), ProviderRegistry gets one client per configured provider keyed by type (line 73-81), ModelRouter gets the route table and provider list (line 85-93), and Web UI mounts under /ui. Routes() (line 125) installs the chi mux with logger/recoverer/CORS middleware and the 4 protocol endpoints plus /health, /status, and /ui. This is the only place that knows about all the pieces."
+    },
+    {
+      "file": "internal/server/gateway.go",
+      "line": 124,
+      "title": "The 4 inbound routes → one handler",
+      "description": "Four POST endpoints (line 136-140), each a thin stub calling handleRequest with a protocol name: /v1/chat/completions→chatcompletion, /v1/messages→anthropic, /v1/responses→responses, /v1/models/{model}/generateContent→gemini. detectIngressProtocol (line 109) mirrors this mapping. There is also GET /v1/models (line 139) listing every model across every provider. Gotcha: the protocol name string is the key — it indexes into the TranslatorRegistry on ingress and is carried through to format error responses and logs."
+    },
+    {
+      "file": "internal/server/gateway.go",
+      "line": 153,
+      "title": "handleRequest — the central pipeline",
+      "description": "The single most important function. It reads the body capped at 1MB (line 159), checks the rate limiter (line 166), runs ingress translation to InternalRequest (line 180), resolves the provider via the router (line 187), translates to the provider's protocol (line 194), calls the provider (line 197-208), then either streams or returns a non-stream response. The five named stages in the comment at line 152 are the whole protocol-translation story in one line. Everything in this repo exists to make those five steps work for any 4×4 combination."
+    },
+    {
+      "file": "internal/server/gateway.go",
+      "line": 395,
+      "title": "translateToProvider — egress protocol selection",
+      "description": "Given the resolved ProviderInfo, this picks the outgoing protocol by info.Version (line 397): openai/sensenova builds a CC request via buildCCRequest (line 402) with no provider translator (upstream IS CC); anthropic/gemini/responses each instantiate their own translator and call TranslateToProvider. The returned interface{} (a provider translator) is reused downstream to parse the provider's response and stream events. Gotcha: when upstream is OpenAI-compatible the egress translator is nil — that's why handleNonStreamResponse and handleStreamRequest both have an 'if providerTranslator != nil' branch that parses CC directly."
+    },
+    {
+      "file": "internal/server/gateway.go",
+      "line": 295,
+      "title": "Streaming — the SSE pipeline end to end",
+      "description": "handleStreamRequest (line 295): set SSE headers (line 307), call client.CallStream which returns raw json lines over a channel (line 312), then fan out a goroutine (line 321) that parses each raw line into an InternalStreamEvent — either via the provider's stream-event translator (line 333) or a direct CC delta parse (line 341). Events go into a buffered chan of 16, and the ingress translator's TranslateStream (line 384) drains it and writes user-facing SSE, flushing between chunks. The pipeline is 'provider dialect in → central event → ingress dialect out' with a small channel decoupling the slow upstream from the client."
+    },
+    {
+      "file": "internal/provider/provider.go",
+      "line": 12,
+      "title": "Provider interface — the downstream abstraction",
+      "description": "Provider interface (line 12) abstracts every upstream: Name, BaseURL, Endpoint, Call (non-stream, returns body+headers), CallStream (stream, returns a channel of raw json lines+headers), DefaultHeaders (auth + content-type), BuildURL. Three concrete clients live in openai.go: OpenAIClient, AnthropicClient, GeminiClient — each differs only in URL format, auth header (Bearer vs x-api-key), and Gemini's stream line-stripping. No ResponsesClient exists yet; Responses upstream goes through OpenAIClient. The shared lineReader helper (line 166 of openai.go) is the SSE line parser both clients reuse."
+    },
+    {
+      "file": "internal/server/quick.go",
+      "line": 23,
+      "title": "QuickGateway — the same stack, zero config",
+      "description": "QuickGateway (line 23) reuses the exact same TranslatorRegistry, provider clients, and CC build/parsing helpers — it just skips the ModelRouter and config file and wires a single provider from one DB record. NewQuickGateway (line 34) selects the client by provider type string. Routes() (line 84) is leaner: no /ui, no /status, but it adds a GET /v1/models passthrough (line 366) that forwards to the upstream in real time. This is the code path for `agent-proxy run --db 1`. Gotcha: quick mode proves the architecture — the heavy lifting is the shared translation stack, not the config layer."
+    },
+    {
+      "file": "internal/web/server.go",
+      "line": 17,
+      "title": "Web UI + monitoring (complex mode only)",
+      "description": "An embed.FS (line 16) bundles the static dashboard; handleSummary/LogsSSE/MetricsSSE/Providers (lines 118-255) push live QPS, latency, error rate, and request logs to the browser over SSE. They all feed from monitor.Store. Mounted only when cfg.Monitor.Enabled (gateway at line 145). Gotcha: quick mode skips all of this, which is why its startup message omits the /ui line."
+    },
+    {
+      "title": "Next: trace a request yourself",
+      "description": "You now have the anchors. To follow any request end to end, start at an endpoint stub in gateway.go (step 12), drop into handleRequest (line 152), watch the ingress translator build an InternalRequest (the chatcompletion example at step 8 is the cleanest), watch translateToProvider pick the egress (step 13), then either handleNonStreamResponse or handleStreamRequest depending on the stream flag. Swap the ingress protocol string and the provider type and the same five-step pipeline handles it — that's the whole project."
+    }
+  ]
+}
