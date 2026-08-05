@@ -12,6 +12,7 @@
 # Binaries (released via GitHub Releases)
 *.exe
 agent-proxy
+dist/
 
 # Temp
 test-request.json
