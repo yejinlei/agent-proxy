@@ -9,12 +9,18 @@ import (
 )
 
 // geminiModelPathKey context 键类型：由 gateway 在 /v1/models/{model}:generateContent 路径中
-// 解析出的模型名写入 ctx，供 TranslateRequest 在 body 无 model 时兜底使用。
+// 解析出的模型名写入 ctx，供 TranslateRequest 和网关层（如透传模式）在 body 无 model 时兜底使用。
 type geminiModelPathKey struct{}
 
 // WithGeminiModel 将路径中提取的模型名写入 context，供 TranslateRequest 兜底。
 func WithGeminiModel(ctx context.Context, model string) context.Context {
 	return context.WithValue(ctx, geminiModelPathKey{}, model)
+}
+
+// GeminiModelFromContext 从 context 中读取路径中的模型名（透传模式等场景使用）。
+func GeminiModelFromContext(ctx context.Context) (string, bool) {
+	m, ok := ctx.Value(geminiModelPathKey{}).(string)
+	return m, ok
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

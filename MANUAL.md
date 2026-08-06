@@ -45,15 +45,6 @@ OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任�
 | Google Gemini | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 |
 | OpenAI Responses | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 |
 
-翻译链路（N 协议只需 N 翻译器，而非 N×N）：
-
-```
-入站协议 TranslateRequest → InternalRequest → 路由 Provider
-→ TranslateToProvider → Provider 调用
-→ TranslateFromProvider → InternalResponse
-→ 入站协议 TranslateResponse → 出站响应
-```
-
 ### 核心设计
 
 - **Central Schema 中枢模型**：定义与所有外部协议无关的统一消息结构
@@ -77,7 +68,7 @@ OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任�
 
 ```powershell
 go mod download
-go build -o agent-proxy ./cmd/server
+go build -o agent-proxy .
 ```
 
 依赖：
@@ -295,6 +286,33 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 ChatCompletionRequest  ─→  InternalRequest  ─→  AnthropicRequest
                               (中枢)
 ChatCompletionRequest  ─→  InternalRequest  ─→  GeminiRequest
+```
+
+### 透传优化（Passthrough）
+
+当 **入站协议 == 下游 Provider 类型** 时，网关**跳过翻译链路，直接透传原始请求体**给下游，避免不必要的格式转换：
+
+```
+入站协议 == Provider 类型  ─→  直接转发原始 body（零损耗、零开销）
+                              模型名 → 注入 URL 路径 / 请求头
+入站协议 ≠ Provider 类型   ─→  走完整翻译链路（如上）
+```
+
+示例：Anthropic Messages 入站 → Anthropic Provider 出站，请求体原样发送，不做任何转换。
+
+透传路径要点：
+- 请求体 (`json.RawMessage`) 不经翻译器，直接传给 `ProviderClient.Call` / `CallStream`
+- 模型名通过防御拷贝的 `ProviderInfo.Name` 注入下游 URL（如 Gemini `/v1/models/{model}:generateContent`）
+- 响应体原样回传，仅过滤内部元数据事件（`_type="headers"`）
+- 请求体在入口处已预读取为内存，透传时重包为可读流，避免 body 耗尽
+
+完整翻译链路（协议不匹配时）仍为：
+
+```
+入站协议 TranslateRequest → InternalRequest → 路由 Provider
+→ TranslateToProvider → Provider 调用
+→ TranslateFromProvider → InternalResponse
+→ 入站协议 TranslateResponse → 出站响应
 ```
 
 ### InternalMessage 结构
