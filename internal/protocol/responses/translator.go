@@ -69,7 +69,7 @@ func (t *ResponsesTranslator) Protocol() string { return "responses" }
 //  REQUEST: Responses ResponseRequest → InternalRequest (入站解析)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func (t *ResponsesTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var req ResponseRequest
 	if err := json.Unmarshal(rawReq, &req); err != nil {
 		return nil, err

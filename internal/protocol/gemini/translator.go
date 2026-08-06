@@ -8,6 +8,15 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
 
+// geminiModelPathKey context 键类型：由 gateway 在 /v1/models/{model}:generateContent 路径中
+// 解析出的模型名写入 ctx，供 TranslateRequest 在 body 无 model 时兜底使用。
+type geminiModelPathKey struct{}
+
+// WithGeminiModel 将路径中提取的模型名写入 context，供 TranslateRequest 兜底。
+func WithGeminiModel(ctx context.Context, model string) context.Context {
+	return context.WithValue(ctx, geminiModelPathKey{}, model)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Gemini 协议翻译器
 //
@@ -72,7 +81,7 @@ func (t *GeminiTranslator) Protocol() string { return "gemini" }
 //  REQUEST: Gemini GenerateContentRequest → InternalRequest (入站解析)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func (t *GeminiTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+func (t *GeminiTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var req GenerateContentRequest
 	if err := json.Unmarshal(rawReq, &req); err != nil {
 		return nil, err
@@ -109,8 +118,13 @@ func (t *GeminiTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.Int
 		maxTokens = cfg.MaxOutputTokens
 	}
 
-	// 提取模型名
+	// 提取模型名：优先 body 中的 model，其次路径中的模型名（由 gateway 写入 ctx），最后兜底
 	model := req.Model
+	if model == "" {
+		if m, ok := ctx.Value(geminiModelPathKey{}).(string); ok && m != "" {
+			model = m
+		}
+	}
 	if model == "" {
 		model = "gemini-1.5-flash"
 	}

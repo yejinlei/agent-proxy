@@ -23,8 +23,9 @@ import (
 type RequestTranslator interface {
 	// Name 返回协议名称
 	Protocol() string
-	// TranslateRequest 将上游协议请求翻译为内部统一模型
-	TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error)
+	// TranslateRequest 将上游协议请求翻译为内部统一模型。
+	// ctx 携带请求路径信息(如 Gemini /v1/models/{model}:generateContent 中的模型名)。
+	TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error)
 }
 
 // ResponseTranslator 响应翻译器：InternalResponse → 协议响应

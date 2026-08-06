@@ -26,7 +26,7 @@ func (t *AnthropicTranslator) Protocol() string { return "anthropic" }
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // TranslateRequest 将 Anthropic 原生请求解析为 InternalRequest
-func (t *AnthropicTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var antReq MessageRequest
 	if err := json.Unmarshal(rawReq, &antReq); err != nil {
 		return nil, err

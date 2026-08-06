@@ -22,7 +22,7 @@ type ChatCompletionTranslator struct{}
 func (t *ChatCompletionTranslator) Protocol() string { return "chatcompletion" }
 
 // TranslateRequest 将 ChatCompletionRequest 翻译为 InternalRequest
-func (t *ChatCompletionTranslator) TranslateRequest(rawReq json.RawMessage) (*schema.InternalRequest, error) {
+func (t *ChatCompletionTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var ccReq ChatCompletionRequest
 	if err := json.Unmarshal(rawReq, &ccReq); err != nil {
 		return nil, err

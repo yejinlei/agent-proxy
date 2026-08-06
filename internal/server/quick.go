@@ -122,7 +122,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		return
 	}
 
-	internalReq, err := ingressTranslator.TranslateRequest(body)
+	internalReq, err := ingressTranslator.TranslateRequest(r.Context(), body)
 	if err != nil {
 		q.sendError(w, http.StatusBadRequest, "translate_request", err.Error())
 		return
@@ -165,7 +165,10 @@ func (q *QuickGateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
-	q.handleGenerateContent(w, r)
+	model := strings.TrimSuffix(suffix, ":generateContent")
+	model = strings.TrimPrefix(model, "/")
+	ctx := gemini.WithGeminiModel(r.Context(), model)
+	q.handleGenerateContent(w, r.WithContext(ctx))
 }
 
 // handleNonStreamResponse 非流式响应
