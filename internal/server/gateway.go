@@ -182,7 +182,7 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		return
 	}
 
-	internalReq, err := ingressTranslator.TranslateRequest(body)
+	internalReq, err := ingressTranslator.TranslateRequest(r.Context(), body)
 	if err != nil {
 		g.sendError(w, ingressProtocol, http.StatusBadRequest, "translate request failed", err.Error())
 		return
@@ -243,7 +243,12 @@ func (g *Gateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	g.handleGenerateContent(w, r)
+	// 从通配路径中提取模型名：/{model}:generateContent → {model}
+	model := strings.TrimSuffix(suffix, ":generateContent")
+	model = strings.TrimPrefix(model, "/")
+	// 将模型名写入 ctx，供 GeminiTranslator.TranslateRequest 兜底使用
+	ctx := gemini.WithGeminiModel(r.Context(), model)
+	g.handleGenerateContent(w, r.WithContext(ctx))
 }
 
 // handleNonStreamResponse 非流式响应

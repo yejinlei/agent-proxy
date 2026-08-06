@@ -492,8 +492,8 @@ type MyRequest struct {
 ```go
 type MyTranslator struct{}
 
-func (t *MyTranslator) TranslateRequest(raw json.RawMessage) (*schema.InternalRequest, error) {
-    // ... 解析 → 中枢
+func (t *MyTranslator) TranslateRequest(ctx context.Context, raw json.RawMessage) (*schema.InternalRequest, error) {
+    // ... 解析 → 中枢（路径元数据如模型名通过 ctx 传入）
 }
 
 func (t *MyTranslator) TranslateToProvider(req *schema.InternalRequest) (json.RawMessage, error) {
