@@ -7,6 +7,7 @@
 3. [快速模式使用](#快速模式使用)
 4. [复杂模式使用](#复杂模式使用)
 5. [CLI 命令参考](#cli-命令参考)
+6. [客户端认证](#客户端认证)
 6. [协议兼容性详解](#协议兼容性详解)
 7. [Web UI 使用](#web-ui-使用)
 8. [高级配置](#高级配置)
@@ -116,6 +117,67 @@ curl -X POST http://localhost:8080/v1/responses \
   -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
+### 客户端认证
+
+快速模式默认要求客户端通过 `Authorization: Bearer <key>` 头认证后才能连接。三种使用方式：
+
+#### 方式一：随机生成密钥（默认）
+
+不传 `--key` 也不传 `--nokey`，启动时自动随机生成一个 48 位 hex 密钥并打印到控制台：
+
+```powershell
+agent-proxy run --db 1
+```
+
+```
+🚀 Agent-Proxy (快速模式) running on http://127.0.0.1:8080
+🔑 Proxy Key:      sk-a1b2c3d4e5f6...
+🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
+```
+
+```powershell
+curl -X POST http://localhost:8080/v1/chat/completions ^
+  -H "Authorization: Bearer sk-a1b2c3d4e5f6..." ^
+  -H "Content-Type: application/json" ^
+  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
+```
+
+> 密钥每次重启都会变化，适合本地临时使用。如需固定密钥请用方式二。
+
+#### 方式二：指定固定密钥
+
+```powershell
+agent-proxy run --db 1 --key sk-my-fixed-key
+```
+
+客户端连接时使用同一个 `sk-my-fixed-key`。
+
+#### 方式三：无需密钥（本地开发用）
+
+```powershell
+agent-proxy run --db 1 --nokey
+```
+
+任何客户端均可直接连接，无需 `Authorization` 头。**不要在生产环境使用此模式。**
+
+```powershell
+curl -X POST http://localhost:8080/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
+```
+
+#### 认证行为说明
+
+| 标志 | 密钥来源 | 客户端是否需要 `Authorization` 头 | 适用场景 |
+|------|---------|----------------------------------|---------|
+| （不传） | 随机生成 | ✅ 需要 | 本地临时使用、快速试用 |
+| `--key <k>` | 指定值 | ✅ 需要 | 固定环境、自动化脚本 |
+| `--nokey` | 无 | ❌ 不需要 | 本地开发、内网直连 |
+
+- 缺密钥或密钥错误时返回 `401 Unauthorized`，响应体为标准错误格式（`error.type`, `error.message`）
+- `/health` 端点始终**不受认证影响**，可用于健康检查或负载均衡探测
+- 未认证的请求会被拒绝，不会到达下游 Provider
+
 ### 数据库存储
 
 数据库文件位于 `~/.agent-proxy/proxies.db`（SQLite 单文件）：
@@ -215,6 +277,9 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 
 | 命令 | 说明 |
 |------|------|
+| `agent-proxy run --db <id>` | 快速模式（默认，随机密钥） |
+| `agent-proxy run --db <id> --key <k>` | 快速模式（指定密钥） |
+| `agent-proxy run --db <id> --nokey` | 快速模式（无需密钥） |
 | `agent-proxy run --mode complex --host 0.0.0.0 --port 8080` | 复杂模式（默认配置） |
 | `agent-proxy run --mode complex --conf config.json` | 复杂模式 + 配置文件 |
 | `agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1` | 快速模式 |

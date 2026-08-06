@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net/http"
@@ -144,18 +146,42 @@ func runServer(args []string) {
 	mode := ""
 	dbID := -1
 	conf := ""
-	for i := 0; i+1 < len(args); i++ {
+	clientKey := ""
+	noClientKey := false
+	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--host":
-			host = args[i+1]
+			i++
+			if i < len(args) {
+				host = args[i]
+			}
 		case "--port":
-			port, _ = strconv.Atoi(args[i+1])
+			i++
+			if i < len(args) {
+				port, _ = strconv.Atoi(args[i])
+			}
 		case "--mode":
-			mode = args[i+1]
+			i++
+			if i < len(args) {
+				mode = args[i]
+			}
 		case "--db":
-			dbID, _ = strconv.Atoi(args[i+1])
+			i++
+			if i < len(args) {
+				dbID, _ = strconv.Atoi(args[i])
+			}
 		case "--conf":
-			conf = args[i+1]
+			i++
+			if i < len(args) {
+				conf = args[i]
+			}
+		case "--key":
+			i++
+			if i < len(args) {
+				clientKey = args[i]
+			}
+		case "--nokey":
+			noClientKey = true
 		}
 	}
 
@@ -172,9 +198,23 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 
+	// 快速模式下解析认证密钥：--key <k> 固定密钥 / 默认随机生成 / --nokey 无认证
+	quickClientKey := ""
+	quickClientKeyEnabled := false
+	if quickMode {
+		quickClientKeyEnabled = !noClientKey
+		if quickClientKeyEnabled {
+			if clientKey != "" {
+				quickClientKey = clientKey
+			} else {
+				quickClientKey = generateRandomKey()
+			}
+		}
+	}
+
 	var handler http.Handler
 	if quickMode {
-		quickHandler, err := startQuickMode(dbID)
+		quickHandler, err := startQuickMode(dbID, quickClientKey, quickClientKeyEnabled)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ 启动快速模式失败: %v\n", err)
 			os.Exit(1)
@@ -205,6 +245,12 @@ func runServer(args []string) {
 
 	if quickMode {
 		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://%s:%d\n", host, port)
+		if quickClientKeyEnabled {
+			fmt.Printf("🔑 Proxy Key:      %s\n", quickClientKey)
+			fmt.Printf("🔐 客户端需使用 Authorization: Bearer %s 连接\n", quickClientKey)
+		} else {
+			fmt.Printf("🔓 无需认证密钥（--nokey）\n")
+		}
 		fmt.Printf("📝 Chat Completions: POST http://localhost:%d/v1/chat/completions\n", port)
 		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
 		fmt.Printf("🔮 Gemini:            POST http://localhost:%d/v1/models/{model}:generateContent\n", port)
@@ -229,7 +275,7 @@ func runServer(args []string) {
 }
 
 // startQuickMode 从 DB 读取一条记录启动快速网关
-func startQuickMode(dbID int) (http.Handler, error) {
+func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Handler, error) {
 	store, err := db.New("")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -256,8 +302,17 @@ func startQuickMode(dbID int) (http.Handler, error) {
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.ProviderType, 60)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.ProviderType, 60, clientKey, clientKeyEnabled)
 	return quick.Routes(), nil
+}
+
+// generateRandomKey 生成一个随机的 24 字节 hex 密钥（共 48 字符）
+func generateRandomKey() string {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "sk-" + time.Now().Format("20060102150405")
+	}
+	return "sk-" + hex.EncodeToString(b)
 }
 
 // startComplexMode 使用配置启动完整网关
@@ -329,10 +384,12 @@ func printUsage() {
 🔗 Agent-Proxy — AI 消息协议网关
 
 启动命令:
-  agent-proxy run --db <id>                           快速模式（默认，只监听本机）
-  agent-proxy run --db <id> --host <h> --port <p>    快速模式（可指定监听地址/端口）
-  agent-proxy run --mode complex                       复杂模式（默认配置）
-  agent-proxy run --mode complex --host <h> --port <p> --conf <f>  复杂模式（配置文件）
+  agent-proxy run --db <id>                                              快速模式（默认，随机生成密钥）
+  agent-proxy run --db <id> --key <k>                                   快速模式（指定客户端密钥）
+  agent-proxy run --db <id> --nokey                                     快速模式（无需客户端密钥）
+  agent-proxy run --mode complex                                         复杂模式（默认配置）
+  agent-proxy run --mode complex --host <h> --port <p>                   复杂模式（指定监听地址/端口）
+  agent-proxy run --mode complex --host <h> --port <p> --conf <f>        复杂模式（配置文件）
 
   参数说明:
     --db <id>    从数据库选一条记录启动（快速模式）
@@ -340,6 +397,8 @@ func printUsage() {
     --port       监听端口（默认 8080）
     --mode       simple / complex（默认由 --db 自动判断）
     --conf       复杂模式配置文件路径
+    --key <k>    快速模式客户端密钥（默认随机生成并显示）
+    --nokey      快速模式不要求客户端密钥（本地开发用）
 
 数据库命令:
   agent-proxy db list                                    列出所有记录
@@ -354,8 +413,11 @@ func printUsage() {
   # 快速启动（本机）
   agent-proxy run --db 1
 
-  # 快速启动（允许远程访问）
-  agent-proxy run --db 1 --host 0.0.0.0 --port 8080
+  # 快速启动（允许远程访问，指定密钥）
+  agent-proxy run --db 1 --host 0.0.0.0 --port 8080 --key sk-xxx
+
+  # 快速启动（无需密钥，本地开发）
+  agent-proxy run --db 1 --nokey
 
   # 复杂模式
   agent-proxy run --mode complex --host 0.0.0.0 --port 8080

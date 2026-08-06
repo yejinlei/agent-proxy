@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-proxy/agent-proxy/internal/middleware"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/anthropic"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/chatcompletion"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/gemini"
@@ -29,10 +30,13 @@ type QuickGateway struct {
 	// 透传上游 /v1/models 用的
 	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
 	proxyKey     string
+	// 客户端认证
+	clientKey          string
+	clientKeyEnabled   bool
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
-func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int) *QuickGateway {
+func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int, clientKey string, clientKeyEnabled bool) *QuickGateway {
 	var p provider.Provider
 	switch providerType {
 	case "anthropic":
@@ -65,6 +69,8 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int) *Q
 		translatorRegistry: registry,
 		proxyBaseURL:       strings.TrimSuffix(baseURL, "/"),
 		proxyKey:           apiKey,
+		clientKey:          clientKey,
+		clientKeyEnabled:   clientKeyEnabled,
 	}
 }
 
@@ -86,6 +92,10 @@ func (q *QuickGateway) detectIngressProtocol(path string) string {
 
 func (q *QuickGateway) Routes() chi.Router {
 	mux := chi.NewRouter()
+
+	if q.clientKeyEnabled {
+		mux.Use(middleware.Auth(q.clientKey))
+	}
 
 	mux.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
