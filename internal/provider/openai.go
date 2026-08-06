@@ -403,7 +403,11 @@ func (c *GeminiClient) Endpoint(model string, stream bool) (method string, url s
 }
 
 func (c *GeminiClient) Call(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (body json.RawMessage, headers http.Header, err error) {
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, "", false), bytes.NewReader(req))
+	model := ""
+	if info != nil {
+		model = info.Name
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, model, false), bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -437,7 +441,11 @@ func (c *GeminiClient) Call(ctx context.Context, req json.RawMessage, info *sche
 func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (lines <-chan json.RawMessage, headers http.Header, err error) {
 	linesCh := make(chan json.RawMessage, 50)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, "", true), bytes.NewReader(req))
+	model := ""
+	if info != nil {
+		model = info.Name
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, model, true), bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}

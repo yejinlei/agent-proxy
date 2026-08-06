@@ -175,6 +175,49 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		}
 	}
 
+	// ── 轻量提取 model 用于路由（不解构整个请求体） ──
+	// Gemini 的 model 在 URL 路径 /v1/models/{model}:generateContent 中，已从 catch-all
+	// 写入 ctx，通过 GeminiModelFromContext 读取；其他协议从请求体读取。
+	model := extractModelFromRaw(body, ingressProtocol)
+	if model == "" && ingressProtocol == "gemini" {
+		if m, ok := gemini.GeminiModelFromContext(r.Context()); ok && m != "" {
+			model = m
+		}
+	}
+	if model == "" {
+		g.sendError(w, ingressProtocol, http.StatusBadRequest, "missing model", "model is required")
+		return
+	}
+
+	// ── 路由 Provider ──
+	info, providerName, err := g.router.Resolve(model)
+	if err != nil {
+		g.sendError(w, ingressProtocol, http.StatusNotFound, "model not found", err.Error())
+		return
+	}
+
+	providerClient := g.registry.Get(providerName)
+	if providerClient == nil {
+		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider not found", providerName)
+		return
+	}
+
+	// 轻量检测 stream 字段
+	stream := detectStream(body)
+
+	// ── 透传 vs 翻译 ──
+	// ingress 协议 == provider 协议时，直接透传原始 body，零损耗
+	providerType := info.Version
+	if ingressProtocol == providerType {
+		ctx := r.Context()
+		if stream {
+			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, model, ingressProtocol, startTime)
+		} else {
+			g.handlePassthroughNonStream(ctx, w, r, providerClient, info, body, model, ingressProtocol, startTime)
+		}
+		return
+	}
+
 	// ── 入站翻译：协议请求 → InternalRequest ──
 	ingressTranslator := g.translatorRegistry.Get(ingressProtocol)
 	if ingressTranslator == nil {
@@ -188,30 +231,143 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		return
 	}
 
-	// ── 路由 Provider ──
-	info, providerName, err := g.router.Resolve(internalReq.Model)
-	if err != nil {
-		g.sendError(w, ingressProtocol, http.StatusNotFound, "model not found", err.Error())
-		return
-	}
+	// 构造 ProviderInfo：将实际 model 写入 Name（GeminiClient.BuildURL 据此拼 URL）。
+	// 取副本，避免修改路由缓存中的共享 info。
+	callInfo := makeTranslationInfo(info, model)
 
 	// ── 翻译到目标 Provider 协议 ──
-	providerTranslator, downstreamReq := g.translateToProvider(info, internalReq)
+	providerTranslator, downstreamReq := g.translateToProvider(callInfo, internalReq)
 
 	// ── 执行 Provider 调用 ──
-	providerClient := g.registry.Get(providerName)
-	if providerClient == nil {
-		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider not found", providerName)
+	ctx := r.Context()
+	if stream {
+		g.handleStreamRequest(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, startTime)
+	} else {
+		g.handleNonStreamResponse(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
+	}
+}
+
+// makeTranslationInfo 为翻译路径构造 ProviderInfo：把路由解析出的实际 model 写入 Name，
+// 让 provider（尤其是 GeminiClient）的 BuildURL 能拿到正确的模型名构建 URL。
+// 返回副本以避免修改路由缓存中的共享 ProviderInfo。
+func makeTranslationInfo(info *schema.ProviderInfo, model string) *schema.ProviderInfo {
+	return &schema.ProviderInfo{
+		Name:     model,
+		BaseURL:  info.BaseURL,
+		APIToken: info.APIToken,
+		Version:  info.Version,
+	}
+}
+
+// makePassthroughInfo 为透传构造 ProviderInfo：把已解析出的 model 作为 Name，
+// 让 provider 的 BuildURL / DefaultHeaders 能拿到正确的 model 与 APIToken。
+// 返回副本以避免修改路由缓存中的共享 ProviderInfo。
+func makePassthroughInfo(info *schema.ProviderInfo, model string) *schema.ProviderInfo {
+	return &schema.ProviderInfo{
+		Name:     model,
+		BaseURL:  info.BaseURL,
+		APIToken: info.APIToken,
+	}
+}
+
+// handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
+func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
+	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
+	model string, ingressProtocol string, startTime time.Time) {
+
+	callInfo := makePassthroughInfo(info, model)
+	resp, headers, err := client.Call(ctx, rawBody, callInfo)
+	if err != nil {
+		latency := time.Since(startTime).Milliseconds()
+		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
+		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider error", err.Error())
 		return
 	}
 
-	stream := internalReq.Stream
-	ctx := r.Context()
-	if stream {
-		g.handleStreamRequest(ctx, w, r, providerClient, info, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, startTime)
-	} else {
-		g.handleNonStreamResponse(ctx, w, r, providerClient, info, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(resp)
+
+	latency := time.Since(startTime).Milliseconds()
+	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
+}
+
+// handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
+func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
+	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
+	model string, ingressProtocol string, startTime time.Time) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	callInfo := makePassthroughInfo(info, model)
+	lines, headers, err := client.CallStream(ctx, rawBody, callInfo)
+	if err != nil {
+		flusher.Flush()
+		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "stream error", err.Error())
+		return
+	}
+
+	// 透传下游响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	for line := range lines {
+		var meta map[string]interface{}
+		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
+			continue
+		}
+		w.Write(line)
+		w.Write([]byte("\n"))
+		flusher.Flush()
+	}
+
+	g.recordRequest(r, startTime, "", http.StatusOK, time.Since(startTime).Milliseconds(), "")
+}
+
+// extractModelFromRaw 从原始 JSON 中提取 model 字段，不解构整个请求体
+func extractModelFromRaw(body json.RawMessage, ingressProtocol string) string {
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	if v, ok := m["model"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// detectStream 检测请求体中 stream 字段
+func detectStream(body json.RawMessage) bool {
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return false
+	}
+	if v, ok := m["stream"]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 // handleChatCompletion 入口：Chat Completions 协议

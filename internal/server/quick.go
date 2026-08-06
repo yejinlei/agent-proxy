@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -105,6 +106,7 @@ func (q *QuickGateway) Routes() chi.Router {
 }
 
 // handleRequest 统一请求处理：入站协议 → InternalRequest → 下游 Provider → InternalResponse → 入站协议
+// 优先透传：当入站协议与 Provider 类型一致时，原始 body 原样转发，零损耗。
 func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressProtocol string) {
 	startTime := time.Now()
 
@@ -112,6 +114,31 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		return
+	}
+	// 重新包装 r.Body，让下游处理函数能再次读取
+	br := bytes.NewReader(body)
+	r.Body = io.NopCloser(io.NewSectionReader(br, 0, int64(br.Len())))
+
+	// ── 轻量提取 model 用于路由 & 透传 URL ──
+	// Gemini 的 model 在 URL 路径 /v1/models/{model}:generateContent 中，
+	// 已由 handleModelsCatchAll 写入 ctx；其他协议从请求体读取。
+	model := quickExtractModel(body, ingressProtocol)
+	if model == "" && ingressProtocol == "gemini" {
+		if m, ok := gemini.GeminiModelFromContext(r.Context()); ok && m != "" {
+			model = m
+		}
+	}
+
+	// ── 透传 vs 翻译 ──
+	providerType := q.info.Version
+	if ingressProtocol == providerType && model != "" {
+		ctx := r.Context()
+		if quickDetectStream(body) {
+			q.handlePassthroughStream(ctx, w, r, model, startTime)
+		} else {
+			q.handlePassthroughNonStream(ctx, w, r, model, startTime)
+		}
 		return
 	}
 
@@ -169,6 +196,133 @@ func (q *QuickGateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Reque
 	model = strings.TrimPrefix(model, "/")
 	ctx := gemini.WithGeminiModel(r.Context(), model)
 	q.handleGenerateContent(w, r.WithContext(ctx))
+}
+
+// quickExtractModel 从原始 JSON 中提取 model 字段
+func quickExtractModel(body json.RawMessage, ingressProtocol string) string {
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	if v, ok := m["model"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// quickDetectStream 检测请求体中 stream 字段
+func quickDetectStream(body json.RawMessage) bool {
+	var m map[string]interface{}
+	if json.Unmarshal(body, &m) != nil {
+		return false
+	}
+	if v, ok := m["stream"]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+// makeQuickPassthroughInfo 为 Quick 透传构造 ProviderInfo：把 model 写入 Name
+//（各 provider BuildURL 的 model 参数来自 info.Name），并带上 APIToken 用于认证。
+func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.ProviderInfo {
+	return &schema.ProviderInfo{
+		Name:     model,
+		BaseURL:  info.BaseURL,
+		APIToken: info.APIToken,
+	}
+}
+
+// handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
+func (q *QuickGateway) handlePassthroughNonStream(ctx context.Context, w http.ResponseWriter,
+	r *http.Request, model string, startTime time.Time) {
+
+	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	callInfo := makeQuickPassthroughInfo(q.info, model)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		return
+	}
+
+	resp, headers, err := q.provider.Call(callCtx, body, callInfo)
+	if err != nil {
+		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
+		return
+	}
+
+	// 透传下游响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(resp)
+
+	latency := time.Since(startTime).Milliseconds()
+	fmt.Printf("[%s] passthrough %s %dms\n", time.Now().Format("15:04:05"), q.proxyName, latency)
+}
+
+// handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
+func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter,
+	r *http.Request, model string, startTime time.Time) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	callInfo := makeQuickPassthroughInfo(q.info, model)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		flusher.Flush()
+		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		return
+	}
+
+	lines, headers, err := q.provider.CallStream(callCtx, body, callInfo)
+	if err != nil {
+		flusher.Flush()
+		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
+		return
+	}
+
+	// 透传下游响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	for line := range lines {
+		var meta map[string]interface{}
+		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
+			continue
+		}
+		w.Write(line)
+		w.Write([]byte("\n"))
+		flusher.Flush()
+	}
+
+	latency := time.Since(startTime).Milliseconds()
+	fmt.Printf("[%s] passthrough stream %s %dms\n", time.Now().Format("15:04:05"), q.proxyName, latency)
 }
 
 // handleNonStreamResponse 非流式响应
@@ -277,15 +431,23 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 					events <- *event
 				}
 			} else {
-				// OpenAI 兼容：解析 SSE delta 行
+				// OpenAI 兼容：解析 SSE delta 行（可能带 "data: " 前缀）
+				payload := string(line)
+				if strings.HasPrefix(payload, "data: ") {
+					payload = payload[6:]
+				}
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
-				if json.Unmarshal(line, &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
 				}
 				choice := ccChunk.Choices[0]
 				msg := schema.InternalMessage{Role: schema.RoleAssistant}
-				if choice.Delta.Content != "" {
-					msg.Content, _ = json.Marshal(choice.Delta.Content)
+				text := choice.Delta.Content
+				if text == "" {
+					text = choice.Delta.Reasoning
+				}
+				if text != "" {
+					msg.Content, _ = json.Marshal(text)
 				}
 				for _, tc := range choice.Delta.ToolCalls {
 					msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{

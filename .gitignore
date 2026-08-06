@@ -22,3 +22,4 @@ test-stream.json
 release_body.json
 agent-proxy.bundle
 dist/
+.tmp/

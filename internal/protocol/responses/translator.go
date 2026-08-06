@@ -82,7 +82,7 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	}
 
 	// --- 2. Input → Messages ---
-	messages := inputToMessages(req.Input)
+	messages := inputToMessages(InputToItems(req.Input))
 
 	// --- 3. Tools → InternalTools ---
 	var tools []schema.InternalTool

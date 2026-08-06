@@ -1,11 +1,13 @@
 package responses
 
+import "encoding/json"
+
 // OpenAI Responses API 协议类型
 
 // ResponseRequest Responses API 请求
 type ResponseRequest struct {
 	Model           string        `json:"model"`
-	Input           []InputItem   `json:"input"`
+	Input           Input         `json:"input"`
 	Tools           []Tool        `json:"tools,omitempty"`
 	Stream          bool          `json:"stream,omitempty"`
 	Temperature     *float64      `json:"temperature,omitempty"`
@@ -15,6 +17,43 @@ type ResponseRequest struct {
 	ResponseFormat  *ResponseFormat `json:"response_format,omitempty"`
 	Metadata        *Metadata     `json:"metadata,omitempty"`
 	Instructions    string        `json:"instructions,omitempty"` // 系统提示
+}
+
+// Input 兼容 Responses API 两种 input 形式：纯字符串（单消息）或 []InputItem 数组
+type Input interface{}
+
+// InputToItems 把 Input 统一转为 []InputItem
+func InputToItems(i Input) []InputItem {
+	switch v := i.(type) {
+	case string:
+		return []InputItem{{Type: "message", Role: "user", Content: v}}
+	case []InputItem:
+		return v
+	}
+	return nil
+}
+
+func (r *ResponseRequest) UnmarshalJSON(data []byte) error {
+	type alias ResponseRequest
+	aux := &struct {
+		Input json.RawMessage `json:"input"`
+		*alias
+	}{alias: (*alias)(r)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if aux.Input != nil {
+		var items []InputItem
+		if err := json.Unmarshal(aux.Input, &items); err == nil {
+			r.Input = items
+		} else {
+			var s string
+			if err2 := json.Unmarshal(aux.Input, &s); err2 == nil {
+				r.Input = s
+			}
+		}
+	}
+	return nil
 }
 
 type InputItem struct {
