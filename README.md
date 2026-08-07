@@ -51,9 +51,11 @@ GOOS=darwin GOARCH=arm64 go build -o agent-proxy .
 ## 快速开始
 
 ```powershell
-# === 1. 添加一个代理 ===
+# === 1. 嗅探并添加代理（自动探测所有支持的协议）===
 agent-proxy db add --url https://token.sensenova.cn/v1 \
                   --key sk-xxx --name sensenova
+# 等价命令（别名）
+agent-proxy detect --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
 
 # === 2. 快速启动（只需 --db）===
 agent-proxy run --db 1
@@ -103,10 +105,11 @@ agent-proxy <subcommand> [options]
   --conf      复杂模式配置文件路径
 
 数据库命令:
-  agent-proxy db list                            列出所有记录
-  agent-proxy db show <id>                       显示详情
-  agent-proxy db add --url <u> --key <k> [--name <n>] 添加记录
-  agent-proxy db rm <id>                         删除记录
+  agent-proxy db list                                    列出所有记录
+  agent-proxy db show <id>                               显示详情
+  agent-proxy db add --url <u> --key <k> [--name <n>]    嗅探并添加（自动探测所有协议）
+  agent-proxy detect --url <u> --key <k> [--name <n>]    同上（add 的别名）
+  agent-proxy db rm <id>                                 删除记录
 
 帮助:
   agent-proxy --help  /  -h                      显示帮助
@@ -121,7 +124,7 @@ agent-proxy <subcommand> [options]
 | 启动方式 | `agent-proxy run --db 1` | `agent-proxy run --mode complex` |
 | Provider 来源 | SQLite 数据库一条记录 | 内置配置 或 `--conf` 配置文件 |
 | 多 Provider | 不支持 | 支持（路由前缀匹配） |
-| 协议翻译 | 支持（自动按 Provider 类型） | 支持（完整 4 协议） |
+| 协议翻译 | 支持（协议感知路由：入站匹配则透传，否则经 OpenAI 协议转换） | 支持（完整 4 协议） |
 | Web UI | 无 | 有（`/ui`） |
 | 限流 / 监控 | 无 | 有 |
 | 适用场景 | 快速试用、单一端点 | 生产、多厂商调度 |
@@ -177,6 +180,37 @@ agent-proxy run --db 1 --nokey
 
 - 缺密钥或密钥错误时返回 `401 Unauthorized`
 - `/health` 端点始终不受认证影响
+
+## 多协议嗅探与协议感知路由
+
+### 嗅探
+
+`db add` 和 `detect` 是**完全等价**的命令，对上游自动探测所有 4 种协议：
+
+| 步骤 | 协议 | 探测方式 | 成功条件 |
+|------|------|----------|----------|
+| 1 | OpenAI | `GET {base}/v1/models` + `Authorization: Bearer` | 200 或 401 |
+| 2 | OpenAI Responses | 共享 OpenAI 基础设施 | 步骤 1 成功即标记 |
+| 3 | Anthropic Messages | `POST {base}/v1/messages` + `x-api-key` | 非 5xx |
+| 4 | Gemini | `POST {base}/v1/models/gemini-pro:generateContent` | 非 5xx |
+
+- **至少一个模型**：打印摘要 + 提示确认后写入 SQLite（单条记录含 `capabilities_json` + `models_map_json`）
+- **无任何模型**：直接报告失败，不提示
+
+```powershell
+agent-proxy db add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
+agent-proxy detect --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
+```
+
+### 协议感知路由（快速模式）
+
+```
+入站协议 → normalizeIngress → selectProtocol(capabilities)
+  - 命中 capabilities → 透传（零开销）
+  - 未命中          → 回退到 OpenAI 协议转换
+```
+
+示例：上游支持 openai + anthropic，下游按 Anthropic 接入 → **透传**；上游仅支持 openai，下游按 Gemini 接入 → 经 OpenAI 翻译后转发。
 
 ## 4×4 协议互转矩阵
 

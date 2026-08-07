@@ -43,6 +43,8 @@ func main() {
 		}
 	case "add":
 		runDBAdd(args[1:])
+	case "detect":
+		runDBAdd(args[1:])
 	case "rm", "delete":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy rm <id>\n")
@@ -89,6 +91,8 @@ func runDBCommand(args []string) {
 		}
 	case "add":
 		runDBAdd(args)
+	case "detect":
+		runDBAdd(args)
 	case "rm", "delete":
 		if len(args) < 1 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy db rm <id>\n")
@@ -115,36 +119,26 @@ func runDBList() {
 	}
 }
 
-// validProviderTypes db add 支持的 provider 类型
-var validProviderTypes = map[string]bool{"openai": true, "anthropic": true, "gemini": true}
-
-// runDBAdd 添加代理配置
+// runDBAdd 添加代理配置（自动嗅探所有支持的协议）
 func runDBAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	name := fs.String("name", "", "Provider 名称")
 	url := fs.String("url", "", "Provider URL (必选)")
 	key := fs.String("key", "", "API Key (必选)")
-	providerType := fs.String("type", "openai", "Provider 类型: openai/anthropic/gemini")
 	fs.Parse(args)
 
 	if *url == "" || *key == "" {
 		fmt.Fprintf(os.Stderr, "❌ --url 和 --key 为必填参数\n")
-		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>] [--type <t>]\n")
-		os.Exit(1)
-	}
-	if !validProviderTypes[*providerType] {
-		fmt.Fprintf(os.Stderr, "❌ --type 无效: %q（仅支持 openai/anthropic/gemini）\n", *providerType)
-		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>] [--type <t>]\n")
+		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>]\n")
 		os.Exit(1)
 	}
 	if *name == "" {
 		*name = *url
 	}
-	if err := cmd.RunDBAdd(*name, *url, *key, *providerType); err != nil {
+	if err := cmd.RunDBAdd(*name, *url, *key); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("✅ 已保存代理配置: %s (%s)\n", *name, *url)
 }
 
 // validRunFlags run 命令允许的参数
@@ -339,7 +333,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Han
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.ProviderType, 60, clientKey, clientKeyEnabled)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), 60, clientKey, clientKeyEnabled)
 	return quick.Routes(), nil
 }
 

@@ -86,8 +86,12 @@ go build -o agent-proxy .
 ### 30 秒上手
 
 ```powershell
-# ① 添加一个代理（自动嗅探模型列表）
+# ① 嗅探并添加代理（自动探测所有支持的协议）
 agent-proxy db add --url https://token.sensenova.cn/v1 \
+                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
+                   --name sensenova
+# 等价别名
+agent-proxy detect --url https://token.sensenova.cn/v1 \
                    --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
                    --name sensenova
 
@@ -182,7 +186,7 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
 
 ### 数据库存储
 
-数据库文件位于 `~/.agent-proxy/proxies.db`（SQLite 单文件）：
+数据库文件位于 `~/.agent-proxy/proxies.db`（SQLite 单文件），含多协议嗅探列：
 
 ```sql
 CREATE TABLE proxies (
@@ -196,6 +200,8 @@ CREATE TABLE proxies (
   anthropic_cap   INTEGER NOT NULL DEFAULT 0,
   model_count     INTEGER NOT NULL DEFAULT 0,
   models_json     TEXT,
+  capabilities_json TEXT,   -- 嗅探到的所有协议 ["openai","anthropic","gemini","responses"]
+  models_map_json   TEXT,   -- 每协议模型 {"openai":["gpt-4"],"anthropic":["claude-3"]}
   weight          INTEGER NOT NULL DEFAULT 100,
   created_at      TEXT NOT NULL
 );
@@ -293,24 +299,42 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 |------|------|------|
 | `db list` | `agent-proxy db list` | 列出所有代理 |
 | `db show` | `agent-proxy db show 1` | 查看 ID=1 详情 |
-| `db add` | `agent-proxy db add --url <url> --key <key>` | 添加代理 |
-| `db add` | `agent-proxy db add --url <url> --key <key> --name my --type anthropic` | 添加（指定类型） |
+| `db add` / `db detect` | `agent-proxy db add --url <url> --key <key> [--name <n>]` | 嗅探并添加（自动探测所有协议，确认后写入） |
 | `db rm` | `agent-proxy db rm 1` | 删除记录 |
 
-### `add` 参数详解
+### `add` / `detect` 参数详解
 
 | 参数 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
 | `--url` | — | ✅ | API 地址，如 `https://api.example.com/v1` |
 | `--key` | — | ✅ | API Key |
 | `--name` | URL 值 | 否 | 友好名称 |
-| `--type` | `openai` | 否 | `openai` / `anthropic` / `gemini` |
+
+`--type` 参数已废弃（协议由嗅探自动确定）。
 
 添加时自动执行：
 
-1. 拼接 `/v1/models` 端点，发送 GET 请求
-2. 解析返回的模型列表
-3. 写入 SQLite（含模型 JSON、时间戳）
+1. **嗅探 OpenAI**：`GET {url}/v1/models` + Bearer → 200/401 视为支持
+2. **自动标记 Responses**：OpenAI 成功则同时标记
+3. **嗅探 Anthropic**：`POST {url}/v1/messages` + x-api-key
+4. **嗅探 Gemini**：`POST {url}/v1/models/gemini-pro:generateContent`
+5. **汇总**：至少 1 个模型 → 提示确认 → 写入 SQLite
+6. **失败**：0 模型 → 直接报告失败，不提示
+
+### 协议感知路由
+
+启动快速模式后，每个入站请求按以下逻辑路由：
+
+```
+入站协议 → normalizeIngress → selectProtocol(capabilities)
+  - 命中 capabilities → 透传（零开销转发）
+  - 未命中          → 回退到 OpenAI 协议转换
+```
+
+示例：
+- 上游支持 openai + anthropic，下游按 Anthropic `/v1/messages` 接入 → **透传**
+- 上游仅支持 openai，下游按 Gemini 接入 → 经 OpenAI 翻译后转发
+- 上游支持 openai，下游按 Responses 接入 → 透传（Responses 与 OpenAI 共享）
 
 ### `show` 输出示例
 

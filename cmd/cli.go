@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,19 +29,23 @@ func RunDBList() error {
 		return err
 	}
 	if len(records) == 0 {
-		fmt.Println("数据库为空。使用 'db add' 添加代理配置。")
+		fmt.Println("数据库为空。使用 'agent-proxy detect' 或 'agent-proxy db add' 嗅探并添加代理。")
 		return nil
 	}
 
 	fmt.Printf("\n📋 已保存的代理配置 (%d 条):\n", len(records))
-	fmt.Println(strings.Repeat("─", 90))
-	fmt.Printf("  %-4s  %-16s  %-42s  %-12s  %-24s  %s\n", "ID", "Name", "URL", "Provider", "OpenAI/Anth", "时间")
-	fmt.Println(strings.Repeat("─", 90))
+	fmt.Println(strings.Repeat("─", 100))
+	fmt.Printf("  %-4s  %-16s  %-42s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "时间")
+	fmt.Println(strings.Repeat("─", 100))
 
 	for _, r := range records {
-		caps := fmt.Sprintf("%v/%v", r.OpenAICap, r.AnthropicCap)
-		fmt.Printf("  %-4d  %-16s  %-42s  %-12s  %-24s  %s\n",
-			r.ID, r.Name, r.URL, r.ProviderType, caps, r.CreatedAt.Format("2006-01-02 15:04:05"))
+		caps := strings.Join(r.Capabilities(), " / ")
+		if caps == "" {
+			caps = r.ProviderType
+		}
+		modelCount := r.TotalModelCount()
+		fmt.Printf("  %-4d  %-16s  %-42s  %-18s  %-8d  %s\n",
+			r.ID, r.Name, r.URL, caps, modelCount, r.CreatedAt.Format("2006-01-02 15:04:05"))
 	}
 	fmt.Println()
 	return nil
@@ -58,7 +63,7 @@ func RunDBShow(id int) error {
 	}
 
 	if !store.Exists(id) {
-		return fmt.Errorf("未找到 ID=%d 的代理配置。使用 'db list' 查看现有配置", id)
+		return fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db list' 查看现有配置", id)
 	}
 
 	r, err := store.GetByID(id)
@@ -71,26 +76,58 @@ func RunDBShow(id int) error {
 	fmt.Printf("  Name:         %s\n", r.Name)
 	fmt.Printf("  URL:          %s\n", r.URL)
 	fmt.Printf("  Key:          %s\n", maskKey(r.Key))
-	fmt.Printf("  Provider:     %s\n", r.ProviderType)
-	fmt.Printf("  检测格式:     %s\n", r.DetectedFormat)
-	fmt.Printf("  OpenAI:       %v\n", r.OpenAICap)
-	fmt.Printf("  Anthropic:    %v\n", r.AnthropicCap)
 	fmt.Printf("  权重:         %d\n", r.Weight)
 	fmt.Printf("  时间:         %s\n", r.CreatedAt.Format("2006-01-02 15:04:05"))
 
-	models := r.Models()
-	if len(models) > 0 {
-		fmt.Printf("  模型列表 (%d):\n", len(models))
-		for i, m := range models {
-			fmt.Printf("    %3d. %s\n", i+1, m)
+	// 多协议能力
+	caps := r.Capabilities()
+	if len(caps) > 0 {
+		fmt.Printf("  协议:         %s\n", strings.Join(caps, " / "))
+
+		// 每协议模型列表
+		hasAnyModel := false
+		for _, proto := range caps {
+			models := r.ModelsForProtocol(proto)
+			if len(models) == 0 {
+				continue
+			}
+			hasAnyModel = true
+			fmt.Printf("  %s 模型 (%d):\n", proto, len(models))
+			for i, m := range models {
+				fmt.Printf("    %3d. %s\n", i+1, m)
+			}
+		}
+
+		// 兼容：如果没有 models_map_json 但有 models_json，显示旧格式
+		if !hasAnyModel {
+			models := r.Models()
+			if len(models) > 0 {
+				fmt.Printf("  模型列表 (%d):\n", len(models))
+				for i, m := range models {
+					fmt.Printf("    %3d. %s\n", i+1, m)
+				}
+			}
+		}
+	} else {
+		// 兼容旧记录
+		fmt.Printf("  Provider:     %s\n", r.ProviderType)
+		fmt.Printf("  检测格式:     %s\n", r.DetectedFormat)
+		fmt.Printf("  OpenAI:       %v\n", r.OpenAICap)
+		fmt.Printf("  Anthropic:    %v\n", r.AnthropicCap)
+		models := r.Models()
+		if len(models) > 0 {
+			fmt.Printf("  模型列表 (%d):\n", len(models))
+			for i, m := range models {
+				fmt.Printf("    %3d. %s\n", i+1, m)
+			}
 		}
 	}
 	fmt.Println()
 	return nil
 }
 
-// RunDBAdd 添加代理配置
-func RunDBAdd(name, url, key, providerType string) error {
+// RunDBAdd 添加代理配置（多协议嗅探）
+func RunDBAdd(name, url, key string) error {
 	store, err := openDB()
 	if err != nil {
 		return err
@@ -100,25 +137,61 @@ func RunDBAdd(name, url, key, providerType string) error {
 		return fmt.Errorf("init db: %w", err)
 	}
 
-	// 简易嗅探（直接 GET models 端点）
-	models, err := sniffModels(url, key, providerType)
-	if err != nil {
-		fmt.Printf("⚠  嗅探模型列表失败（记录仍会保存）: %v\n", err)
+	// 多协议嗅探
+	result := sniffAll(url, key)
+
+	// 计算总模型数
+	totalModels := 0
+	for _, ms := range result.ModelsMap {
+		totalModels += len(ms)
 	}
 
-	providerType = normalizeProvider(providerType)
+	// 无模型 → 直接失败，不提示
+	if totalModels == 0 {
+		fmt.Println("未检测到任何大模型，已取消。")
+		return nil
+	}
+
+	// 打印嗅探摘要
+	fmt.Printf("🔎 探测到 %d 个协议，%d 个模型：\n", len(result.Capabilities), totalModels)
+	for _, proto := range result.Capabilities {
+		models := result.ModelsMap[proto]
+		fmt.Printf("  · %s (%d 个模型)\n", proto, len(models))
+	}
+
+	// 提示确认
+	fmt.Print("  是否要加到 DB？(yes/no): ")
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer != "yes" && answer != "y" {
+		fmt.Println("已取消。")
+		return nil
+	}
+
+	// 写入 DB
+	capsJSON, _ := json.Marshal(result.Capabilities)
+	modelsMapJSON, _ := json.Marshal(result.ModelsMap)
+
+	// ProviderType 取第一个能力（用于兼容旧字段）
+	providerType := "openai"
+	if len(result.Capabilities) > 0 {
+		providerType = result.Capabilities[0]
+	}
 
 	err = store.Add(&db.ProxyRecord{
-		Name:           name,
-		URL:            url,
-		Key:            key,
-		ProviderType:   providerType,
-		DetectedFormat: "openai-compatible",
-		OpenAICap:      providerType == "openai",
-		AnthropicCap:   providerType == "anthropic",
-		ModelCount:     len(models),
-		Weight:         100,
-		CreatedAt:      time.Now(),
+		Name:             name,
+		URL:              url,
+		Key:              key,
+		ProviderType:     providerType,
+		DetectedFormat:   "auto-sniffed",
+		OpenAICap:        result.hasProto("openai"),
+		AnthropicCap:     result.hasProto("anthropic"),
+		ModelCount:       totalModels,
+		CapabilitiesJSON: string(capsJSON),
+		ModelsMapJSON:    string(modelsMapJSON),
+		Weight:           100,
+		CreatedAt:        time.Now(),
 	})
 	if err != nil {
 		return fmt.Errorf("save: %w", err)
@@ -126,9 +199,13 @@ func RunDBAdd(name, url, key, providerType string) error {
 
 	fmt.Printf("✅ 已保存代理配置:\n")
 	fmt.Printf("  URL:      %s\n", url)
-	fmt.Printf("  Provider: %s\n", providerType)
-	if len(models) > 0 {
-		fmt.Printf("  模型 (%d):\n", len(models))
+	fmt.Printf("  协议:     %s\n", strings.Join(result.Capabilities, " / "))
+	for _, proto := range result.Capabilities {
+		models := result.ModelsMap[proto]
+		if len(models) == 0 {
+			continue
+		}
+		fmt.Printf("  %s 模型 (%d):\n", proto, len(models))
 		for i, m := range models {
 			fmt.Printf("    %3d. %s\n", i+1, m)
 		}
@@ -173,43 +250,158 @@ func RunDBDelete(id int) error {
 	return nil
 }
 
-// 嗅探模型列表（简化版，类似 agent-nexus sniff）
-func sniffModels(url, key, providerType string) ([]string, error) {
-	// 拼接 /v1/models 端点
-	modelsURL := url
-	if !strings.HasSuffix(modelsURL, "/v1") {
-		modelsURL = strings.TrimSuffix(modelsURL, "/") + "/v1"
-	}
-	modelsURL += "/models"
+// SniffResult 多协议嗅探结果
+type SniffResult struct {
+	Capabilities []string            // ["openai", "anthropic", "gemini", "responses"]
+	ModelsMap    map[string][]string // {"openai": ["gpt-4"], "anthropic": ["claude-3"]}
+}
 
-	// 构建请求
-	req, err := http.NewRequest("GET", modelsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Accept", "application/json")
+func (s *SniffResult) hasProto(p string) bool {
+	return slices.Contains(s.Capabilities, p)
+}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
+// sniffAll 对上游进行多协议嗅探
+func sniffAll(url, key string) *SniffResult {
+	result := &SniffResult{
+		ModelsMap: make(map[string][]string),
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	client := &http.Client{Timeout: 20 * time.Second}
+
+	// 规范化 base URL（去掉 /v1 后缀，便于拼接）
+	base := strings.TrimSuffix(url, "/")
+	base = strings.TrimSuffix(base, "/v1")
+	base = strings.TrimSuffix(base, "/v1/")
+
+	// ── Step 1: OpenAI ──────────────────────────────────
+	openaiURL := base + "/v1/models"
+	req, err := http.NewRequest("GET", openaiURL, nil)
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			switch resp.StatusCode {
+			case 200:
+				models := parseOpenAIModels(resp.Body)
+				result.ModelsMap["openai"] = models
+				result.Capabilities = append(result.Capabilities, "openai")
+			case 401:
+				result.Capabilities = append(result.Capabilities, "openai")
+				result.ModelsMap["openai"] = nil
+			}
+		}
+
+		// ── Step 1b: OpenAI Responses（独立探测 /v1/responses 端点） ──
+		// OpenAI Responses 是 /v1/responses，与 /v1/chat/completions 是不同的端点；
+		// 很多 OpenAI 兼容网关（vLLM/SGLang）只支持 chat 不支持 responses，
+		// 所以不能用 Step 1 的 200/401 自动推断，必须实际探测端点。
+		if len(result.Capabilities) > 0 {
+			responsesURL := base + "/v1/responses"
+			respBody := map[string]any{
+				"model":          "gpt-4o",
+				"input":          "probe",
+				"max_output_tokens": 1,
+				"stream":         false,
+			}
+			respBodyJSON, _ := json.Marshal(respBody)
+			req, err := http.NewRequest("POST", responsesURL, strings.NewReader(string(respBodyJSON)))
+			if err == nil {
+				req.Header.Set("Authorization", "Bearer "+key)
+				req.Header.Set("content-type", "application/json")
+				req.Header.Set("Accept", "application/json")
+				shortClient := &http.Client{Timeout: 10 * time.Second}
+				resp, err := shortClient.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode < 500 {
+						result.Capabilities = append(result.Capabilities, "responses")
+						result.ModelsMap["responses"] = result.ModelsMap["openai"]
+					}
+				}
+			}
+		}
 	}
 
-	// 解析 OpenAI 格式的 models 响应
-	var body map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, err
+	// ── Step 2: Anthropic ────────────────────────────────
+	anthropicURL := base + "/v1/messages"
+	msgBody := map[string]any{
+		"model":      "claude-3-opus-20240229",
+		"max_tokens": 1,
+		"system":     "probe",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	msgBodyJSON, _ := json.Marshal(msgBody)
+	req, err = http.NewRequest("POST", anthropicURL, strings.NewReader(string(msgBodyJSON)))
+	if err == nil {
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		shortClient := &http.Client{Timeout: 10 * time.Second}
+		resp, err := shortClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode < 500 {
+				var bodyMap map[string]interface{}
+				if json.NewDecoder(resp.Body).Decode(&bodyMap) == nil {
+					if m, ok := bodyMap["model"].(string); ok {
+						result.ModelsMap["anthropic"] = []string{m}
+					} else {
+						result.ModelsMap["anthropic"] = nil
+					}
+				} else {
+					result.ModelsMap["anthropic"] = nil
+				}
+				result.Capabilities = append(result.Capabilities, "anthropic")
+			}
+		}
 	}
 
-	data, ok := body["data"].([]interface{})
+	// ── Step 3: Gemini ──────────────────────────────────
+	geminiURL := base + "/v1/models/gemini-pro:generateContent"
+	geminiBody := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"role": "user",
+				"parts": []any{
+					map[string]any{"text": "hi"},
+				},
+			},
+		},
+	}
+	geminiBodyJSON, _ := json.Marshal(geminiBody)
+	req, err = http.NewRequest("POST", geminiURL, strings.NewReader(string(geminiBodyJSON)))
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		shortClient := &http.Client{Timeout: 10 * time.Second}
+		resp, err := shortClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode < 500 {
+				result.ModelsMap["gemini"] = nil
+				result.Capabilities = append(result.Capabilities, "gemini")
+			}
+		}
+	}
+
+	return result
+}
+
+// parseOpenAIModels 从 OpenAI /v1/models 响应解析模型 ID 列表
+func parseOpenAIModels(body ioReader) []string {
+	var bodyMap map[string]interface{}
+	if err := json.NewDecoder(body).Decode(&bodyMap); err != nil {
+		return nil
+	}
+	data, ok := bodyMap["data"].([]interface{})
 	if !ok {
-		return nil, nil
+		return nil
 	}
-
 	var models []string
 	for _, item := range data {
 		if m, ok := item.(map[string]interface{}); ok {
@@ -218,19 +410,12 @@ func sniffModels(url, key, providerType string) ([]string, error) {
 			}
 		}
 	}
-	return models, nil
+	return models
 }
 
-func normalizeProvider(p string) string {
-	p = strings.ToLower(p)
-	switch p {
-	case "anthropic":
-		return "anthropic"
-	case "gemini", "google":
-		return "gemini"
-	default:
-		return "openai"
-	}
+// ioReader 简化为 io.Reader 接口约束
+type ioReader interface {
+	Read(p []byte) (n int, err error)
 }
 
 func maskKey(k string) string {
