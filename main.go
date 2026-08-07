@@ -115,6 +115,9 @@ func runDBList() {
 	}
 }
 
+// validProviderTypes db add 支持的 provider 类型
+var validProviderTypes = map[string]bool{"openai": true, "anthropic": true, "gemini": true}
+
 // runDBAdd 添加代理配置
 func runDBAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
@@ -129,6 +132,11 @@ func runDBAdd(args []string) {
 		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>] [--type <t>]\n")
 		os.Exit(1)
 	}
+	if !validProviderTypes[*providerType] {
+		fmt.Fprintf(os.Stderr, "❌ --type 无效: %q（仅支持 openai/anthropic/gemini）\n", *providerType)
+		fmt.Fprintf(os.Stderr, "用法: agent-proxy db add --url <url> --key <key> [--name <n>] [--type <t>]\n")
+		os.Exit(1)
+	}
 	if *name == "" {
 		*name = *url
 	}
@@ -139,17 +147,37 @@ func runDBAdd(args []string) {
 	fmt.Printf("✅ 已保存代理配置: %s (%s)\n", *name, *url)
 }
 
+// validRunFlags run 命令允许的参数
+var validRunFlags = map[string]bool{
+	"--host": true, "--port": true, "--mode": true,
+	"--db": true, "--conf": true, "--key": true, "--nokey": true,
+}
+
+// validRunMode 允许的 mode 值
+var validRunMode = map[string]bool{"simple": true, "complex": true}
+
 // runServer 解析启动参数并启动服务
 func runServer(args []string) {
 	host := "127.0.0.1"
 	port := 8080
 	mode := ""
+	modeGiven := false
 	dbID := -1
 	conf := ""
 	clientKey := ""
+	keyGiven := false
 	noClientKey := false
+
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
+		flag := args[i]
+		if _, ok := validRunFlags[flag]; !ok {
+			fmt.Fprintf(os.Stderr, "❌ 未知参数: %s\n", flag)
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy run [--mode <simple|complex>] [--db <id>]\n")
+			fmt.Fprintf(os.Stderr, "      [--host <h>] [--port <p>] [--conf <f>]\n")
+			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey]\n")
+			os.Exit(1)
+		}
+		switch flag {
 		case "--host":
 			i++
 			if i < len(args) {
@@ -164,6 +192,7 @@ func runServer(args []string) {
 			i++
 			if i < len(args) {
 				mode = args[i]
+				modeGiven = true
 			}
 		case "--db":
 			i++
@@ -179,15 +208,23 @@ func runServer(args []string) {
 			i++
 			if i < len(args) {
 				clientKey = args[i]
+				keyGiven = true
 			}
 		case "--nokey":
 			noClientKey = true
 		}
 	}
 
-	// --db N        → 快速模式（默认，需指定 --db）
-	// --mode complex [--conf] → 复杂模式
-	// 无 --db 也无 --mode → 默认复杂模式
+	if modeGiven && !validRunMode[mode] {
+		fmt.Fprintf(os.Stderr, "❌ --mode 无效: %q（仅支持 simple 或 complex）\n", mode)
+		fmt.Fprintf(os.Stderr, "用法: agent-proxy run [--mode <simple|complex>] [--db <id>] [--host <h>] [--port <p>] [--conf <f>] [--key <k> | --nokey]\n")
+		os.Exit(1)
+	}
+
+	if keyGiven && !modeGiven && dbID <= 0 {
+		fmt.Fprintf(os.Stderr, "⚠️  警告: --key 仅在快速模式（--mode simple 或 --db <id>）下有效，当前为复杂模式，将被忽略\n")
+	}
+
 	quickMode := mode == "simple" || dbID > 0
 	if mode == "complex" {
 		quickMode = false
