@@ -11,6 +11,14 @@
 - **随机密钥生成** — 基于 `crypto/rand` 生成 24 字节随机 hex，前缀 `sk-`
 - **`/health` 端点始终免认证** — 可用于健康检查与负载均衡探测
 
+## Bug 修复
+
+- **认证错误返回格式** — `middleware.Auth()` 现返回与网关一致的标准 JSON 错误格式
+  (`{"error":{"type":"invalid_request_error","message":"invalid api key","code":"401"}}`)，
+  而非纯文本 `Unauthorized`，避免解析 `error.type` 的客户端出错
+- **控制台密钥行排版** — 去除 `Proxy Key:` 行多余对齐空格，脚本化提取密钥
+  (`grep "Proxy Key:" | sed 's/.*: //'`) 时不会捕获前导空白
+
 ## 用法
 
 ```powershell
@@ -32,6 +40,6 @@ agent-proxy run --db 1 --nokey
 | `--key <k>` | 指定值 | ✅ 需要 | 固定环境、自动化脚本 |
 | `--nokey` | 无 | ❌ 不需要 | 本地开发、内网直连 |
 
-- 缺密钥或密钥错误时返回 `401 Unauthorized`
+- 缺密钥或密钥错误时返回 `401 Unauthorized`，响应体为标准 JSON 错误格式（`error.type`, `error.message`, `error.code`）
 - `/health` 端点不受认证影响
 - 未认证请求被拒绝，不会到达下游 Provider
