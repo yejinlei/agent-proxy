@@ -392,12 +392,6 @@ func (t *AnthropicTranslator) TranslateToProvider(req *schema.InternalRequest) (
 
 	tools := toolsToAnthropic(req.Tools)
 
-	// ⚠️ Anthropic 要求 max_tokens 最小值 1024
-	maxTokens := req.MaxTokens
-	if maxTokens > 0 && maxTokens < 1024 {
-		maxTokens = 1024
-	}
-
 	return &MessageRequest{
 		Model:         req.Model,
 		Messages:      messages,
@@ -407,7 +401,7 @@ func (t *AnthropicTranslator) TranslateToProvider(req *schema.InternalRequest) (
 		Temperature:   req.Temperature,
 		TopP:          req.TopP,
 		TopK:          req.TopK,
-		MaxTokens:     maxTokens,
+		MaxTokens:     req.MaxTokens,
 		StopSequences: req.StopSequences,
 		Metadata: &Metadata{
 			UserID: req.UserID,
