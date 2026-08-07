@@ -8,11 +8,11 @@
 4. [复杂模式使用](#复杂模式使用)
 5. [CLI 命令参考](#cli-命令参考)
 6. [客户端认证](#客户端认证)
-6. [协议兼容性详解](#协议兼容性详解)
-7. [Web UI 使用](#web-ui-使用)
-8. [高级配置](#高级配置)
-9. [故障排查](#故障排查)
-10. [扩展开发](#扩展开发)
+7. [协议兼容性详解](#协议兼容性详解)
+8. [Web UI 使用](#web-ui-使用)
+9. [高级配置](#高级配置)
+10. [故障排查](#故障排查)
+11. [扩展开发](#扩展开发)
 
 ---
 
@@ -91,8 +91,8 @@ agent-proxy db add --url https://token.sensenova.cn/v1 \
                    --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
                    --name sensenova
 
-# ② 快速模式启动
-agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1
+# ② 快速模式启动（--nokey 本地开发无需客户端密钥）
+agent-proxy run --db 1 --nokey
 
 # ③ 使用任意入站协议调用（4 种协议全支持，自动翻译到下游）
 # 3a. OpenAI Compatible 入站
@@ -116,6 +116,8 @@ curl -X POST http://localhost:8080/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
+
+> **注意**：以上 curl 示例省略了 `Authorization` 头，因为启动时使用了 `--nokey`。默认情况下快速模式会要求客户端认证，详见下方[客户端认证](#客户端认证)章节。
 
 ### 客户端认证
 

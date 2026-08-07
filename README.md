@@ -126,6 +126,58 @@ agent-proxy <subcommand> [options]
 | 限流 / 监控 | 无 | 有 |
 | 适用场景 | 快速试用、单一端点 | 生产、多厂商调度 |
 
+## 客户端认证（--key）
+
+快速模式内置客户端认证机制，通过 `Authorization: Bearer <key>` 保护代理端点。三种使用方式：
+
+### 1. 随机密钥（默认）
+
+不传 `--key` 时，启动时自动随机生成一个 48 位 hex 密钥并打印到控制台：
+
+```powershell
+agent-proxy run --db 1
+```
+
+```
+🚀 Agent-Proxy (快速模式) running on http://127.0.0.1:8080
+🔑 Proxy Key:      sk-a1b2c3d4e5f6...
+🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
+```
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-a1b2c3d4e5f6..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
+```
+
+> 密钥每次重启都会变化，适合临时使用。
+
+### 2. 固定密钥
+
+```powershell
+agent-proxy run --db 1 --key sk-my-fixed-key
+```
+
+客户端连接时使用同一个 `sk-my-fixed-key`。
+
+### 3. 无需密钥（本地开发）
+
+```powershell
+agent-proxy run --db 1 --nokey
+```
+
+任何客户端均可直接连接，无需 `Authorization` 头。**不要在生产环境使用。**
+
+| 标志 | 密钥来源 | 需要 `Authorization` 头 | 适用场景 |
+|------|---------|------------------------|---------|
+| （不传） | 随机生成 | ✅ | 本地临时使用 |
+| `--key <k>` | 指定值 | ✅ | 固定环境、自动化脚本 |
+| `--nokey` | 无 | ❌ | 本地开发、内网直连 |
+
+- 缺密钥或密钥错误时返回 `401 Unauthorized`
+- `/health` 端点始终不受认证影响
+
 ## 4×4 协议互转矩阵
 
 任意入站协议（行）可转换为任意出站协议（列），网关自动完成双向翻译：
