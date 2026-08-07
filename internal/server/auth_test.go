@@ -12,7 +12,6 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/protocol/gemini"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/responses"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
-	"github.com/agent-proxy/agent-proxy/internal/provider"
 	"github.com/agent-proxy/agent-proxy/internal/translator"
 )
 
@@ -132,11 +131,12 @@ func setupTestQuickGateway(clientKey string, clientKeyEnabled bool) *QuickGatewa
 
 	return &QuickGateway{
 		proxyName:          proxyName,
-		info:               &schema.ProviderInfo{Name: proxyName, BaseURL: proxyBaseURL, APIToken: proxyKey, Version: "openai"},
-		provider:           provider.NewOpenAIClient(proxyName, proxyBaseURL, 5),
+		info:               &schema.ProviderInfo{Name: proxyName, BaseURL: proxyBaseURL, APIToken: proxyKey, Version: "openai", Capabilities: []string{"openai"}},
+		capabilities:       []string{"openai"},
 		translatorRegistry: registry,
 		proxyBaseURL:       proxyBaseURL,
 		proxyKey:           proxyKey,
+		timeout:            60,
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
 	}

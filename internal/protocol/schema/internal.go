@@ -279,6 +279,7 @@ type ProviderInfo struct {
 	Status     string          // "healthy" | "degraded" | "down"
 	Version    string          // Provider 类型 (openai/anthropic/gemini/responses)
 	APIVersion string          // API 版本号 (如 anthropic 2023-06-01)
+	Capabilities []string      // 上游支持的协议列表 ["openai","anthropic","gemini","responses"]
 }
 
 // ─── Monitor ─────────────────────────────────────────────────────────

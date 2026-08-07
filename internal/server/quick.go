@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/middleware"
@@ -25,30 +27,22 @@ import (
 type QuickGateway struct {
 	proxyName          string
 	info               *schema.ProviderInfo
-	provider           provider.Provider
+	timeout            int
+	capabilities       []string
 	translatorRegistry *translator.TranslatorRegistry
 	// 透传上游 /v1/models 用的
 	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
 	proxyKey     string
 	// 客户端认证
-	clientKey          string
-	clientKeyEnabled   bool
+	clientKey        string
+	clientKeyEnabled bool
+	// 按协议类型按需创建的 provider
+	providerCache sync.Map // string → provider.Provider
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
-func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int, clientKey string, clientKeyEnabled bool) *QuickGateway {
-	var p provider.Provider
-	switch providerType {
-	case "anthropic":
-		p = provider.NewAnthropicClient(name, baseURL, apiKey, "2023-06-01", timeout)
-	case "gemini":
-		p = provider.NewGeminiClient(name, baseURL, timeout)
-	case "responses":
-		p = provider.NewResponsesClient(name, baseURL, timeout)
-	default:
-		p = provider.NewOpenAIClient(name, baseURL, timeout)
-	}
-
+// capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeout int, clientKey string, clientKeyEnabled bool) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
@@ -59,13 +53,14 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int, cl
 	return &QuickGateway{
 		proxyName: name,
 		info: &schema.ProviderInfo{
-			Name:       name,
-			BaseURL:    baseURL,
-			APIToken:   apiKey,
-			Version:    providerType,
-			APIVersion: "2023-06-01",
+			Name:         name,
+			BaseURL:      baseURL,
+			APIToken:     apiKey,
+			APIVersion:   "2023-06-01",
+			Capabilities: capabilities,
 		},
-		provider:           p,
+		timeout:            timeout,
+		capabilities:       capabilities,
 		translatorRegistry: registry,
 		proxyBaseURL:       strings.TrimSuffix(baseURL, "/"),
 		proxyKey:           apiKey,
@@ -74,20 +69,49 @@ func NewQuickGateway(name, baseURL, apiKey, providerType string, timeout int, cl
 	}
 }
 
-// detectIngressProtocol 从请求路径识别入站协议
-func (q *QuickGateway) detectIngressProtocol(path string) string {
-	switch {
-	case path == "/v1/chat/completions":
-		return "chatcompletion"
-	case path == "/v1/messages":
-		return "anthropic"
-	case path == "/v1/responses":
-		return "responses"
-	case strings.HasSuffix(path, ":generateContent"):
-		return "gemini"
-	default:
-		return "chatcompletion"
+// normalizeIngress 将入站协议名归一化为存储名
+// detectIngressProtocol 返回 "chatcompletion" / "anthropic" / "gemini" / "responses"
+// DB 中存储 "openai"（代表 Chat Completions），需要映射
+func (q *QuickGateway) normalizeIngress(p string) string {
+	if p == "chatcompletion" {
+		return "openai"
 	}
+	return p
+}
+
+// selectProtocol 根据入站协议选择匹配的上游协议
+// 策略：归一化后，若该协议在 capabilities 中则使用它（透传）；否则回退到 openai（翻译转换）
+func (q *QuickGateway) selectProtocol(ingressProtocol string) string {
+	normalized := q.normalizeIngress(ingressProtocol)
+	if slices.Contains(q.capabilities, normalized) {
+		return normalized
+	}
+	// 回退：上游不支持该协议 → 翻译到 openai 协议转换
+	return "openai"
+}
+
+// getProvider 按需创建并缓存 provider（按协议类型）
+func (q *QuickGateway) getProvider(protocolType string) provider.Provider {
+	if cached, ok := q.providerCache.Load(protocolType); ok {
+		return cached.(provider.Provider)
+	}
+
+	var p provider.Provider
+	switch protocolType {
+	case "anthropic":
+		p = provider.NewAnthropicClient(q.proxyName, q.proxyBaseURL, q.proxyKey, "2023-06-01", q.timeout)
+	case "gemini":
+		p = provider.NewGeminiClient(q.proxyName, q.proxyBaseURL, q.timeout)
+	case "responses":
+		p = provider.NewResponsesClient(q.proxyName, q.proxyBaseURL, q.timeout)
+	default:
+		p = provider.NewOpenAIClient(q.proxyName, q.proxyBaseURL, q.timeout)
+	}
+
+	if val, loaded := q.providerCache.LoadOrStore(protocolType, p); loaded {
+		return val.(provider.Provider)
+	}
+	return p
 }
 
 func (q *QuickGateway) Routes() chi.Router {
@@ -116,7 +140,7 @@ func (q *QuickGateway) Routes() chi.Router {
 }
 
 // handleRequest 统一请求处理：入站协议 → InternalRequest → 下游 Provider → InternalResponse → 入站协议
-// 优先透传：当入站协议与 Provider 类型一致时，原始 body 原样转发，零损耗。
+// 协议感知路由：先按入站协议选择匹配的上游协议（透传优先），无匹配则回退到 openai 翻译转换。
 func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressProtocol string) {
 	startTime := time.Now()
 
@@ -130,10 +154,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	br := bytes.NewReader(body)
 	r.Body = io.NopCloser(io.NewSectionReader(br, 0, int64(br.Len())))
 
+	// ── 协议感知路由：选择上游协议（本地变量，不修改 q.info 共享结构） ──
+	providerType := q.selectProtocol(ingressProtocol)
+	p := q.getProvider(providerType)
+
 	// ── 轻量提取 model 用于路由 & 透传 URL ──
 	// Gemini 的 model 在 URL 路径 /v1/models/{model}:generateContent 中，
 	// 已由 handleModelsCatchAll 写入 ctx；其他协议从请求体读取。
-	model := quickExtractModel(body, ingressProtocol)
+	model := quickExtractModel(body)
 	if model == "" && ingressProtocol == "gemini" {
 		if m, ok := gemini.GeminiModelFromContext(r.Context()); ok && m != "" {
 			model = m
@@ -141,13 +169,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	}
 
 	// ── 透传 vs 翻译 ──
-	providerType := q.info.Version
-	if ingressProtocol == providerType && model != "" {
+	// 归一化后 ingressProtocol == providerType 时透传（零损耗）
+	normalizedIngress := q.normalizeIngress(ingressProtocol)
+	if normalizedIngress == providerType && model != "" {
 		ctx := r.Context()
 		if quickDetectStream(body) {
-			q.handlePassthroughStream(ctx, w, r, model, startTime)
+			q.handlePassthroughStream(p, ctx, w, r, model, startTime)
 		} else {
-			q.handlePassthroughNonStream(ctx, w, r, model, startTime)
+			q.handlePassthroughNonStream(p, ctx, w, r, model, startTime)
 		}
 		return
 	}
@@ -166,15 +195,15 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	}
 
 	// ── 翻译到目标 Provider 协议 ──
-	providerTranslator, downstreamReq := q.translateToProvider(internalReq)
+	providerTranslator, downstreamReq := q.translateToProvider(providerType, internalReq)
 
 	// ── 执行 Provider 调用 ──
 	stream := internalReq.Stream
 	ctx := r.Context()
 	if stream {
-		q.handleStreamRequest(ctx, w, downstreamReq, providerTranslator, ingressTranslator, startTime, r)
+		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, startTime)
 	} else {
-		q.handleNonStreamResponse(ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime, r)
+		q.handleNonStreamResponse(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	}
 }
 
@@ -209,8 +238,8 @@ func (q *QuickGateway) handleModelsCatchAll(w http.ResponseWriter, r *http.Reque
 }
 
 // quickExtractModel 从原始 JSON 中提取 model 字段
-func quickExtractModel(body json.RawMessage, ingressProtocol string) string {
-	var m map[string]interface{}
+func quickExtractModel(body json.RawMessage) string {
+	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return ""
 	}
@@ -224,7 +253,7 @@ func quickExtractModel(body json.RawMessage, ingressProtocol string) string {
 
 // quickDetectStream 检测请求体中 stream 字段
 func quickDetectStream(body json.RawMessage) bool {
-	var m map[string]interface{}
+	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return false
 	}
@@ -247,10 +276,10 @@ func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.P
 }
 
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
-func (q *QuickGateway) handlePassthroughNonStream(ctx context.Context, w http.ResponseWriter,
+func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, model string, startTime time.Time) {
 
-	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, model)
@@ -260,7 +289,7 @@ func (q *QuickGateway) handlePassthroughNonStream(ctx context.Context, w http.Re
 		return
 	}
 
-	resp, headers, err := q.provider.Call(callCtx, body, callInfo)
+	resp, headers, err := p.Call(callCtx, body, callInfo)
 	if err != nil {
 		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
@@ -282,7 +311,7 @@ func (q *QuickGateway) handlePassthroughNonStream(ctx context.Context, w http.Re
 }
 
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
-func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter,
+func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, model string, startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
@@ -296,7 +325,7 @@ func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.Respo
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, model)
@@ -307,7 +336,7 @@ func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.Respo
 		return
 	}
 
-	lines, headers, err := q.provider.CallStream(callCtx, body, callInfo)
+	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	if err != nil {
 		flusher.Flush()
 		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
@@ -322,7 +351,7 @@ func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.Respo
 	}
 
 	for line := range lines {
-		var meta map[string]interface{}
+		var meta map[string]any
 		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
 			continue
 		}
@@ -336,15 +365,15 @@ func (q *QuickGateway) handlePassthroughStream(ctx context.Context, w http.Respo
 }
 
 // handleNonStreamResponse 非流式响应
-func (q *QuickGateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWriter,
-	downstreamReq json.RawMessage, providerTranslator interface{},
+func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	downstreamReq json.RawMessage, providerTranslator any,
 	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
-	startTime time.Time, r *http.Request) {
+	startTime time.Time) {
 
-	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
-	resp, headers, err := q.provider.Call(callCtx, downstreamReq, q.info)
+	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
 	if err != nil {
 		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
@@ -394,10 +423,10 @@ func (q *QuickGateway) handleNonStreamResponse(ctx context.Context, w http.Respo
 }
 
 // handleStreamRequest 流式请求
-func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter,
-	downstreamReq json.RawMessage, providerTranslator interface{},
+func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	downstreamReq json.RawMessage, providerTranslator any,
 	ingressTranslator translator.CombinedTranslator,
-	startTime time.Time, r *http.Request) {
+	startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -410,10 +439,10 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
-	lines, _, err := q.provider.CallStream(callCtx, downstreamReq, q.info)
+	lines, _, err := p.CallStream(callCtx, downstreamReq, q.info)
 	if err != nil {
 		flusher.Flush()
 		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
@@ -426,7 +455,7 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 		defer close(events)
 		for line := range lines {
 			// 跳过元数据
-			var meta map[string]interface{}
+			var meta map[string]any
 			if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
 				continue
 			}
@@ -442,10 +471,7 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 				}
 			} else {
 				// OpenAI 兼容：解析 SSE delta 行（可能带 "data: " 前缀）
-				payload := string(line)
-				if strings.HasPrefix(payload, "data: ") {
-					payload = payload[6:]
-				}
+				payload := strings.TrimPrefix(string(line), "data: ")
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
 				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
@@ -504,8 +530,8 @@ func (q *QuickGateway) handleStreamRequest(ctx context.Context, w http.ResponseW
 }
 
 // translateToProvider 根据目标 Provider 类型选择翻译器并构建下游请求体
-func (q *QuickGateway) translateToProvider(internalReq *schema.InternalRequest) (interface{}, json.RawMessage) {
-	providerType := q.info.Version
+// providerType 来自调用方本地变量，避免读取共享 q.info.Version 造成数据竞争。
+func (q *QuickGateway) translateToProvider(providerType string, internalReq *schema.InternalRequest) (any, json.RawMessage) {
 
 	switch providerType {
 	case "openai", "sensenova":
@@ -539,8 +565,8 @@ func (q *QuickGateway) translateToProvider(internalReq *schema.InternalRequest) 
 }
 
 func (q *QuickGateway) sendError(w http.ResponseWriter, code int, typ, msg string) {
-	errResp := map[string]interface{}{
-		"error": map[string]interface{}{
+	errResp := map[string]any{
+		"error": map[string]any{
 			"message": msg,
 			"type":    typ,
 			"code":    fmt.Sprintf("%d", code),

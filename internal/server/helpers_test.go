@@ -66,39 +66,34 @@ func TestMakePassthroughInfo(t *testing.T) {
 
 func TestQuickExtractModel(t *testing.T) {
 	tests := []struct {
-		name     string
-		protocol string
-		body     string
-		want     string
+		name string
+		body string
+		want string
 	}{
 		{
-			name:     "chatcompletion with stream",
-			protocol: "chatcompletion",
-			body:     `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`,
-			want:     "gpt-4o",
+			name: "chatcompletion with stream",
+			body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`,
+			want: "gpt-4o",
 		},
 		{
-			name:     "anthropic messages",
-			protocol: "anthropic",
-			body:     `{"model":"claude-3-opus","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`,
-			want:     "claude-3-opus",
+			name: "anthropic messages",
+			body: `{"model":"claude-3-opus","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`,
+			want: "claude-3-opus",
 		},
 		{
-			name:     "responses api",
-			protocol: "responses",
-			body:     `{"model":"gpt-4o-mini","input":"hello","stream":false}`,
-			want:     "gpt-4o-mini",
+			name: "responses api",
+			body: `{"model":"gpt-4o-mini","input":"hello","stream":false}`,
+			want: "gpt-4o-mini",
 		},
 		{
-			name:     "chatcompletion missing model",
-			protocol: "chatcompletion",
-			body:     `{"messages":[{"role":"user","content":"hi"}]}`,
-			want:     "",
+			name: "chatcompletion missing model",
+			body: `{"messages":[{"role":"user","content":"hi"}]}`,
+			want: "",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := quickExtractModel(json.RawMessage(tt.body), tt.protocol)
+			got := quickExtractModel(json.RawMessage(tt.body))
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -156,7 +151,7 @@ func TestQuickGateway_sendError(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("status: got %d, want 400", w.Code)
 	}
-	var out map[string]interface{}
+	var out map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatalf("response not JSON: %v", err)
 	}
@@ -166,18 +161,18 @@ func TestQuickGateway_sendError(t *testing.T) {
 	}
 	// sendError stores the error *type* under "type" and the HTTP status code
 	// (as a string) under "code".
-	if err.(map[string]interface{})["type"] != "missing_model" {
-		t.Errorf("error type mismatch: got %v", err.(map[string]interface{})["type"])
+	if err.(map[string]any)["type"] != "missing_model" {
+		t.Errorf("error type mismatch: got %v", err.(map[string]any)["type"])
 	}
-	if err.(map[string]interface{})["code"] != "400" {
-		t.Errorf("error code mismatch: got %v", err.(map[string]interface{})["code"])
+	if err.(map[string]any)["code"] != "400" {
+		t.Errorf("error code mismatch: got %v", err.(map[string]any)["code"])
 	}
 }
 
 // ── quickExtractModel & quickDetectStream 空 body 防御 ──
 
 func TestQuickExtractModel_EmptyBody(t *testing.T) {
-	got := quickExtractModel(json.RawMessage(`{}`), "chatcompletion")
+	got := quickExtractModel(json.RawMessage(`{}`))
 	if got != "" {
 		t.Errorf("expected empty model, got %q", got)
 	}
