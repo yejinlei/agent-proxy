@@ -246,7 +246,7 @@ func runServer(args []string) {
 	if quickMode {
 		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://%s:%d\n", host, port)
 		if quickClientKeyEnabled {
-			fmt.Printf("🔑 Proxy Key:      %s\n", quickClientKey)
+			fmt.Printf("🔑 Proxy Key: %s\n", quickClientKey)
 			fmt.Printf("🔐 客户端需使用 Authorization: Bearer %s 连接\n", quickClientKey)
 		} else {
 			fmt.Printf("🔓 无需认证密钥（--nokey）\n")
