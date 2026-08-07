@@ -57,8 +57,11 @@ func TestAuthMiddleware_WrongKey(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if body != "Unauthorized\n" {
-		t.Errorf("unexpected body %q", body)
+	if !strings.Contains(body, "invalid api key") {
+		t.Errorf("expected JSON error containing 'invalid api key', got %q", body)
+	}
+	if w.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("expected application/json content type, got %q", w.Header().Get("Content-Type"))
 	}
 }
 

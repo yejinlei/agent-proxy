@@ -1,6 +1,7 @@
 package middleware
 
 import (
+        "encoding/json"
         "net/http"
 )
 
@@ -41,10 +42,29 @@ func Auth(apiKey string) func(http.Handler) http.Handler {
                 return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
                         auth := r.Header.Get("Authorization")
                         if auth != "Bearer "+apiKey && r.URL.Path != "/health" {
-                                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                                sendUnauthorizedJSON(w)
                                 return
                         }
                         next.ServeHTTP(w, r)
                 })
         }
+}
+
+// sendUnauthorizedJSON 发送标准 JSON 格式的 401 错误，与网关 sendError 保持一致。
+func sendUnauthorizedJSON(w http.ResponseWriter) {
+        errResp := map[string]interface{}{
+                "error": map[string]interface{}{
+                        "type":    "invalid_request_error",
+                        "message": "invalid api key",
+                        "code":    "401",
+                },
+        }
+        data, err := json.Marshal(errResp)
+        if err != nil {
+                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusUnauthorized)
+        w.Write(data)
 }
