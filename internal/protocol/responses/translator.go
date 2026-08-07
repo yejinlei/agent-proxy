@@ -124,7 +124,12 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 func inputToMessages(items []InputItem) []schema.InternalMessage {
 	var msgs []schema.InternalMessage
 	for _, item := range items {
-		if item.Type != "message" {
+		// type 为空时默认 "message"（部分客户端省略 type 字段）
+		itemType := item.Type
+		if itemType == "" {
+			itemType = "message"
+		}
+		if itemType != "message" {
 			continue
 		}
 
