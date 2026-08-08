@@ -13,8 +13,13 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/db"
 )
 
-// RunDBList 列出所有代理
-func RunDBList() error {
+// openDB 打开默认 SQLite 数据库
+func openDB() (*db.DB, error) {
+	return db.New("")
+}
+
+// RunDBQuery 查询代理（无 id 列出全部，有 id 显示详情）
+func RunDBQuery(id *int) error {
 	store, err := openDB()
 	if err != nil {
 		return err
@@ -24,49 +29,41 @@ func RunDBList() error {
 		return fmt.Errorf("init db: %w", err)
 	}
 
-	records, err := store.List()
-	if err != nil {
-		return err
-	}
-	if len(records) == 0 {
-		fmt.Println("数据库为空。使用 'agent-proxy detect' 或 'agent-proxy db add' 嗅探并添加代理。")
+	if id == nil {
+		// 列出全部
+		records, err := store.List()
+		if err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			fmt.Println("数据库为空。使用 'agent-proxy db add' 嗅探并添加代理。")
+			return nil
+		}
+
+		fmt.Printf("\n📋 已保存的代理配置 (%d 条):\n", len(records))
+		fmt.Println(strings.Repeat("─", 100))
+		fmt.Printf("  %-4s  %-16s  %-42s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "时间")
+		fmt.Println(strings.Repeat("─", 100))
+
+		for _, r := range records {
+			caps := strings.Join(r.Capabilities(), " / ")
+			if caps == "" {
+				caps = r.ProviderType
+			}
+			modelCount := r.TotalModelCount()
+			fmt.Printf("  %-4d  %-16s  %-42s  %-18s  %-8d  %s\n",
+				r.ID, r.Name, r.URL, caps, modelCount, r.CreatedAt.Format("2006-01-02 15:04:05"))
+		}
+		fmt.Println()
 		return nil
 	}
 
-	fmt.Printf("\n📋 已保存的代理配置 (%d 条):\n", len(records))
-	fmt.Println(strings.Repeat("─", 100))
-	fmt.Printf("  %-4s  %-16s  %-42s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "时间")
-	fmt.Println(strings.Repeat("─", 100))
-
-	for _, r := range records {
-		caps := strings.Join(r.Capabilities(), " / ")
-		if caps == "" {
-			caps = r.ProviderType
-		}
-		modelCount := r.TotalModelCount()
-		fmt.Printf("  %-4d  %-16s  %-42s  %-18s  %-8d  %s\n",
-			r.ID, r.Name, r.URL, caps, modelCount, r.CreatedAt.Format("2006-01-02 15:04:05"))
-	}
-	fmt.Println()
-	return nil
-}
-
-// RunDBShow 显示指定代理详情
-func RunDBShow(id int) error {
-	store, err := openDB()
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	if err := store.Init(); err != nil {
-		return fmt.Errorf("init db: %w", err)
+	// 显示详情
+	if !store.Exists(*id) {
+		return fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db query' 查看现有配置", *id)
 	}
 
-	if !store.Exists(id) {
-		return fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db list' 查看现有配置", id)
-	}
-
-	r, err := store.GetByID(id)
+	r, err := store.GetByID(*id)
 	if err != nil {
 		return err
 	}
@@ -79,12 +76,10 @@ func RunDBShow(id int) error {
 	fmt.Printf("  权重:         %d\n", r.Weight)
 	fmt.Printf("  时间:         %s\n", r.CreatedAt.Format("2006-01-02 15:04:05"))
 
-	// 多协议能力
 	caps := r.Capabilities()
 	if len(caps) > 0 {
 		fmt.Printf("  协议:         %s\n", strings.Join(caps, " / "))
 
-		// 每协议模型列表
 		hasAnyModel := false
 		for _, proto := range caps {
 			models := r.ModelsForProtocol(proto)
@@ -98,7 +93,6 @@ func RunDBShow(id int) error {
 			}
 		}
 
-		// 兼容：如果没有 models_map_json 但有 models_json，显示旧格式
 		if !hasAnyModel {
 			models := r.Models()
 			if len(models) > 0 {
@@ -109,7 +103,6 @@ func RunDBShow(id int) error {
 			}
 		}
 	} else {
-		// 兼容旧记录
 		fmt.Printf("  Provider:     %s\n", r.ProviderType)
 		fmt.Printf("  检测格式:     %s\n", r.DetectedFormat)
 		fmt.Printf("  OpenAI:       %v\n", r.OpenAICap)
@@ -214,8 +207,8 @@ func RunDBAdd(name, url, key string) error {
 	return nil
 }
 
-// RunDBDelete 删除代理
-func RunDBDelete(id int) error {
+// RunDBRm 删除代理
+func RunDBRm(id int) error {
 	store, err := openDB()
 	if err != nil {
 		return err
@@ -247,6 +240,105 @@ func RunDBDelete(id int) error {
 		return fmt.Errorf("delete: %w", err)
 	}
 	fmt.Printf("✅ 已删除 ID=%d\n", id)
+	return nil
+}
+
+// RunDBCheck 核对所有代理配置（重新嗅探，提示删除无效记录）
+func RunDBCheck() error {
+	store, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		return fmt.Errorf("init db: %w", err)
+	}
+
+	records, err := store.List()
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		fmt.Println("数据库为空，无需核对。")
+		return nil
+	}
+
+	fmt.Printf("🔍 正在核对 %d 条代理配置，请稍候...\n\n", len(records))
+
+	type checkResult struct {
+		id         int
+		name       string
+		url        string
+		caps       string
+		modelCount int
+		valid      bool
+	}
+	results := make([]checkResult, 0, len(records))
+	var invalid []int
+
+	for _, r := range records {
+		result := sniffAll(r.URL, r.Key)
+		totalModels := 0
+		for _, ms := range result.ModelsMap {
+			totalModels += len(ms)
+		}
+		valid := totalModels > 0
+		caps := strings.Join(result.Capabilities, " / ")
+		if caps == "" {
+			caps = "—"
+		}
+		cr := checkResult{
+			id:         r.ID,
+			name:       r.Name,
+			url:        r.URL,
+			caps:       caps,
+			modelCount: totalModels,
+			valid:      valid,
+		}
+		results = append(results, cr)
+		if !valid {
+			invalid = append(invalid, r.ID)
+		}
+	}
+
+	// 打印汇总表
+	fmt.Println(strings.Repeat("─", 110))
+	fmt.Printf("  %-4s  %-16s  %-48s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "状态")
+	fmt.Println(strings.Repeat("─", 110))
+
+	for _, cr := range results {
+		status := "✅ 有效"
+		if !cr.valid {
+			status = "❌ 无效"
+		}
+		fmt.Printf("  %-4d  %-16s  %-48s  %-18s  %-8d  %s\n",
+			cr.id, cr.name, cr.url, cr.caps, cr.modelCount, status)
+	}
+	fmt.Println(strings.Repeat("─", 110))
+
+	if len(invalid) == 0 {
+		fmt.Printf("\n✅ 全部 %d 条记录有效，无需操作。\n\n", len(records))
+		return nil
+	}
+
+	fmt.Printf("\n⚠️  发现 %d/%d 条无效记录（ID: %v）\n", len(invalid), len(records), invalid)
+	fmt.Print("  是否删除无效记录？(yes/no): ")
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer != "yes" && answer != "y" {
+		fmt.Println("已取消。")
+		return nil
+	}
+
+	for _, id := range invalid {
+		if err := store.Delete(id); err != nil {
+			fmt.Printf("  ❌ 删除 ID=%d 失败: %v\n", id, err)
+		} else {
+			fmt.Printf("  ✅ 已删除 ID=%d\n", id)
+		}
+	}
+	fmt.Printf("\n✅ 已删除 %d 条无效记录。\n", len(invalid))
 	return nil
 }
 
@@ -345,7 +437,7 @@ func sniffAll(url, key string) *SniffResult {
 		if err == nil {
 			defer resp.Body.Close()
 			if resp.StatusCode < 500 {
-				var bodyMap map[string]interface{}
+				var bodyMap map[string]any
 				if json.NewDecoder(resp.Body).Decode(&bodyMap) == nil {
 					if m, ok := bodyMap["model"].(string); ok {
 						result.ModelsMap["anthropic"] = []string{m}
@@ -425,6 +517,45 @@ func maskKey(k string) string {
 	return k[:4] + "****" + k[len(k)-4:]
 }
 
-func openDB() (*db.DB, error) {
-	return db.New("")
+// RunDBFind 按关键词搜索代理（匹配 name / url / capabilities_json / models_map_json）
+func RunDBFind(query string) error {
+	if query == "" {
+		fmt.Fprintf(os.Stderr, "用法: agent-proxy db find <关键词>\n")
+		return nil
+	}
+
+	store, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		return fmt.Errorf("init db: %w", err)
+	}
+
+	records, err := store.Search(query)
+	if err != nil {
+		return fmt.Errorf("search: %w", err)
+	}
+
+	if len(records) == 0 {
+		fmt.Printf("未找到匹配「%s」的代理配置。\n", query)
+		return nil
+	}
+
+	fmt.Printf("🔎 搜索「%s」：找到 %d 条匹配记录\n", query, len(records))
+	fmt.Println(strings.Repeat("─", 100))
+	fmt.Printf("  %-4s  %-16s  %-42s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "时间")
+	fmt.Println(strings.Repeat("─", 100))
+
+	for _, r := range records {
+		caps := strings.Join(r.Capabilities(), " / ")
+		if caps == "" {
+			caps = r.ProviderType
+		}
+		fmt.Printf("  %-4d  %-16s  %-42s  %-18s  %-8d  %s\n",
+			r.ID, r.Name, r.URL, caps, r.TotalModelCount(), r.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Println()
+	return nil
 }

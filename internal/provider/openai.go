@@ -143,9 +143,22 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		// 发送第一个事件带响应头信息（用于下游 header 透传）
 		meta, _ := json.Marshal(map[string]interface{}{
 			"_type":    "headers",
+			"_status":  resp.StatusCode,
 			"_headers": respHeaders,
 		})
 		linesCh <- meta
+
+		// 上游返回错误状态码时，不解析为 SSE，直接转为一条错误事件并关闭 channel
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			errSSE, _ := json.Marshal(map[string]interface{}{
+				"_type":    "error",
+				"_status":  resp.StatusCode,
+				"data":     string(errBody),
+			})
+			linesCh <- errSSE
+			return
+		}
 
 		reader := lineReader(ctx, resp.Body)
 
@@ -330,9 +343,21 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 		}
 		meta, _ := json.Marshal(map[string]interface{}{
 			"_type":    "headers",
+			"_status":  resp.StatusCode,
 			"_headers": respHeaders,
 		})
 		linesCh <- meta
+
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			errSSE, _ := json.Marshal(map[string]interface{}{
+				"_type":    "error",
+				"_status":  resp.StatusCode,
+				"data":     string(errBody),
+			})
+			linesCh <- errSSE
+			return
+		}
 
 		reader := lineReader(ctx, resp.Body)
 		for {
@@ -469,9 +494,21 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 		}
 		meta, _ := json.Marshal(map[string]interface{}{
 			"_type":    "headers",
+			"_status":  resp.StatusCode,
 			"_headers": respHeaders,
 		})
 		linesCh <- meta
+
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			errSSE, _ := json.Marshal(map[string]interface{}{
+				"_type":    "error",
+				"_status":  resp.StatusCode,
+				"data":     string(errBody),
+			})
+			linesCh <- errSSE
+			return
+		}
 
 		reader := lineReader(ctx, resp.Body)
 		for {

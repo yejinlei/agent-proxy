@@ -208,6 +208,24 @@ func (d *DB) Add(record *ProxyRecord) error {
 	return nil
 }
 
+func scanRecord(rows *sql.Rows, r *ProxyRecord) error {
+	var oaiCap, antCap int64
+	var ts string
+	var ns1, ns2, ns3 sql.NullString
+	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &r.Weight, &ts); err != nil {
+		return err
+	}
+	r.ModelsJSON = ns1.String
+	r.CapabilitiesJSON = ns2.String
+	r.ModelsMapJSON = ns3.String
+	r.OpenAICap = oaiCap != 0
+	r.AnthropicCap = antCap != 0
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		r.CreatedAt = t
+	}
+	return nil
+}
+
 // List 列出所有代理记录
 func (d *DB) List() ([]ProxyRecord, error) {
 	rows, err := d.db.Query(`
@@ -222,15 +240,8 @@ func (d *DB) List() ([]ProxyRecord, error) {
 	var records []ProxyRecord
 	for rows.Next() {
 		var r ProxyRecord
-		var oaiCap, antCap int64
-		var ts string
-		if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &r.ModelsJSON, &r.CapabilitiesJSON, &r.ModelsMapJSON, &r.Weight, &ts); err != nil {
+		if err := scanRecord(rows, &r); err != nil {
 			return nil, err
-		}
-		r.OpenAICap = oaiCap != 0
-		r.AnthropicCap = antCap != 0
-		if t, err := time.Parse(time.RFC3339, ts); err == nil {
-			r.CreatedAt = t
 		}
 		records = append(records, r)
 	}
@@ -242,13 +253,17 @@ func (d *DB) GetByID(id int) (*ProxyRecord, error) {
 	var r ProxyRecord
 	var oaiCap, antCap int64
 	var ts string
+	var ns1, ns2, ns3 sql.NullString
 	err := d.db.QueryRow(`
 		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
 		FROM proxies WHERE id = ?
-	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &r.ModelsJSON, &r.CapabilitiesJSON, &r.ModelsMapJSON, &r.Weight, &ts)
+	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &r.Weight, &ts)
 	if err != nil {
 		return nil, err
 	}
+	r.ModelsJSON = ns1.String
+	r.CapabilitiesJSON = ns2.String
+	r.ModelsMapJSON = ns3.String
 	r.OpenAICap = oaiCap != 0
 	r.AnthropicCap = antCap != 0
 	if t, err := time.Parse(time.RFC3339, ts); err == nil {
@@ -291,6 +306,30 @@ func (d *DB) ExistsByURL(url string) bool {
 	return count > 0
 }
 
+// Search 按 LIKE 关键词搜索记录（匹配 name / url / capabilities_json / models_map_json）
+func (d *DB) Search(query string) ([]ProxyRecord, error) {
+	like := "%" + query + "%"
+	rows, err := d.db.Query(`
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
+		FROM proxies
+		WHERE name LIKE ? OR url LIKE ? OR capabilities_json LIKE ? OR models_map_json LIKE ?
+		ORDER BY id
+	`, like, like, like, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []ProxyRecord
+	for rows.Next() {
+		var r ProxyRecord
+		if err := scanRecord(rows, &r); err != nil {
+			continue
+		}
+		records = append(records, r)
+	}
+	return records, rows.Err()
+}
+
 // First 返回第一条记录
 // Deprecated: 使用 FirstRecord 替代。
 func (d *DB) First() (*ProxyRecord, error) {
@@ -308,18 +347,11 @@ func (d *DB) FirstRecord() (*ProxyRecord, error) {
 	}
 	defer rows.Close()
 	var r ProxyRecord
-	var oaiCap, antCap int64
-	var ts string
 	if !rows.Next() {
 		return nil, nil
 	}
-	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &r.ModelsJSON, &r.CapabilitiesJSON, &r.ModelsMapJSON, &r.Weight, &ts); err != nil {
+	if err := scanRecord(rows, &r); err != nil {
 		return nil, err
-	}
-	r.OpenAICap = oaiCap != 0
-	r.AnthropicCap = antCap != 0
-	if t, err := time.Parse(time.RFC3339, ts); err == nil {
-		r.CreatedAt = t
 	}
 	return &r, nil
 }

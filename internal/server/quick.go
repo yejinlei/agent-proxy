@@ -38,11 +38,13 @@ type QuickGateway struct {
 	clientKeyEnabled bool
 	// 按协议类型按需创建的 provider
 	providerCache sync.Map // string → provider.Provider
+	// 详细日志级别（0=关闭 1=-v 2=-vv，仅快速模式有效）
+	verboseLevel int
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
-func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeout int, clientKey string, clientKeyEnabled bool) *QuickGateway {
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
@@ -66,6 +68,7 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeou
 		proxyKey:           apiKey,
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
+		verboseLevel:       verboseLevel,
 	}
 }
 
@@ -112,6 +115,25 @@ func (q *QuickGateway) getProvider(protocolType string) provider.Provider {
 		return val.(provider.Provider)
 	}
 	return p
+}
+
+// verboseCtxKey 用于在 context 中传递 -v/-vv 日志所需的元信息
+type verboseCtxKey struct{}
+
+// verboseCtx 从 context 读取日志元信息
+type verboseCtx struct {
+	// 哪个客户端 IP 接入
+	clientIP string
+	// 入站协议（未归一化的原始协议名）
+	ingressProtocol string
+	// 上游协议（选择后的 provider 类型）
+	providerType string
+	// 模型名
+	model string
+	// 请求体（-vv 模式用）
+	reqBody []byte
+	// 上游 URL
+	upstream string
 }
 
 func (q *QuickGateway) Routes() chi.Router {
@@ -171,8 +193,25 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	// ── 透传 vs 翻译 ──
 	// 归一化后 ingressProtocol == providerType 时透传（零损耗）
 	normalizedIngress := q.normalizeIngress(ingressProtocol)
+
+	// 提取客户端 IP（剥离端口）
+	clientIP := r.RemoteAddr
+	if idx := strings.LastIndex(clientIP, ":"); idx > 0 {
+		clientIP = clientIP[:idx]
+	}
+
+	// 构建 verbose 日志上下文（用于 -v/-vv 输出）
+	vctx := verboseCtx{
+		clientIP:        clientIP,
+		ingressProtocol: ingressProtocol,
+		providerType:    providerType,
+		model:           model,
+		reqBody:         body,
+		upstream:        q.proxyBaseURL,
+	}
+
 	if normalizedIngress == providerType && model != "" {
-		ctx := r.Context()
+		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		if quickDetectStream(body) {
 			q.handlePassthroughStream(p, ctx, w, r, model, startTime)
 		} else {
@@ -199,7 +238,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 
 	// ── 执行 Provider 调用 ──
 	stream := internalReq.Stream
-	ctx := r.Context()
+	ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 	if stream {
 		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, startTime)
 	} else {
@@ -291,6 +330,12 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 
 	resp, headers, err := p.Call(callCtx, body, callInfo)
 	if err != nil {
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			return
+		}
 		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
 	}
@@ -306,8 +351,9 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	w.WriteHeader(http.StatusOK)
 	w.Write(resp)
 
-	latency := time.Since(startTime).Milliseconds()
-	fmt.Printf("[%s] passthrough %s %dms\n", time.Now().Format("15:04:05"), q.proxyName, latency)
+	usage := q.extractUsage(resp)
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	q.logRequest(vctx, startTime, http.StatusOK, usage, resp)
 }
 
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
@@ -350,18 +396,38 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		}
 	}
 
+	var lastUsage *schema.InternalUsage
 	for line := range lines {
 		var meta map[string]any
-		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
-			continue
+		if json.Unmarshal(line, &meta) == nil {
+			if meta["_type"] == "headers" {
+				continue
+			}
+			if meta["_type"] == "error" {
+				status, _ := meta["_status"].(float64)
+				if status == 0 {
+					status = 502
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(int(status))
+				if data, ok := meta["data"].(string); ok {
+					w.Write([]byte(data))
+				}
+				return
+			}
+		}
+		// 累积 usage（用于 -v 日志）
+		usage := q.extractUsage(line)
+		if usage != nil {
+			lastUsage = usage
 		}
 		w.Write(line)
 		w.Write([]byte("\n"))
 		flusher.Flush()
 	}
 
-	latency := time.Since(startTime).Milliseconds()
-	fmt.Printf("[%s] passthrough stream %s %dms\n", time.Now().Format("15:04:05"), q.proxyName, latency)
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
 // handleNonStreamResponse 非流式响应
@@ -375,6 +441,12 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 
 	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
 	if err != nil {
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			return
+		}
 		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
 	}
@@ -418,8 +490,9 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	w.WriteHeader(http.StatusOK)
 	w.Write(outgoingResp)
 
-	latency := time.Since(startTime).Milliseconds()
-	fmt.Printf("[%s] %s → %s %dms\n", time.Now().Format("15:04:05"), internalReq.Model, q.proxyName, latency)
+	usage := internalResp.Usage
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	q.logRequest(vctx, startTime, http.StatusOK, usage, outgoingResp)
 }
 
 // handleStreamRequest 流式请求
@@ -451,13 +524,35 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
+	var accumulatedUsage *schema.InternalUsage
 	go func() {
 		defer close(events)
 		for line := range lines {
 			// 跳过元数据
 			var meta map[string]any
-			if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
-				continue
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					continue
+				}
+				if meta["_type"] == "error" {
+				status, _ := meta["_status"].(float64)
+				if status == 0 {
+					status = 502
+				}
+				data, _ := meta["data"].(string)
+				if data == "" {
+					data = fmt.Sprintf("upstream error: HTTP %.0f", status)
+				}
+				events <- schema.InternalStreamEvent{
+					Type: "error",
+					Error: &schema.StreamError{
+						Message: data,
+						Type:    "upstream_error",
+						Code:    int(status),
+					},
+				}
+				return
+			}
 			}
 
 			// Provider 翻译器解析流式事件
@@ -467,6 +562,9 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				})
 				event := pte.TranslateStreamEvent(line)
 				if event != nil {
+					if event.Data != nil && event.Data.Usage != nil {
+						accumulatedUsage = event.Data.Usage
+					}
 					events <- *event
 				}
 			} else {
@@ -513,6 +611,9 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 						Usage: mapInternalUsage(ccChunk.Usage),
 					},
 				}
+				if ccChunk.Usage != nil {
+					accumulatedUsage = mapInternalUsage(ccChunk.Usage)
+				}
 			}
 		}
 	}()
@@ -525,8 +626,8 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 		}
 	})
 
-	latency := time.Since(startTime).Milliseconds()
-	fmt.Printf("[%s] stream %s %dms\n", time.Now().Format("15:04:05"), q.proxyName, latency)
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	q.logRequest(vctx, startTime, http.StatusOK, accumulatedUsage, nil)
 }
 
 // translateToProvider 根据目标 Provider 类型选择翻译器并构建下游请求体
@@ -610,4 +711,141 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// parseCallError 解析 provider.Call 返回的错误。
+// provider.Call 在 HTTP >= 400 时返回 "HTTP <code>: <body>" 格式的错误，
+// 解析后返回 HTTP 状态码和原始响应体，以便服务端透传上游错误。
+// 无法解析时返回 (0, "")。
+func parseCallError(err error) (int, string) {
+	msg := err.Error()
+	const prefix = "HTTP "
+	idx := strings.Index(msg, prefix)
+	if idx < 0 {
+		return 0, ""
+	}
+	rest := msg[idx+len(prefix):]
+	// 找到冒号分隔符
+	colon := strings.Index(rest, ":")
+	if colon < 0 {
+		return 0, ""
+	}
+	var code int
+	if _, nErr := fmt.Sscanf(rest[:colon], "%d", &code); nErr != nil || code < 400 || code > 599 {
+		return 0, ""
+	}
+	body := strings.TrimSpace(rest[colon+1:])
+	return code, body
+}
+
+// logRequest 输出 -v / -vv 级别的请求日志。
+// -v 级别: 显示客户端 IP、入站协议、上游协议、模型、状态码、token 用量
+// -vv 级别: 在 -v 基础上额外显示 Guest 侧请求体和 LLM 侧响应内容
+func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status int, usage *schema.InternalUsage, respBody []byte) {
+	if q.verboseLevel == 0 {
+		return
+	}
+	if vctx.ingressProtocol == "" {
+		return
+	}
+
+	latency := time.Since(startTime).Milliseconds()
+	ingressName := normalizeProtocolName(vctx.ingressProtocol)
+
+	if q.verboseLevel >= 1 {
+		usageStr := "—"
+		if usage != nil {
+			usageStr = fmt.Sprintf("prompt=%d, completion=%d, total=%d",
+				usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+		}
+		fmt.Printf("[请求 %s] 上游: %s  |  协议: %s → %s  |  模型: %s  |  状态: %d  |  耗时: %dms  |  Token: %s\n",
+			vctx.clientIP, vctx.upstream, ingressName, vctx.providerType, vctx.model, status, latency, usageStr)
+	}
+
+	if q.verboseLevel >= 2 {
+		if len(vctx.reqBody) > 0 {
+			fmt.Printf("[Guest → 代理] 请求体:\n%s\n", truncateJSON(vctx.reqBody, 600))
+		}
+		if len(respBody) > 0 {
+			fmt.Printf("[代理 → LLM] 响应体:\n%s\n", truncateJSON(respBody, 800))
+		}
+	}
+}
+
+// extractUsage 从原始 JSON 响应中提取 token 用量。
+// 支持多种格式:
+//   - OpenAI: usage.prompt_tokens / completion_tokens / total_tokens
+//   - Anthropic: usage.input_tokens / output_tokens
+//   - Responses API: usage.input_tokens / output_tokens
+func (q *QuickGateway) extractUsage(resp []byte) *schema.InternalUsage {
+	var m map[string]any
+	if err := json.Unmarshal(resp, &m); err != nil {
+		return nil
+	}
+	usageMap, ok := m["usage"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	usage := &schema.InternalUsage{}
+	if v, ok := usageMap["prompt_tokens"].(float64); ok {
+		usage.PromptTokens = int(v)
+	}
+	if v, ok := usageMap["completion_tokens"].(float64); ok {
+		usage.CompletionTokens = int(v)
+	}
+	// Anthropic/Responses 用 input_tokens / output_tokens
+	if v, ok := usageMap["input_tokens"].(float64); ok {
+		usage.PromptTokens = int(v)
+	}
+	if v, ok := usageMap["output_tokens"].(float64); ok {
+		usage.CompletionTokens = int(v)
+	}
+	if v, ok := usageMap["total_tokens"].(float64); ok {
+		usage.TotalTokens = int(v)
+	}
+	if v, ok := usageMap["cache_creation_input_tokens"].(float64); ok {
+		usage.CacheCreationTokens = int(v)
+	}
+	if v, ok := usageMap["cache_read_input_tokens"].(float64); ok {
+		usage.CacheReadTokens = int(v)
+	}
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0 {
+		return nil
+	}
+	return usage
+}
+
+// normalizeProtocolName 将协议内部名映射为用户可读名
+func normalizeProtocolName(proto string) string {
+	switch proto {
+	case "openai", "chatcompletion":
+		return "OpenAI"
+	case "anthropic", "messages":
+		return "Anthropic"
+	case "gemini":
+		return "Gemini"
+	case "responses":
+		return "Responses"
+	default:
+		return proto
+	}
+}
+
+// truncateJSON 将 JSON 字节切片格式化为缩进 JSON 并截断到 maxLen 字节
+func truncateJSON(raw []byte, maxLen int) string {
+	var data any
+	if json.Unmarshal(raw, &data) != nil {
+		return truncateString(string(raw), maxLen)
+	}
+	pretty, _ := json.MarshalIndent(data, "", "  ")
+	return truncateString(string(pretty), maxLen)
+}
+
+// truncateString 截断字符串到 maxLen，并附加省略标记
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "...\n  (truncated, " + fmt.Sprintf("%d bytes total", len(s)) + ")"
 }
