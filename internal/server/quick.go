@@ -556,11 +556,18 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 			}
 
 			// Provider 翻译器解析流式事件
+			// OpenAIClient.CallStream 发送的 SSE 行包含 "data: " 前缀，
+			// 需要在传入翻译器前剥离（与下方 OpenAI 路径一致）
+			payload := strings.TrimPrefix(string(line), "data: ")
+			if payload == "[DONE]" {
+				continue
+			}
+
 			if providerTranslator != nil {
 				pte := providerTranslator.(interface {
 					TranslateStreamEvent(json.RawMessage) *schema.InternalStreamEvent
 				})
-				event := pte.TranslateStreamEvent(line)
+				event := pte.TranslateStreamEvent(json.RawMessage(payload))
 				if event != nil {
 					if event.Data != nil && event.Data.Usage != nil {
 						accumulatedUsage = event.Data.Usage

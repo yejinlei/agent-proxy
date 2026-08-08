@@ -1,0 +1,387 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// buildRequestHelper creates a POST request with JSON body
+func buildRequest(url string, body map[string]any) *http.Request {
+	data, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func TestQuickGateway_E2E_ChatCompletion_Passthrough(t *testing.T) {
+	// This test reuses the mock server + gateway setup from TestQuickGateway_E2E_AllProtocols
+	// but is isolated so each subtest can run independently.
+	t.Run("non_stream_passthrough", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"stream": false,
+		}
+		req := buildRequest("/v1/chat/completions", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON response: %v: %s", err, rr.Body.String())
+		}
+		choices, ok := resp["choices"].([]any)
+		if !ok || len(choices) == 0 {
+			t.Fatal("expected choices array")
+		}
+		choice, ok := choices[0].(map[string]any)
+		if !ok {
+			t.Fatal("expected choice object")
+		}
+		msg, ok := choice["message"].(map[string]any)
+		if !ok {
+			t.Fatal("expected message object")
+		}
+		content, _ := msg["content"].(string)
+		if content != "Hello World" {
+			t.Fatalf("expected 'Hello World', got %q", content)
+		}
+		t.Logf("✓ CC passthrough non-stream: content=%q", content)
+	})
+
+	t.Run("stream_passthrough", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"stream": true,
+		}
+		req := buildRequest("/v1/chat/completions", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "Hello") {
+			t.Fatalf("expected stream to contain 'Hello', got: %s", rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), " World") {
+			t.Fatalf("expected stream to contain 'World', got: %s", rr.Body.String())
+		}
+		t.Logf("✓ CC passthrough stream: %q", rr.Body.String()[:100])
+	})
+}
+
+func TestQuickGateway_E2E_Anthropic_Translation(t *testing.T) {
+	t.Run("non_stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"max_tokens": 100,
+		}
+		req := buildRequest("/v1/messages", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON: %v: %s", err, rr.Body.String())
+		}
+		// Anthropic format: content is array of blocks
+		content, ok := resp["content"].([]any)
+		if !ok {
+			t.Fatalf("expected content array in Anthropic response, got type %T: %s", resp["content"], rr.Body.String())
+		}
+		var texts []string
+		for _, block := range content {
+			b, _ := block.(map[string]any)
+			if b["type"] == "text" {
+				if txt, _ := b["text"].(string); txt != "" {
+					texts = append(texts, txt)
+				}
+			}
+		}
+		if len(texts) == 0 || texts[0] != "Hello World" {
+			t.Fatalf("expected 'Hello World' in content blocks, got %v", texts)
+		}
+		t.Logf("✓ Anthropic translation non-stream: %v", texts)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"max_tokens": 100,
+			"stream":   true,
+		}
+		req := buildRequest("/v1/messages", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		bodyStr := rr.Body.String()
+		// Anthropic SSE uses "event: content_block_delta" + "data: {...}"
+		if !strings.Contains(bodyStr, "Hello") {
+			t.Fatalf("expected stream to contain 'Hello', got:\n%s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, " World") {
+			t.Fatalf("expected stream to contain 'World', got:\n%s", bodyStr)
+		}
+		// Verify Anthropic SSE format (event: lines)
+		if !strings.Contains(bodyStr, "content_block_delta") {
+			t.Fatalf("expected Anthropic SSE event 'content_block_delta', got:\n%s", bodyStr)
+		}
+		t.Logf("✓ Anthropic translation stream (first 200 chars): %q", bodyStr[:min(200, len(bodyStr))])
+	})
+}
+
+func TestQuickGateway_E2E_Gemini_Translation(t *testing.T) {
+	t.Run("non_stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		// Gemini request format
+		body := map[string]any{
+			"contents": []map[string]any{
+				{
+					"role": "user",
+					"parts": []map[string]string{
+						{"text": "hi"},
+					},
+				},
+			},
+		}
+		req := buildRequest("/v1/models/gpt-4o-mini:generateContent", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON: %v: %s", err, rr.Body.String())
+		}
+		candidates, ok := resp["candidates"].([]any)
+		if !ok || len(candidates) == 0 {
+			t.Fatalf("expected candidates array, got: %s", rr.Body.String())
+		}
+		candidate, _ := candidates[0].(map[string]any)
+		content, _ := candidate["content"].(map[string]any)
+		parts, _ := content["parts"].([]any)
+		if len(parts) == 0 {
+			t.Fatalf("expected parts, got: %s", rr.Body.String())
+		}
+		part, _ := parts[0].(map[string]any)
+		text, _ := part["text"].(string)
+		if text != "Hello World" {
+			t.Fatalf("expected 'Hello World', got %q: %s", text, rr.Body.String())
+		}
+		t.Logf("✓ Gemini translation non-stream: content=%q", text)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"contents": []map[string]any{
+				{
+					"role": "user",
+					"parts": []map[string]string{
+						{"text": "hi"},
+					},
+				},
+			},
+			"stream": true,
+		}
+		req := buildRequest("/v1/models/gpt-4o-mini:generateContent", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		bodyStr := rr.Body.String()
+		if !strings.Contains(bodyStr, "Hello") {
+			t.Fatalf("expected stream to contain 'Hello', got:\n%s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, " World") {
+			t.Fatalf("expected stream to contain 'World', got:\n%s", bodyStr)
+		}
+		t.Logf("✓ Gemini translation stream (first 200 chars): %q", bodyStr[:min(200, len(bodyStr))])
+	})
+}
+
+func TestQuickGateway_E2E_Responses_Translation(t *testing.T) {
+	t.Run("non_stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"input": "hi",
+		}
+		req := buildRequest("/v1/responses", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON: %v: %s", err, rr.Body.String())
+		}
+		output, ok := resp["output"].([]any)
+		if !ok {
+			t.Fatalf("expected output array, got type %T: %s", resp["output"], rr.Body.String())
+		}
+		var foundContent string
+		for _, item := range output {
+			itemMap, _ := item.(map[string]any)
+			if itemMap["type"] == "message" {
+				if content, ok := itemMap["content"].([]any); ok {
+					for _, block := range content {
+						b, _ := block.(map[string]any)
+						if b["type"] == "output_text" {
+							if txt, _ := b["text"].(string); txt != "" {
+								foundContent += txt
+							}
+						}
+					}
+				}
+			}
+		}
+		if foundContent != "Hello World" {
+			t.Fatalf("expected 'Hello World' in output, got %q: %s", foundContent, rr.Body.String())
+		}
+		t.Logf("✓ Responses translation non-stream: content=%q", foundContent)
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		qg := setupMockGateway(t)
+		defer qg.mockServer.Close()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"input": "hi",
+			"stream": true,
+		}
+		req := buildRequest("/v1/responses", body)
+		rr := httptest.NewRecorder()
+		qg.router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+		bodyStr := rr.Body.String()
+		if !strings.Contains(bodyStr, "Hello") {
+			t.Fatalf("expected stream to contain 'Hello', got:\n%s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, " World") {
+			t.Fatalf("expected stream to contain 'World', got:\n%s", bodyStr)
+		}
+		t.Logf("✓ Responses translation stream (first 200 chars): %q", bodyStr[:min(200, len(bodyStr))])
+	})
+}
+
+// ── Shared helper ──
+type mockGateway struct {
+	mockServer *httptest.Server
+	router     interface {
+		ServeHTTP(http.ResponseWriter, *http.Request)
+	}
+}
+
+func setupMockGateway(t *testing.T) *mockGateway {
+	t.Helper()
+
+	nonStreamResp := `{
+		"id":"chatcmpl-mock",
+		"object":"chat.completion",
+		"created":1700000000,
+		"model":"gpt-4o-mini",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"Hello World"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+	}`
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		var req map[string]any
+		if json.Unmarshal(body, &req) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		stream, _ := req["stream"].(bool)
+
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			chunks := []string{
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`,
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":" World"},"finish_reason":null}]}`,
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+				`data: [DONE]`,
+			}
+			for _, chunk := range chunks {
+				w.Write([]byte(chunk + "\n\n"))
+			}
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(nonStreamResp))
+		}
+	}))
+
+	qg := NewQuickGateway(
+		"mock-proxy",
+		mockServer.URL,
+		"mock-key",
+		[]string{"openai"},
+		30,
+		"", false, 0,
+	)
+	router := qg.Routes()
+
+	return &mockGateway{
+		mockServer: mockServer,
+		router:     router,
+	}
+}

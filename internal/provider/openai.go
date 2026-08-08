@@ -196,7 +196,6 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 func lineReader(ctx context.Context, r io.Reader) func() ([]byte, error) {
 	buf := make([]byte, 4096)
 	pos := 0
-	needFlush := false
 
 	return func() ([]byte, error) {
 		for {
@@ -206,28 +205,21 @@ func lineReader(ctx context.Context, r io.Reader) func() ([]byte, error) {
 			default:
 			}
 
-			if needFlush && pos > 0 {
-				data := make([]byte, pos)
-				copy(data, buf[:pos])
-				pos = 0
-				needFlush = false
-				return data, nil
+			// 扫描换行符
+			for i := 0; i < pos; i++ {
+				if buf[i] == '\n' {
+					data := make([]byte, i)
+					copy(data, buf[:i])
+					copy(buf, buf[i+1:pos])
+					pos -= i + 1
+					return data, nil
+				}
 			}
 
 			n, err := r.Read(buf[pos:])
 			if n > 0 {
 				pos += n
-				// 扫描换行符
-				for i := 0; i < pos; i++ {
-					if buf[i] == '\n' {
-						data := make([]byte, i)
-						copy(data, buf[:i])
-						copy(buf, buf[i+1:pos])
-						pos -= i + 1
-						needFlush = true
-						return data, nil
-					}
-				}
+				continue
 			}
 
 			if err != nil {
