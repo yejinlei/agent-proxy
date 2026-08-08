@@ -168,10 +168,22 @@ func contentsToMessages(contents []Content) []schema.InternalMessage {
 		var textParts []string
 		var toolCalls []schema.InternalToolCall
 		var functionResponses []FunctionResponse
+		var contentBlocks []schema.InternalContentBlock
 
 		for _, part := range c.Parts {
 			if part.Text != "" {
 				textParts = append(textParts, part.Text)
+				contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+					Type: "text",
+					Text: part.Text,
+				})
+			}
+			if part.InlineData != nil {
+				contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+					Type:      "image",
+					Data:      part.InlineData.Data,
+					MediaType: part.InlineData.MimeType,
+				})
 			}
 			if part.FunctionCall != nil {
 				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
@@ -197,6 +209,9 @@ func contentsToMessages(contents []Content) []schema.InternalMessage {
 		msg.Content, _ = json.Marshal(joinText(textParts))
 		if len(toolCalls) > 0 {
 			msg.ToolCalls = toolCalls
+		}
+		if len(contentBlocks) > 0 {
+			msg.ContentBlocks = contentBlocks
 		}
 		msgs = append(msgs, msg)
 
@@ -258,12 +273,32 @@ func (t *GeminiTranslator) TranslateResponse(resp *schema.InternalResponse) (jso
 	var toolCalls []schema.InternalToolCall
 
 	for _, choice := range resp.Choices {
-		var text string
-		if choice.Message.Content != nil {
-			json.Unmarshal(choice.Message.Content, &text)
-		}
-		if text != "" {
-			parts = append(parts, Part{Text: text})
+		if len(choice.Message.ContentBlocks) > 0 {
+			for _, cb := range choice.Message.ContentBlocks {
+				switch cb.Type {
+				case "text":
+					if cb.Text != "" {
+						parts = append(parts, Part{Text: cb.Text})
+					}
+				case "image":
+					if cb.Data != "" {
+						parts = append(parts, Part{
+							InlineData: &InlineData{
+								MimeType: cb.MediaType,
+								Data:     cb.Data,
+							},
+						})
+					}
+				}
+			}
+		} else {
+			var text string
+			if choice.Message.Content != nil {
+				json.Unmarshal(choice.Message.Content, &text)
+			}
+			if text != "" {
+				parts = append(parts, Part{Text: text})
+			}
 		}
 		toolCalls = choice.Message.ToolCalls
 	}
@@ -480,21 +515,46 @@ func messagesToGemini(msgs []schema.InternalMessage) ([]Content, error) {
 		switch msg.Role {
 		case schema.RoleUser:
 			content.Role = "user"
-			// 提取文本
-			var text string
-			if msg.Content != nil {
-				if err := json.Unmarshal(msg.Content, &text); err == nil {
-					content.Parts = append(content.Parts, Part{Text: text})
+			if len(msg.ContentBlocks) > 0 {
+				for _, cb := range msg.ContentBlocks {
+					switch cb.Type {
+					case "text":
+						content.Parts = append(content.Parts, Part{Text: cb.Text})
+					case "image":
+						if cb.Data != "" {
+							content.Parts = append(content.Parts, Part{
+								InlineData: &InlineData{
+									MimeType: cb.MediaType,
+									Data:     cb.Data,
+								},
+							})
+						}
+					}
+				}
+			} else {
+				var text string
+				if msg.Content != nil {
+					if err := json.Unmarshal(msg.Content, &text); err == nil {
+						content.Parts = append(content.Parts, Part{Text: text})
+					}
 				}
 			}
 
 		case schema.RoleAssistant:
 			content.Role = "model" // ⚠️ Gemini 用 model 不是 assistant
-			var text string
-			if msg.Content != nil {
-				json.Unmarshal(msg.Content, &text)
-				if text != "" {
-					content.Parts = append(content.Parts, Part{Text: text})
+			if len(msg.ContentBlocks) > 0 {
+				for _, cb := range msg.ContentBlocks {
+					if cb.Type == "text" && cb.Text != "" {
+						content.Parts = append(content.Parts, Part{Text: cb.Text})
+					}
+				}
+			} else {
+				var text string
+				if msg.Content != nil {
+					json.Unmarshal(msg.Content, &text)
+					if text != "" {
+						content.Parts = append(content.Parts, Part{Text: text})
+					}
 				}
 			}
 
@@ -598,11 +658,23 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 
 	var textParts []string
 	var toolCalls []schema.InternalToolCall
+	var contentBlocks []schema.InternalContentBlock
 
 	if candidate.Content != nil {
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
 				textParts = append(textParts, part.Text)
+				contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+					Type: "text",
+					Text: part.Text,
+				})
+			}
+			if part.InlineData != nil {
+				contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+					Type:      "image",
+					Data:      part.InlineData.Data,
+					MediaType: part.InlineData.MimeType,
+				})
 			}
 			if part.FunctionCall != nil {
 				// ⚠️ args 是对象，需 Marshal 为字符串
@@ -629,6 +701,9 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 	}
 
 	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
+	if len(contentBlocks) > 0 {
+		choiceMessage.ContentBlocks = contentBlocks
+	}
 
 	// --- 2. Usage 字段映射（兼容性 7） ---
 	var usage *schema.InternalUsage

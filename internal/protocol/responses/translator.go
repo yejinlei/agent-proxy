@@ -135,28 +135,56 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 
 		msg := schema.InternalMessage{Role: schema.Role(item.Role)}
 
-		// 提取 text
+		// 提取 text + 内容块
 		var text string
+		var textParts []string
+		var contentBlocks []schema.InternalContentBlock
 		switch c := item.Content.(type) {
 		case string:
 			text = c
 		case []interface{}:
 			// content blocks
-			var textParts []string
 			for _, cb := range c {
 				block, ok := cb.(map[string]interface{})
 				if !ok {
 					continue
 				}
-				if block["type"] == "output_text" || block["type"] == "input_text" {
+				switch block["type"] {
+				case "output_text", "input_text":
 					if t, ok := block["text"].(string); ok {
 						textParts = append(textParts, t)
+						contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+							Type: "text",
+							Text: t,
+						})
 					}
+				case "input_image":
+					var icb schema.InternalContentBlock
+					icb.Type = "image"
+					if source, ok := block["source"].(map[string]interface{}); ok {
+						switch source["type"] {
+						case "base64":
+							if data, ok := source["data"].(string); ok {
+								icb.Data = data
+							}
+							if mediaType, ok := source["media_type"].(string); ok {
+								icb.MediaType = mediaType
+							}
+						case "url":
+							if url, ok := source["url"].(string); ok {
+								icb.URL = url
+							}
+						}
+					}
+					contentBlocks = append(contentBlocks, icb)
 				}
 			}
 			text = joinText(textParts)
 		}
 		msg.Content, _ = json.Marshal(text)
+		if len(contentBlocks) > 0 {
+			msg.ContentBlocks = contentBlocks
+		}
 
 		// Tool calls
 		for _, tc := range item.ToolCalls {
@@ -189,12 +217,40 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 	var contentBlocks []ContentBlock
 
 	for _, choice := range resp.Choices {
-		var text string
-		if choice.Message.Content != nil {
-			json.Unmarshal(choice.Message.Content, &text)
-		}
-		if text != "" {
-			contentBlocks = append(contentBlocks, ContentBlock{Type: "output_text", Text: text})
+		if len(choice.Message.ContentBlocks) > 0 {
+			for _, cb := range choice.Message.ContentBlocks {
+				switch cb.Type {
+				case "text":
+					if cb.Text != "" {
+						contentBlocks = append(contentBlocks, ContentBlock{Type: "output_text", Text: cb.Text})
+					}
+				case "image":
+					var source map[string]interface{}
+					if cb.Data != "" {
+						source = map[string]interface{}{
+							"type":      "base64",
+							"data":      cb.Data,
+							"media_type": cb.MediaType,
+						}
+					} else if cb.URL != "" {
+						source = map[string]interface{}{
+							"type": "url",
+							"url":  cb.URL,
+						}
+					}
+					if source != nil {
+						contentBlocks = append(contentBlocks, ContentBlock{Type: "output_image", Source: source})
+					}
+				}
+			}
+		} else {
+			var text string
+			if choice.Message.Content != nil {
+				json.Unmarshal(choice.Message.Content, &text)
+			}
+			if text != "" {
+				contentBlocks = append(contentBlocks, ContentBlock{Type: "output_text", Text: text})
+			}
 		}
 
 		for _, tc := range choice.Message.ToolCalls {
@@ -202,11 +258,11 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 				Type: "tool_call",
 				ID:   tc.ID,
 				Name: tc.Function.Name,
-				Input: func() map[string]interface{} {
-					m := make(map[string]interface{})
+				Input: func(tc schema.InternalToolCall) map[string]interface{} {
+					var m map[string]interface{}
 					json.Unmarshal(tc.Function.RawArguments, &m)
 					return m
-				}(),
+				}(tc),
 			})
 		}
 	}
@@ -414,19 +470,11 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 			Role: string(msg.Role),
 		}
 
-		// 文本内容
-		var text string
-		if msg.Content != nil {
-			json.Unmarshal(msg.Content, &text)
-		}
-
-		// 如果有 tool_calls，需要转换为 Responses tool_call blocks
-		if len(msg.ToolCalls) > 0 {
-			contentBlocks := []ContentBlock{
-				{Type: "input_text", Text: text},
-			}
+		// 优先使用 ContentBlocks（含图片等多模态内容），否则回退到纯文本
+		if len(msg.ContentBlocks) > 0 {
+			contentBlocks := buildResponsesContentBlocks(msg.ContentBlocks)
+			// 合并 tool_call blocks
 			for _, tc := range msg.ToolCalls {
-				// ⚠️ input 是 JSON 对象
 				var inputMap map[string]interface{}
 				if tc.Function.RawArguments != nil {
 					json.Unmarshal(tc.Function.RawArguments, &inputMap)
@@ -440,8 +488,29 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 			}
 			item.Content = contentBlocks
 		} else {
-			// 简单文本（请求侧用 input_text）
-			item.Content = ContentBlock{Type: "input_text", Text: text}
+			// 回退：从 msg.Content 读取纯文本
+			var text string
+			if msg.Content != nil {
+				json.Unmarshal(msg.Content, &text)
+			}
+			if len(msg.ToolCalls) > 0 {
+				contentBlocks := []ContentBlock{{Type: "input_text", Text: text}}
+				for _, tc := range msg.ToolCalls {
+					var inputMap map[string]interface{}
+					if tc.Function.RawArguments != nil {
+						json.Unmarshal(tc.Function.RawArguments, &inputMap)
+					}
+					contentBlocks = append(contentBlocks, ContentBlock{
+						Type:  "tool_call",
+						ID:    tc.ID,
+						Name:  tc.Function.Name,
+						Input: inputMap,
+					})
+				}
+				item.Content = contentBlocks
+			} else {
+				item.Content = ContentBlock{Type: "input_text", Text: text}
+			}
 		}
 
 		items = append(items, item)
@@ -462,6 +531,37 @@ func toolsToResponses(tools []schema.InternalTool) []Tool {
 			// ⚠️ Responses 无 description 字段
 			Parameters: tool.Function.Parameters,
 		})
+	}
+	return result
+}
+
+// buildResponsesContentBlocks 将 InternalContentBlock 转为 Responses 请求内容块
+// 文本 → {type:"input_text", text:"..."}
+// 图片 → {type:"input_image", source:{type:"base64"|"url", data/url, media_type}}
+func buildResponsesContentBlocks(blocks []schema.InternalContentBlock) []ContentBlock {
+	var result []ContentBlock
+	for _, cb := range blocks {
+		switch cb.Type {
+		case "text":
+			result = append(result, ContentBlock{Type: "input_text", Text: cb.Text})
+		case "image":
+			var source map[string]interface{}
+			if cb.Data != "" {
+				source = map[string]interface{}{
+					"type":      "base64",
+					"data":      cb.Data,
+					"media_type": cb.MediaType,
+				}
+			} else if cb.URL != "" {
+				source = map[string]interface{}{
+					"type": "url",
+					"url":  cb.URL,
+				}
+			}
+			if source != nil {
+				result = append(result, ContentBlock{Type: "input_image", Source: source})
+			}
+		}
 	}
 	return result
 }
@@ -488,6 +588,7 @@ func (t *ResponsesTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 
 	var textParts []string
 	var toolCalls []schema.InternalToolCall
+	var contentBlocks []schema.InternalContentBlock
 
 	for _, item := range resp.Output {
 		if item.Type != "message" {
@@ -497,6 +598,22 @@ func (t *ResponsesTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 			switch block.Type {
 			case "output_text":
 				textParts = append(textParts, block.Text)
+				contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+					Type: "text",
+					Text: block.Text,
+				})
+			case "output_image":
+				cb := schema.InternalContentBlock{Type: "image"}
+				if block.Source != nil {
+					switch block.Source["type"] {
+					case "base64":
+						cb.Data, _ = block.Source["data"].(string)
+						cb.MediaType, _ = block.Source["media_type"].(string)
+					case "url":
+						cb.URL, _ = block.Source["url"].(string)
+					}
+				}
+				contentBlocks = append(contentBlocks, cb)
 			case "tool_call":
 				// ⚠️ input 是对象，需 Marshal 为字符串
 				argsJSON, _ := json.Marshal(block.Input)
@@ -522,6 +639,9 @@ func (t *ResponsesTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 	}
 
 	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
+	if len(contentBlocks) > 0 {
+		choiceMessage.ContentBlocks = contentBlocks
+	}
 
 	var usage *schema.InternalUsage
 	if resp.Usage != nil {

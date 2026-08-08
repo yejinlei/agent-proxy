@@ -3,6 +3,7 @@ package chatcompletion
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
@@ -100,13 +101,88 @@ func messageToInternal(msg Message) schema.InternalMessage {
 		})
 	}
 
-	return schema.InternalMessage{
+	var contentBlocks []schema.InternalContentBlock
+	raw := msg.Content.Raw()
+	if raw != nil {
+		var blocks []json.RawMessage
+		if err := json.Unmarshal(raw, &blocks); err == nil {
+			contentBlocks = ParseCCContentBlocks(blocks)
+		}
+	}
+
+	im := schema.InternalMessage{
 		Role:       schema.Role(msg.Role),
-		Content:    msg.Content.Raw(),
+		Content:    raw,
 		ToolCalls:  toolCalls,
 		ToolCallID: msg.ToolCallID,
 		Name:       msg.Name,
 	}
+	if len(contentBlocks) > 0 {
+		im.ContentBlocks = contentBlocks
+	}
+	return im
+}
+
+// ParseCCContentBlocks 将 CC 的 content block 数组转为 InternalContentBlock
+//
+// CC 内容块格式：
+//   - {type:"text", text:"..."}
+//   - {type:"image_url", image_url:{url:"data:image/png;base64,...", detail:"..."}}
+//   - {type:"image_url", image_url:{url:"https://...", detail:"..."}}
+func ParseCCContentBlocks(blocks []json.RawMessage) []schema.InternalContentBlock {
+	var result []schema.InternalContentBlock
+	for _, rawBlock := range blocks {
+		var typeOnly struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(rawBlock, &typeOnly); err != nil {
+			continue
+		}
+
+		switch typeOnly.Type {
+		case "text":
+			var t struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(rawBlock, &t); err != nil {
+				continue
+			}
+			result = append(result, schema.InternalContentBlock{
+				Type: "text",
+				Text: t.Text,
+			})
+
+		case "image_url":
+			var img struct {
+				ImageURL struct {
+					URL    string `json:"url"`
+					Detail string `json:"detail,omitempty"`
+				} `json:"image_url"`
+			}
+			if err := json.Unmarshal(rawBlock, &img); err != nil {
+				continue
+			}
+
+			cb := schema.InternalContentBlock{Type: "image"}
+			url := img.ImageURL.URL
+			if strings.HasPrefix(url, "data:") {
+				comma := strings.Index(url, ",")
+				if comma > 0 {
+					prefix := url[:comma] // "data:image/png;base64"
+					mediaType := strings.TrimPrefix(prefix, "data:")
+					if semicolon := strings.Index(mediaType, ";"); semicolon > 0 {
+						mediaType = mediaType[:semicolon]
+					}
+					cb.MediaType = mediaType
+					cb.Data = url[comma+1:]
+				}
+			} else {
+				cb.URL = url
+			}
+			result = append(result, cb)
+		}
+	}
+	return result
 }
 
 // parseStopSequences 解析 stop（string 或 []string）
@@ -229,6 +305,21 @@ func InternalToCCResponse(resp *schema.InternalResponse) *ChatCompletionResponse
 
 	for i, choice := range resp.Choices {
 		content := unmarshalJSONString(choice.Message.Content)
+		var msgContent Content
+		// 优先使用 ContentBlocks（含图片），生成 content block 数组
+		if len(choice.Message.ContentBlocks) > 0 {
+			blocks := buildCCResponseContentBlocks(choice.Message.ContentBlocks)
+			raw, _ := json.Marshal(blocks)
+			var c Content
+			json.Unmarshal(raw, &c)
+			msgContent = c
+		} else {
+			raw, _ := json.Marshal(content)
+			var c Content
+			json.Unmarshal(raw, &c)
+			msgContent = c
+		}
+
 		toolCalls := make([]ToolCall, len(choice.Message.ToolCalls))
 		for j, tc := range choice.Message.ToolCalls {
 			toolCalls[j] = ToolCall{
@@ -247,7 +338,7 @@ func InternalToCCResponse(resp *schema.InternalResponse) *ChatCompletionResponse
 			Index: choice.Index,
 			Message: CCMessage{
 				Role:      string(choice.Message.Role),
-				Content:   content,
+				Content:   msgContent,
 				ToolCalls: toolCalls,
 			},
 			FinishReason: choice.FinishReason,
@@ -288,4 +379,36 @@ func unmarshalJSONString(raw json.RawMessage) string {
 	}
 	// 非纯字符串（如内容块数组），回退为原始 JSON 字符串，避免静默丢弃
 	return string(raw)
+}
+
+// buildCCResponseContentBlocks 将 InternalContentBlock 数组转为 CC content block 数组
+// 文本 → {type:"text", text:"..."}
+// 图片 → {type:"image_url", image_url:{url:"data:image/...;base64,<data>"|"<url>"}}
+func buildCCResponseContentBlocks(blocks []schema.InternalContentBlock) []map[string]interface{} {
+	var ccBlocks []map[string]interface{}
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			ccBlocks = append(ccBlocks, map[string]interface{}{
+				"type": "text",
+				"text": b.Text,
+			})
+		case "image":
+			url := b.Data
+			if url != "" && !strings.HasPrefix(url, "data:") {
+				mt := b.MediaType
+				if mt == "" {
+					mt = "image/png"
+				}
+				url = "data:" + mt + ";base64," + url
+			} else if url == "" && b.URL != "" {
+				url = b.URL
+			}
+			ccBlocks = append(ccBlocks, map[string]interface{}{
+				"type": "image_url",
+				"image_url": map[string]interface{}{"url": url},
+			})
+		}
+	}
+	return ccBlocks
 }

@@ -167,11 +167,28 @@ func messagesToInternal(msg Message) ([]schema.InternalMessage, error) {
 	// 混合 blocks：text 合并到一个 user 消息，tool_result 单独
 	var textParts []string
 	var userMsg *schema.InternalMessage
+	var contentBlocks []schema.InternalContentBlock
 
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
 			textParts = append(textParts, block.Text)
+			cb := schema.InternalContentBlock{Type: "text", Text: block.Text}
+			contentBlocks = append(contentBlocks, cb)
+			if userMsg == nil {
+				userMsg = &schema.InternalMessage{Role: schema.RoleUser}
+			}
+		case "image":
+			cb := schema.InternalContentBlock{
+				Type:      "image",
+				Data:      "",
+				MediaType: "",
+			}
+			if block.Source != nil {
+				cb.Data = block.Source.Data
+				cb.MediaType = block.Source.MediaType
+			}
+			contentBlocks = append(contentBlocks, cb)
 			if userMsg == nil {
 				userMsg = &schema.InternalMessage{Role: schema.RoleUser}
 			}
@@ -199,6 +216,9 @@ func messagesToInternal(msg Message) ([]schema.InternalMessage, error) {
 
 	if userMsg != nil {
 		userMsg.Content, _ = json.Marshal(strings.Join(textParts, "\n"))
+		if len(contentBlocks) > 0 {
+			userMsg.ContentBlocks = contentBlocks
+		}
 		result = append(result, *userMsg)
 	}
 
@@ -221,16 +241,46 @@ func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (
 	var contentBlocks []ContentBlock
 
 	for _, choice := range resp.Choices {
-		// Text
-		var text string
-		if choice.Message.Content != nil {
-			json.Unmarshal(choice.Message.Content, &text)
-		}
-		if text != "" {
-			contentBlocks = append(contentBlocks, ContentBlock{Type: "text", Text: text})
+		// 优先使用 ContentBlocks（含图片），回退到 Content 字符串
+		if len(choice.Message.ContentBlocks) > 0 {
+			for _, cb := range choice.Message.ContentBlocks {
+				switch cb.Type {
+				case "text":
+					if cb.Text != "" {
+						contentBlocks = append(contentBlocks, ContentBlock{Type: "text", Text: cb.Text})
+					}
+				case "image":
+					if cb.Data != "" {
+						contentBlocks = append(contentBlocks, ContentBlock{
+							Type: "image",
+							Source: &ImageSource{
+								Type:      "base64",
+								Data:      cb.Data,
+								MediaType: cb.MediaType,
+							},
+						})
+					} else if cb.URL != "" {
+						contentBlocks = append(contentBlocks, ContentBlock{
+							Type: "image",
+							Source: &ImageSource{
+								Type:      "url",
+								URL:       cb.URL,
+								MediaType: cb.MediaType,
+							},
+						})
+					}
+				}
+			}
+		} else {
+			var text string
+			if choice.Message.Content != nil {
+				json.Unmarshal(choice.Message.Content, &text)
+			}
+			if text != "" {
+				contentBlocks = append(contentBlocks, ContentBlock{Type: "text", Text: text})
+			}
 		}
 
-		// Tool calls
 		for _, tc := range choice.Message.ToolCalls {
 			contentBlocks = append(contentBlocks, ContentBlock{
 				Type:  "tool_use",
@@ -471,14 +521,10 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 			})
 
 		case schema.RoleUser:
-			// content 用原始字符串
-			var text string
-			if msg.Content != nil {
-				json.Unmarshal(msg.Content, &text)
-			}
+			content := buildAnthropicUserContent(msg)
 			result = append(result, Message{
 				Role:    "user",
-				Content: func() json.RawMessage { b, _ := json.Marshal(text); return b }(),
+				Content: content,
 			})
 		}
 	}
@@ -507,6 +553,51 @@ func assistantContentToAnthropic(msg schema.InternalMessage) (json.RawMessage, e
 	}
 
 	return json.Marshal(blocks)
+}
+
+// buildAnthropicUserContent 将 InternalMessage 转换为用户消息的 content
+// 优先使用 ContentBlocks（含图片），回退到 Content 纯文本
+func buildAnthropicUserContent(msg schema.InternalMessage) json.RawMessage {
+	if len(msg.ContentBlocks) > 0 {
+		var blocks []ContentBlock
+		for _, cb := range msg.ContentBlocks {
+			switch cb.Type {
+			case "text":
+				blocks = append(blocks, ContentBlock{Type: "text", Text: cb.Text})
+			case "image":
+				if cb.Data != "" {
+					blocks = append(blocks, ContentBlock{
+						Type: "image",
+						Source: &ImageSource{
+							Type:      "base64",
+							Data:      cb.Data,
+							MediaType: cb.MediaType,
+						},
+					})
+				} else if cb.URL != "" {
+					blocks = append(blocks, ContentBlock{
+						Type: "image",
+						Source: &ImageSource{
+							Type:      "url",
+							URL:       cb.URL,
+							MediaType: cb.MediaType,
+						},
+					})
+				}
+			}
+		}
+		if len(blocks) > 0 {
+			data, _ := json.Marshal(blocks)
+			return data
+		}
+	}
+
+	// 回退: 纯字符串
+	var text string
+	if msg.Content != nil {
+		json.Unmarshal(msg.Content, &text)
+	}
+	return func() json.RawMessage { b, _ := json.Marshal(text); return b }()
 }
 
 func toolsToAnthropic(tools []schema.InternalTool) []Tool {
@@ -546,11 +637,24 @@ func (t *AnthropicTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 
 	var textParts []string
 	var toolCalls []schema.InternalToolCall
+	var contentBlocks []schema.InternalContentBlock
 
 	for _, block := range resp.Content {
 		switch block.Type {
 		case "text":
 			textParts = append(textParts, block.Text)
+			contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+				Type: "text",
+				Text: block.Text,
+			})
+		case "image":
+			cb := schema.InternalContentBlock{Type: "image"}
+			if block.Source != nil {
+				cb.Data = block.Source.Data
+				cb.MediaType = block.Source.MediaType
+				cb.URL = block.Source.URL
+			}
+			contentBlocks = append(contentBlocks, cb)
 		case "tool_use":
 			// ⚠️ tool_use 混在 content blocks 中
 			toolCalls = append(toolCalls, schema.InternalToolCall{
@@ -574,6 +678,9 @@ func (t *AnthropicTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 	}
 
 	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
+	if len(contentBlocks) > 0 {
+		choiceMessage.ContentBlocks = contentBlocks
+	}
 
 	var usage *schema.InternalUsage
 	if resp.Usage != nil {

@@ -58,9 +58,12 @@ type ContentBlock struct {
 }
 
 type ImageSource struct {
-	Type     string `json:"type"`     // "base64"
-	Data     string `json:"data"`
-	MediaType string `json:"media_type"`
+	Type string `json:"type"` // "base64" | "url"
+	// base64 源
+	Data      string `json:"data,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	// url 源
+	URL string `json:"url,omitempty"`
 }
 
 type Tool struct {

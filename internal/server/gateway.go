@@ -636,7 +636,10 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 			Role: string(msg.Role),
 			Name: msg.Name,
 		}
-		if msg.Content != nil {
+		// 优先使用 ContentBlocks（含图片等多模态内容），否则回退到 Content 纯文本
+		if len(msg.ContentBlocks) > 0 {
+			im.Content = buildCCContentFromBlocks(msg.ContentBlocks)
+		} else if msg.Content != nil {
 			var text string
 			json.Unmarshal(msg.Content, &text)
 			im.Content = makeContent(text)
@@ -709,15 +712,59 @@ func makeContent(text string) chatcompletion.Content {
 	json.Unmarshal(raw, &c)
 	return c
 }
+
+// buildCCContentFromBlocks 将 InternalContentBlock 数组转换为 CC 格式的内容块数组
+// CC 格式: [{type:"text", text:"..."},{type:"image_url", image_url:{url:"data:image/..."}}]
+// 内部 Data 字段可能含 data URL 前缀或纯 base64，统一处理
+func buildCCContentFromBlocks(blocks []schema.InternalContentBlock) chatcompletion.Content {
+	var ccBlocks []json.RawMessage
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			block, _ := json.Marshal(map[string]any{"type": "text", "text": b.Text})
+			ccBlocks = append(ccBlocks, block)
+		case "image":
+			url := b.Data
+			if url != "" && !strings.HasPrefix(url, "data:") {
+				mt := b.MediaType
+				if mt == "" {
+					mt = "image/png"
+				}
+				url = "data:" + mt + ";base64," + url
+			}
+			block, _ := json.Marshal(map[string]any{
+				"type":     "image_url",
+				"image_url": map[string]any{"url": url},
+			})
+			ccBlocks = append(ccBlocks, block)
+		}
+	}
+	if len(ccBlocks) == 0 {
+		return chatcompletion.Content{}
+	}
+	raw, _ := json.Marshal(ccBlocks)
+	var c chatcompletion.Content
+	json.Unmarshal(raw, &c)
+	return c
+}
 func chatCompletionToInternal(ccResp *chatcompletion.ChatCompletionResponse) *schema.InternalResponse {
 	var choices []schema.InternalChoice
 	for _, c := range ccResp.Choices {
 		msg := schema.InternalMessage{
 			Role: schema.Role(c.Message.Role),
 		}
-		if c.Message.Content != "" {
-			// 裸字符串 → 合法 JSON 字符串（带外层引号）
-			msg.Content, _ = json.Marshal(c.Message.Content)
+		// content 可能是字符串或 content block 数组（含图片）
+		raw := c.Message.Content.Raw()
+		if len(raw) > 0 {
+			var text string
+			if err := json.Unmarshal(raw, &text); err == nil {
+				msg.Content, _ = json.Marshal(text)
+			} else {
+				var blocks []json.RawMessage
+				if err := json.Unmarshal(raw, &blocks); err == nil {
+					msg.ContentBlocks = chatcompletion.ParseCCContentBlocks(blocks)
+				}
+			}
 		}
 		for _, tc := range c.Message.ToolCalls {
 			msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{

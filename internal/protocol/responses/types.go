@@ -107,11 +107,12 @@ type OutputItem struct {
 }
 
 type ContentBlock struct {
-	Type      string                 `json:"type"`  // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text"
+	Type      string                 `json:"type"`  // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text" | "input_image"
 	Text      string                 `json:"text"`
 	ID        string                 `json:"id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Input     map[string]interface{} `json:"input,omitempty"`
+	Source    map[string]interface{} `json:"source,omitempty"`
 	ToolUseID string                 `json:"tool_call_id,omitempty"` // tool_result 引用
 }
 
