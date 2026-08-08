@@ -194,7 +194,7 @@ func contentsToMessages(contents []Content) []schema.InternalMessage {
 			}
 		}
 
-		msg.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+		msg.Content, _ = json.Marshal(joinText(textParts))
 		if len(toolCalls) > 0 {
 			msg.ToolCalls = toolCalls
 		}
@@ -208,7 +208,7 @@ func contentsToMessages(contents []Content) []schema.InternalMessage {
 			}
 			msgs = append(msgs, schema.InternalMessage{
 				Role:       schema.RoleTool,
-				Content:    json.RawMessage(`"` + resultText + `"`),
+				Content:    func() json.RawMessage { b, _ := json.Marshal(resultText); return b }(),
 				ToolCallID: fr.Name,
 				Name:       resultText,
 			})
@@ -628,7 +628,7 @@ func (t *GeminiTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.I
 		choiceMessage.ToolCalls = toolCalls
 	}
 
-	choiceMessage.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
 
 	// --- 2. Usage 字段映射（兼容性 7） ---
 	var usage *schema.InternalUsage
@@ -718,7 +718,7 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 	if candidate.Content != nil {
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
-				deltaContent = json.RawMessage(`"` + part.Text + `"`)
+				deltaContent, _ = json.Marshal(part.Text)
 			}
 			if part.FunctionCall != nil {
 				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
