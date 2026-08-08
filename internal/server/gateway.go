@@ -516,9 +516,10 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 					events <- *event
 				}
 			} else {
-				// OpenAI 兼容：解析 SSE delta 行
+				// OpenAI 兼容：解析 SSE delta 行（可能带 "data: " 前缀）
+				payload := strings.TrimPrefix(string(line), "data: ")
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
-				if json.Unmarshal(line, &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
 				}
 				choice := ccChunk.Choices[0]
