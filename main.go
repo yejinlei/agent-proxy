@@ -35,7 +35,7 @@ func main() {
 		runDBAdd(args[1:])
 	case "detect":
 		runDBAdd(args[1:])
-	case "query", "q":
+	case "query", "q", "list", "l":
 		if err := cmd.RunDBQuery(nil); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
@@ -87,7 +87,7 @@ func runDBCommand(args []string) {
 		runDBAdd(args)
 	case "detect":
 		runDBAdd(args)
-	case "query", "q":
+	case "query", "q", "list", "l":
 		if len(args) == 0 {
 			if err := cmd.RunDBQuery(nil); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
@@ -455,7 +455,7 @@ func printUsage() {
 数据库命令:
   agent-proxy db add      --url <u> --key <k> [--name <n>]  新增代理
   agent-proxy db rm       <id>                              删除代理
-  agent-proxy db query    [id]                              查询代理（无 id 列出全部）
+  agent-proxy db query    [id]                              查询代理（无 id 列出全部，alias: list / l / q）
   agent-proxy db find     <关键词>                           搜索代理
   agent-proxy db check                      核对所有代理（重新探测，提示删除无效记录）
   agent-proxy db detect  --url <u> --key <k> [--name <n>]  新增代理（兼容 alias → add）
