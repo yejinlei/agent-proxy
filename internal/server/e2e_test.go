@@ -375,6 +375,7 @@ func setupMockGateway(t *testing.T) *mockGateway {
 		mockServer.URL,
 		"mock-key",
 		[]string{"openai"},
+		nil,
 		30,
 		"", false, 0,
 	)

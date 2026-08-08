@@ -29,6 +29,7 @@ type QuickGateway struct {
 	info               *schema.ProviderInfo
 	timeout            int
 	capabilities       []string
+	modelsMap          map[string][]string
 	translatorRegistry *translator.TranslatorRegistry
 	// 透传上游 /v1/models 用的
 	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
@@ -44,7 +45,8 @@ type QuickGateway struct {
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
-func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
+// modelsMap: 协议→模型列表映射，如 {"openai":["gpt-4"],"anthropic":["claude-3"]}
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
@@ -63,6 +65,7 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, timeou
 		},
 		timeout:            timeout,
 		capabilities:       capabilities,
+		modelsMap:          modelsMap,
 		translatorRegistry: registry,
 		proxyBaseURL:       strings.TrimSuffix(baseURL, "/"),
 		proxyKey:           apiKey,
@@ -84,7 +87,7 @@ func (q *QuickGateway) normalizeIngress(p string) string {
 
 // selectProtocol 根据入站协议选择匹配的上游协议
 // 策略：归一化后，若该协议在 capabilities 中则使用它（透传）；否则回退到 openai（翻译转换）
-func (q *QuickGateway) selectProtocol(ingressProtocol string) string {
+func (q *QuickGateway) selectProtocol(ingressProtocol, model string) string {
 	normalized := q.normalizeIngress(ingressProtocol)
 	if slices.Contains(q.capabilities, normalized) {
 		return normalized
@@ -176,10 +179,6 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	br := bytes.NewReader(body)
 	r.Body = io.NopCloser(io.NewSectionReader(br, 0, int64(br.Len())))
 
-	// ── 协议感知路由：选择上游协议（本地变量，不修改 q.info 共享结构） ──
-	providerType := q.selectProtocol(ingressProtocol)
-	p := q.getProvider(providerType)
-
 	// ── 轻量提取 model 用于路由 & 透传 URL ──
 	// Gemini 的 model 在 URL 路径 /v1/models/{model}:generateContent 中，
 	// 已由 handleModelsCatchAll 写入 ctx；其他协议从请求体读取。
@@ -189,6 +188,10 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			model = m
 		}
 	}
+
+	// ── 协议感知路由：按模型归属选择上游协议（本地变量，不修改 q.info 共享结构） ──
+	providerType := q.selectProtocol(ingressProtocol, model)
+	p := q.getProvider(providerType)
 
 	// ── 透传 vs 翻译 ──
 	// 归一化后 ingressProtocol == providerType 时透传（零损耗）
