@@ -1,150 +1,183 @@
-# agent-proxy — AI 协议网关（4×4 全协议互转）
+# agent-proxy — AI 协议网关
 
-## 一句话
+> **4×4 全协议互转** · 单二进制部署 · 零外部依赖
 
-agent-proxy 是 **4×4 全协议互转** 的 AI 协议中间件：OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站协议可转换为任意出站协议**，彻底打通不同厂商的 API 格式差异。
+agent-proxy 是一个 AI 消息协议中间件：任意入站协议（OpenAI / Anthropic / Gemini / Responses）可转换为任意出站协议，彻底打通不同厂商的 API 格式差异。
 
-两种模式覆盖所有场景：
-
-- **快速模式**（默认）：`agent-proxy run --db 1` 一条命令从 SQLite 选记录启动，4×4 全协议互转
-- **复杂模式**：`agent-proxy run --mode complex` 多 Provider 路由、Web UI 实时监控
-- **配置文件**：`agent-proxy run --mode complex --conf config.json` 完整 JSON 配置
-
-## 架构
-
-![agent-proxy 架构图](docs/architecture.png)
-
-### 核心模块
-
-- **Central Schema**：与所有外部协议无关的统一消息模型，所有翻译通过此模型中转
-- **Protocol Translators**：每个协议实现请求翻译 / 响应翻译 / 流式翻译
-- **Provider Clients**：统一的下游调用接口
-- **Model Router**：模型前缀匹配到 Provider
-- **Web UI**：嵌入静态资源（embed.FS），实时指标推送
-
-## 编译
-
-> 本项目使用 Go 编写，编译后为单二进制文件，零外部依赖。
-
-### Windows（本地编译）
-
-```powershell
-go build -o agent-proxy.exe .
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                   │
+│        入站 (任何协议)     agent-proxy     出站 (任何协议)        │
+│                                                                   │
+│  ┌──────────┐               ┌────────────┐               ┌────────┐│
+│  │  OpenAI  │──────────────→│  Central   │──────────────→│ OpenAI ││
+│  │  Anth.   │──────────────→│  Schema    │──────────────→│ Anth.  ││
+│  │  Gemini  │──────────────→│  (中枢)    │──────────────→│ Gemini ││
+│  │ Resps.   │──────────────→│            │──────────────→│ Resps. ││
+│  └──────────┘               └────────────┘               └────────┘│
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 跨平台编译
+---
+
+## ✨ 特性
+
+| 特性 | 说明 |
+|------|------|
+| 🔄 **4×4 协议互转** | OpenAI / Anthropic / Gemini / Responses 任意入站 → 任意出站 |
+| ⚡ **透传优化** | 入站协议与下游匹配时零开销直传，不做多余翻译 |
+| 🔎 **智能嗅探** | 添加代理时自动探测所有支持的协议和模型 |
+| 🚀 **快速模式** | `agent-proxy run --db 1` 一条命令启动，零配置 |
+| 🏗️ **复杂模式** | 多 Provider 路由、限流、Web UI 实时监控 |
+| 📦 **单二进制** | 纯 Go 编译，内嵌 SQLite，无外部依赖 |
+| 🛡️ **客户端认证** | 快速模式内置 Bearer Token 认证 |
+| 📊 **Web UI** | 深色主题面板：实时指标、请求日志、Provider 状态 |
+
+---
+
+## 🚀 5 分钟上手
+
+### 1. 嗅探并添加代理
+
+自动探测上游支持的所有协议：
 
 ```bash
-# 编译 Windows amd64
-GOOS=windows GOARCH=amd64 go build -o agent-proxy.exe .
-
-# 编译 Linux amd64
-GOOS=linux GOARCH=amd64 go build -o agent-proxy .
-
-# 编译 macOS amd64 / arm64
-GOOS=darwin GOARCH=amd64 go build -o agent-proxy .
-GOOS=darwin GOARCH=arm64 go build -o agent-proxy .
+agent-proxy db add \
+  --url https://token.sensenova.cn/v1 \
+  --key sk-xxx \
+  --name sensenova
 ```
 
-`-ldflags="-s -w"` 可添加以剥离调试信息，进一步减小二进制体积。
+```
+🔎 探测到 4 个协议，12 个模型：
+  · openai (4 个模型)
+  · responses (4 个模型)
+  · anthropic (0 个模型)
+  · gemini (4 个模型)
+  是否要加到 DB？(yes/no): yes
+✅ 已保存代理配置
+```
 
-## 快速开始
+### 2. 启动代理
 
-```powershell
-# === 1. 嗅探并添加代理（自动探测所有支持的协议）===
-agent-proxy db add --url https://token.sensenova.cn/v1 \
-                  --key sk-xxx --name sensenova
-# 等价命令（别名）
-agent-proxy detect --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
+```bash
+agent-proxy run --db 1 --nokey
+```
 
-# === 2. 快速启动（只需 --db）===
-agent-proxy run --db 1
+> `--nokey` 跳过客户端认证，适合本地开发。生产环境建议省略或指定 `--key`。
 
-# 如需允许远程访问
-agent-proxy run --db 1 --host 0.0.0.0 --port 8080
+### 3. 任意协议调用
 
-# === 3. 使用任意协议调用 ===
-# 3a. OpenAI Compatible 入站
+启动后网关同时暴露 4 种协议入口：
+
+```bash
+# ① OpenAI Compatible
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hello"}]}'
 
-# 3b. Anthropic Messages 入站（自动翻译为下游 Provider 协议）
+# ② Anthropic Messages
 curl -X POST http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: dummy" \
   -d '{"model":"sensenova-6.7-flash-lite","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
 
-# 3c. Google Gemini 入站
-curl -X POST http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent \
+# ③ Google Gemini
+curl -X POST "http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
 
-# 3d. OpenAI Responses 入站
+# ④ OpenAI Responses
 curl -X POST http://localhost:8080/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
-## 命令总览
+---
+
+## 📋 CLI 命令参考
 
 ```
-agent-proxy <subcommand> [options]
-
-启动命令:
-  agent-proxy run --db <id>                    快速模式（默认，只监听本机 127.0.0.1）
-  agent-proxy run --db <id> --host 0.0.0.0     快速模式（允许远程访问）
-  agent-proxy run --mode complex                复杂模式（默认配置）
-  agent-proxy run --mode complex --conf <f>     复杂模式（JSON 配置文件）
-
-参数说明:
-  --db <id>   从数据库选一条记录启动（触发快速模式）
-  --host      监听地址（默认 127.0.0.1，用 0.0.0.0 允许远程访问）
-  --port      监听端口（默认 8080）
-  --mode      complex（显式进入复杂模式）
-  --conf      复杂模式配置文件路径
-
-数据库命令:
-  agent-proxy db list                                    列出所有记录
-  agent-proxy db show <id>                               显示详情
-  agent-proxy db add --url <u> --key <k> [--name <n>]    嗅探并添加（自动探测所有协议）
-  agent-proxy detect --url <u> --key <k> [--name <n>]    同上（add 的别名）
-  agent-proxy db rm <id>                                 删除记录
-
-帮助:
-  agent-proxy --help  /  -h                      显示帮助
+agent-proxy <command> [options]
 ```
 
-详细用法见 [MANUAL.md](MANUAL.md)。
+### 启动
 
-## 快速模式 vs 复杂模式
+| 命令 | 说明 |
+|------|------|
+| `run --db <id>` | 快速模式启动（从 DB 选一条记录） |
+| `run --db <id> --key <k>` | 快速模式 + 指定客户端密钥 |
+| `run --db <id> --nokey` | 快速模式，无需客户端密钥 |
+| `run --mode complex` | 复杂模式（多 Provider + Web UI） |
+| `run --mode complex --conf <f>` | 复杂模式 + 配置文件 |
+| `run --mode complex --host <h> --port <p>` | 指定监听地址 |
 
-| 维度 | 快速模式（`--db`） | 复杂模式（`--mode complex`） |
-|------|-------------------|----------------------------|
-| 启动方式 | `agent-proxy run --db 1` | `agent-proxy run --mode complex` |
-| Provider 来源 | SQLite 数据库一条记录 | 内置配置 或 `--conf` 配置文件 |
-| 多 Provider | 不支持 | 支持（路由前缀匹配） |
-| 协议翻译 | 支持（协议感知路由：入站匹配则透传，否则经 OpenAI 协议转换） | 支持（完整 4 协议） |
-| Web UI | 无 | 有（`/ui`） |
-| 限流 / 监控 | 无 | 有 |
-| 适用场景 | 快速试用、单一端点 | 生产、多厂商调度 |
+### DB 管理
 
-## 客户端认证（--key）
+| 命令 | 说明 |
+|------|------|
+| `db add` | 新增代理（自动嗅探协议） |
+| `db rm` | 删除代理 |
+| `db query` | 查询代理（无 id 列出全部，有 id 显示详情） |
+| `db find <关键词>` | 搜索代理（匹配名称 / URL / 协议 / 模型） |
+| `db check` | 核对所有代理有效性 |
+| `detect` | `db add` 的兼容别名 |
 
-快速模式内置客户端认证机制，通过 `Authorization: Bearer <key>` 保护代理端点。三种使用方式：
+### DB 命令速查
 
-### 1. 随机密钥（默认）
+```bash
+# 新增代理
+agent-proxy db add --url <url> --key <key> [--name <name>]
 
-不传 `--key` 时，启动时自动随机生成一个 48 位 hex 密钥并打印到控制台：
+# 列出所有
+agent-proxy db query
 
-```powershell
+# 查看详情
+agent-proxy db query 1
+
+# 搜索代理（匹配名称 / URL / 协议 / 模型）
+agent-proxy db find sensenova
+
+# 核对有效性（重新嗅探每条记录，提示删除无效记录）
+agent-proxy db check
+
+# 删除记录
+agent-proxy db rm 1
+```
+
+---
+
+## ⚡ 快速模式 vs 复杂模式
+
+| | 快速模式 (`--db`) | 复杂模式 (`--mode complex`) |
+|---|---|---|
+| **启动** | `agent-proxy run --db 1` | `agent-proxy run --mode complex` |
+| **配置来源** | SQLite 一条记录 | 内置配置 / `--conf` 文件 |
+| **多 Provider** | ❌ 单条 | ✅ 路由前缀匹配 |
+| **协议互转** | ✅ 协议感知路由 | ✅ 4 协议完整支持 |
+| **Web UI** | ❌ | ✅ `/ui` |
+| **限流 / 监控** | ❌ | ✅ 令牌桶 + 实时指标 |
+| **适用场景** | 快速试用、单一端点 | 生产、多厂商调度 |
+
+---
+
+## 🔐 客户端认证
+
+快速模式内置认证，三种使用方式：
+
+| 方式 | 命令 | 密钥来源 | 需 `Authorization` 头 |
+|------|------|---------|---------------------|
+| 随机密钥（默认） | `run --db 1` | 每次重启随机生成 | ✅ |
+| 固定密钥 | `run --db 1 --key sk-xxx` | 用户指定 | ✅ |
+| 无需密钥 | `run --db 1 --nokey` | 无 | ❌ |
+
+```bash
 agent-proxy run --db 1
-```
 
-```
-🚀 Agent-Proxy (快速模式) running on http://127.0.0.1:8080
-🔑 Proxy Key:      sk-a1b2c3d4e5f6...
-🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
+# 输出：
+# 🔑 Proxy Key: sk-a1b2c3d4e5f6...
+# 🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
 ```
 
 ```bash
@@ -154,169 +187,101 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-> 密钥每次重启都会变化，适合临时使用。
+> `/health` 端点始终不受认证影响。
 
-### 2. 固定密钥
+---
 
-```powershell
-agent-proxy run --db 1 --key sk-my-fixed-key
-```
+## 🔮 协议感知路由
 
-客户端连接时使用同一个 `sk-my-fixed-key`。
-
-### 3. 无需密钥（本地开发）
-
-```powershell
-agent-proxy run --db 1 --nokey
-```
-
-任何客户端均可直接连接，无需 `Authorization` 头。**不要在生产环境使用。**
-
-| 标志 | 密钥来源 | 需要 `Authorization` 头 | 适用场景 |
-|------|---------|------------------------|---------|
-| （不传） | 随机生成 | ✅ | 本地临时使用 |
-| `--key <k>` | 指定值 | ✅ | 固定环境、自动化脚本 |
-| `--nokey` | 无 | ❌ | 本地开发、内网直连 |
-
-- 缺密钥或密钥错误时返回 `401 Unauthorized`
-- `/health` 端点始终不受认证影响
-
-## 多协议嗅探与协议感知路由
-
-### 嗅探
-
-`db add` 和 `detect` 是**完全等价**的命令，对上游自动探测所有 4 种协议：
-
-| 步骤 | 协议 | 探测方式 | 成功条件 |
-|------|------|----------|----------|
-| 1 | OpenAI | `GET {base}/v1/models` + `Authorization: Bearer` | 200 或 401 |
-| 2 | OpenAI Responses | 共享 OpenAI 基础设施 | 步骤 1 成功即标记 |
-| 3 | Anthropic Messages | `POST {base}/v1/messages` + `x-api-key` | 非 5xx |
-| 4 | Gemini | `POST {base}/v1/models/gemini-pro:generateContent` | 非 5xx |
-
-- **至少一个模型**：打印摘要 + 提示确认后写入 SQLite（单条记录含 `capabilities_json` + `models_map_json`）
-- **无任何模型**：直接报告失败，不提示
-
-```powershell
-agent-proxy db add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
-agent-proxy detect --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
-```
-
-### 协议感知路由（快速模式）
+快速模式下，入站请求按以下逻辑路由：
 
 ```
-入站协议 → normalizeIngress → selectProtocol(capabilities)
-  - 命中 capabilities → 透传（零开销）
-  - 未命中          → 回退到 OpenAI 协议转换
+入站协议 → selectProtocol(capabilities)
+  ├── 命中 capabilities → 透传（零开销）
+  └── 未命中            → 回退到 OpenAI 协议翻译
 ```
 
-示例：上游支持 openai + anthropic，下游按 Anthropic 接入 → **透传**；上游仅支持 openai，下游按 Gemini 接入 → 经 OpenAI 翻译后转发。
+| 上游能力 | 下游协议 | 路由方式 |
+|---------|---------|---------|
+| openai + anthropic | Anthropic Messages | ✅ 透传 |
+| openai | Gemini | 经 OpenAI 翻译 |
+| openai + responses | Responses | ✅ 透传 |
+| openai | Anthropic | 经 OpenAI 翻译 |
 
-## 4×4 协议互转矩阵
+---
 
-任意入站协议（行）可转换为任意出站协议（列），网关自动完成双向翻译：
+## 📐 4×4 协议互转矩阵
 
-| 入站 ↓ \ 出站 → | OpenAI Compatible | Anthropic Messages | Google Gemini | OpenAI Responses |
-|----------------|------------------|-------------------|---------------|-----------------|
-| **OpenAI Compatible** `/v1/chat/completions` | ✅ 透传 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 |
-| **Anthropic Messages** `/v1/messages` | ✅ 请求/响应/流式 | ✅ 透传 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 |
-| **Google Gemini** `/v1/models/{model}:generateContent` | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 透传 | ✅ 请求/响应/流式 |
-| **OpenAI Responses** `/v1/responses` | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 请求/响应/流式 | ✅ 透传 |
+| 入站 ↓ \ 出站 → | OpenAI CC | Anthropic | Gemini | Responses |
+|---|---|---|---|---|
+| **OpenAI CC** `/v1/chat/completions` | ✅ 透传 | ✅ 翻译 | ✅ 翻译 | ✅ 翻译 |
+| **Anthropic** `/v1/messages` | ✅ 翻译 | ✅ 透传 | ✅ 翻译 | ✅ 翻译 |
+| **Gemini** `/v1/models/{m}:generateContent` | ✅ 翻译 | ✅ 翻译 | ✅ 透传 | ✅ 翻译 |
+| **Responses** `/v1/responses` | ✅ 翻译 | ✅ 翻译 | ✅ 翻译 | ✅ 透传 |
 
-## 协议兼容性差异点
+---
 
-agent-proxy 处理以下 8 大协议差异：
+## 🛠️ 编译
 
-| # | 差异点 | 说明 |
-|---|--------|------|
-| 1 | System prompt 位置 | CC 在 messages 中；Anthropic 顶层 system；Gemini systemInstruction |
-| 2 | Tool 定义字段 | parameters vs input_schema vs functionDeclarations |
-| 3 | Tool call 位置 | CC 独立 tool_calls；Anthropic/Gemini 混在 content blocks |
-| 4 | Tool call arguments | CC 是 JSON 字符串；其他是 JSON 对象 |
-| 5 | Tool result 角色 | Anthropic 归 user；Gemini 归 user + functionResponse |
-| 6 | Usage 字段名 | prompt_tokens vs input_tokens vs prompt_token_count |
-| 7 | Stop reason | end_turn → stop；max_tokens → length |
-| 8 | SSE 事件格式 | CC 无 event 行；Anthropic 用 type 字段 |
+```bash
+# 本地编译
+go build -o agent-proxy .
 
-## 配置文件
-
-复杂模式支持 `--conf` 指定 JSON 配置文件（参见 [`config.example.json`](config.example.json)）：
-
-```json
-{
-  "server": { "host": "0.0.0.0", "port": 8080 },
-  "providers": {
-    "sensenova": {
-      "base_url": "https://token.sensenova.cn",
-      "api_token": "sk-xxx",
-      "provider_type": "openai",
-      "models": ["sensenova-6.7-flash-lite", "deepseek-v4-flash"]
-    }
-  },
-  "model_router": {
-    "model_to_provider": { "sensenova-": "sensenova" },
-    "default_provider": "sensenova",
-    "prefix_match": true
-  }
-}
+# 跨平台
+GOOS=linux   GOARCH=amd64 go build -o agent-proxy-linux-amd64 .
+GOOS=darwin  GOARCH=arm64 go build -o agent-proxy-darwin-arm64 .
 ```
 
-## Web UI
+> `-ldflags="-s -w"` 可剥离调试信息，减小二进制体积。
 
-复杂模式启动后访问 `http://localhost:8080/ui`，深色主题面板：
+---
 
-- **实时指标卡片**：QPS / P99 延迟 / 错误率 / 活跃连接
-- **Provider 状态列表**：健康状态圆点（green/degraded/down/idle）
-- **图表**：60 秒 QPS + 延迟趋势（uPlot）
-- **请求日志**：SSE 推送，含模型/状态/耗时
-- **数据接口**：`/ui/api/summary` `/ui/api/logs` `/ui/api/metrics` `/ui/api/providers`
+## 📊 Web UI
 
-## 性能与部署
+复杂模式启动后访问 `http://localhost:8080/ui`：
 
-- 单二进制部署（`embed.FS` 嵌入静态资源）
-- 零外部依赖运行时（SQLite 为纯 Go 实现）
-- 连接池 / 限流器（令牌桶）
-- 优雅关闭（SIGINT / SIGTERM）
+- **指标卡片**：QPS / P99 延迟 / 错误率 / 活跃连接
+- **Provider 列表**：健康状态圆点（🟢🟡🔴⚪）
+- **实时图表**：60 秒 QPS + 延迟趋势
+- **请求日志**：SSE 推送
 
-## 项目结构
+---
+
+## 📁 项目结构
 
 ```
 agent-proxy/
-├── main.go                  # 入口：run/db/list/show/add/rm 子命令
-├── cmd/
-│   └── cli.go               # DB 管理实现
-├── config.example.json      # 复杂模式配置文件示例
-├── go.mod / go.sum
-├── .env.example
-├── README.md
-├── MANUAL.md                # 完整用户手册
+├── main.go                    # 入口 & 命令行分派
+├── cmd/cli.go                 # DB 管理实现
+├── config.example.json        # 配置文件示例
+├── README.md                  # 本文件
+├── MANUAL.md                  # 完整用户手册
 └── internal/
-    ├── config/config.go       # 配置结构 + JSON 加载
-    ├── db/db.go               # SQLite 持久化
-    ├── middleware/middleware.go
-    ├── monitor/store.go
-    ├── protocol/
-    │   ├── schema/internal.go
+    ├── config/                # 配置结构
+    ├── db/                    # SQLite 持久化
+    ├── protocol/              # 协议翻译器
+    │   ├── schema/            # Central Schema（中枢）
     │   ├── chatcompletion/
     │   ├── anthropic/
     │   ├── gemini/
     │   └── responses/
-    ├── provider/
-    │   ├── provider.go
-    │   └── openai.go
-    ├── router/router.go
-    ├── server/
-    │   ├── gateway.go
-    │   ├── quick.go
-    │   └── ratelimiter.go
-    ├── translator/interfaces.go
-    └── web/
-        ├── server.go
-        └── static/
-            ├── index.html
-            ├── dashboard.css
-            └── dashboard.js
+    ├── provider/              # 下游客户端
+    ├── router/                # 模型路由
+    ├── server/                # 网关服务
+    ├── translator/            # 翻译接口定义
+    └── web/                   # Web UI
 ```
+
+---
+
+## 📖 文档
+
+| 文档 | 说明 |
+|------|------|
+| [README.md](README.md) | 快速概览、上手、常用命令 |
+| [MANUAL.md](MANUAL.md) | 完整用户手册（含协议兼容性、Web UI、扩展开发） |
+
+---
 
 ## License
 

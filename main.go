@@ -19,6 +19,8 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/server"
 )
 
+var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
+
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
@@ -29,29 +31,36 @@ func main() {
 	switch command {
 	case "run":
 		runServer(args[1:])
-	case "list":
-		runDBList()
-	case "show":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "用法: agent-proxy show <id>\n")
-			os.Exit(1)
-		}
-		id, _ := strconv.Atoi(args[1])
-		if err := cmd.RunDBShow(id); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
 	case "add":
 		runDBAdd(args[1:])
 	case "detect":
 		runDBAdd(args[1:])
-	case "rm", "delete":
+	case "query", "q":
+		if err := cmd.RunDBQuery(nil); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "check", "c":
+		if err := cmd.RunDBCheck(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "rm":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy rm <id>\n")
 			os.Exit(1)
 		}
 		id, _ := strconv.Atoi(args[1])
-		if err := cmd.RunDBDelete(id); err != nil {
+		if err := cmd.RunDBRm(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "find", "f":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy db find <关键词>\n")
+			os.Exit(1)
+		}
+		if err := cmd.RunDBFind(args[1]); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
 		}
@@ -68,38 +77,50 @@ func main() {
 
 // runDBCommand 处理 agent-proxy db <subcommand> [args]
 func runDBCommand(args []string) {
-	command := "list"
+	command := "query"
 	if len(args) > 0 {
 		command = args[0]
 		args = args[1:]
 	}
 	switch command {
-	case "list":
-		if err := cmd.RunDBList(); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
-	case "show":
-		if len(args) < 1 {
-			fmt.Fprintf(os.Stderr, "用法: agent-proxy db show <id>\n")
-			os.Exit(1)
-		}
-		id, _ := strconv.Atoi(args[0])
-		if err := cmd.RunDBShow(id); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			os.Exit(1)
-		}
 	case "add":
 		runDBAdd(args)
 	case "detect":
 		runDBAdd(args)
-	case "rm", "delete":
+	case "query", "q":
+		if len(args) == 0 {
+			if err := cmd.RunDBQuery(nil); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			id, _ := strconv.Atoi(args[0])
+			if err := cmd.RunDBQuery(&id); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
+		}
+	case "check", "c":
+		if err := cmd.RunDBCheck(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "rm":
 		if len(args) < 1 {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy db rm <id>\n")
 			os.Exit(1)
 		}
 		id, _ := strconv.Atoi(args[0])
-		if err := cmd.RunDBDelete(id); err != nil {
+		if err := cmd.RunDBRm(id); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "find", "f":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy db find <关键词>\n")
+			os.Exit(1)
+		}
+		if err := cmd.RunDBFind(args[0]); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
 		}
@@ -108,13 +129,6 @@ func runDBCommand(args []string) {
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令: db %s\n\n", command)
 		printUsage()
-		os.Exit(1)
-	}
-}
-
-func runDBList() {
-	if err := cmd.RunDBList(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -145,6 +159,7 @@ func runDBAdd(args []string) {
 var validRunFlags = map[string]bool{
 	"--host": true, "--port": true, "--mode": true,
 	"--db": true, "--conf": true, "--key": true, "--nokey": true,
+	"-v": true, "-vv": true,
 }
 
 // validRunMode 允许的 mode 值
@@ -206,6 +221,10 @@ func runServer(args []string) {
 			}
 		case "--nokey":
 			noClientKey = true
+		case "-v":
+			verboseLevel = 1
+		case "-vv":
+			verboseLevel = 2
 		}
 	}
 
@@ -321,7 +340,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Han
 		return nil, fmt.Errorf("get record: %w", err)
 	}
 	if record == nil {
-		return nil, fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db list' 查看现有配置", dbID)
+		return nil, fmt.Errorf("未找到 ID=%d 的代理配置。使用 'agent-proxy db query' 查看现有配置", dbID)
 	}
 
 	fmt.Printf("⚡ 快速模式: 使用 DB 记录 #%d\n", dbID)
@@ -333,7 +352,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Han
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), 60, clientKey, clientKeyEnabled)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), 60, clientKey, clientKeyEnabled, verboseLevel)
 	return quick.Routes(), nil
 }
 
@@ -430,12 +449,16 @@ func printUsage() {
     --conf       复杂模式配置文件路径
     --key <k>    快速模式客户端密钥（默认随机生成并显示）
     --nokey      快速模式不要求客户端密钥（本地开发用）
+    -v           快速模式请求日志：客户端 IP / 入站协议 / 上游 / token 用量 / 耗时
+    -vv          快速模式详细日志：-v 基础上额外显示 Guest 侧请求体和 LLM 侧响应内容
 
 数据库命令:
-  agent-proxy db list                                    列出所有记录
-  agent-proxy db show <id>                               显示详情
-  agent-proxy db add --url <u> --key <k> [--name <n>]    添加记录
-  agent-proxy db rm <id>                                 删除记录
+  agent-proxy db add      --url <u> --key <k> [--name <n>]  新增代理
+  agent-proxy db rm       <id>                              删除代理
+  agent-proxy db query    [id]                              查询代理（无 id 列出全部）
+  agent-proxy db find     <关键词>                           搜索代理
+  agent-proxy db check                      核对所有代理（重新探测，提示删除无效记录）
+  agent-proxy db detect  --url <u> --key <k> [--name <n>]  新增代理（兼容 alias → add）
 
 示例:
   # 添加 Sensenova
@@ -449,6 +472,15 @@ func printUsage() {
 
   # 快速启动（无需密钥，本地开发）
   agent-proxy run --db 1 --nokey
+
+  # 查询所有代理
+  agent-proxy db query
+
+  # 查看 ID=1 详情
+  agent-proxy db query 1
+
+  # 核对所有代理有效性
+  agent-proxy db check
 
   # 复杂模式
   agent-proxy run --mode complex --host 0.0.0.0 --port 8080

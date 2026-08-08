@@ -251,7 +251,7 @@ agent-proxy run --mode complex --host 127.0.0.1 --port 9090
 
 ### 多 Provider 配置
 
-在 `cmd/server/main.go` 中修改 `startComplexMode()` 函数：
+在 `main.go` 中修改 `startComplexMode()` 函数：
 
 ```go
 cfg.Providers["my-provider"] = &config.ProviderConfig{
@@ -297,9 +297,11 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 
 | 命令 | 示例 | 说明 |
 |------|------|------|
-| `db list` | `agent-proxy db list` | 列出所有代理 |
-| `db show` | `agent-proxy db show 1` | 查看 ID=1 详情 |
+| `db query` | `agent-proxy db query` | 列出所有代理 |
+| `db query` | `agent-proxy db query 1` | 查看 ID=1 详情 |
+| `db find` | `agent-proxy db find sensenova` | 按关键词搜索（匹配名称 / URL / 协议 / 模型） |
 | `db add` / `db detect` | `agent-proxy db add --url <url> --key <key> [--name <n>]` | 嗅探并添加（自动探测所有协议，确认后写入） |
+| `db check` | `agent-proxy db check` | 核对所有代理有效性（重新嗅探，提示删除无效记录） |
 | `db rm` | `agent-proxy db rm 1` | 删除记录 |
 
 ### `add` / `detect` 参数详解
@@ -315,7 +317,7 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 添加时自动执行：
 
 1. **嗅探 OpenAI**：`GET {url}/v1/models` + Bearer → 200/401 视为支持
-2. **自动标记 Responses**：OpenAI 成功则同时标记
+2. **独立探测 Responses**：`POST {url}/v1/responses` + Bearer → 非 5xx
 3. **嗅探 Anthropic**：`POST {url}/v1/messages` + x-api-key
 4. **嗅探 Gemini**：`POST {url}/v1/models/gemini-pro:generateContent`
 5. **汇总**：至少 1 个模型 → 提示确认 → 写入 SQLite
@@ -336,7 +338,7 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 - 上游仅支持 openai，下游按 Gemini 接入 → 经 OpenAI 翻译后转发
 - 上游支持 openai，下游按 Responses 接入 → 透传（Responses 与 OpenAI 共享）
 
-### `show` 输出示例
+### `query` 输出示例
 
 ```
 🔍 代理配置详情:
@@ -359,11 +361,14 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 
 ### 数据库文件位置
 
+数据库文件位于 `~/.agent-proxy/proxies.db`（SQLite 单文件）：
+
 | 平台 | 路径 |
 |------|------|
 | Windows | `%USERPROFILE%\.agent-proxy\proxies.db` |
 | macOS / Linux | `~/.agent-proxy/proxies.db` |
-| 自定义 | `--dbpath /path/to/custom.db` |
+
+> Key 以明文存储在 SQLite 中。不要将 `.db` 文件上传到公开仓库。
 
 ---
 
@@ -496,7 +501,6 @@ http://localhost:8080/ui
 |------|--------|------|
 | `AGENT_PROXY_API_KEY` | — | 主代理 API Key |
 | `ANTHROPIC_API_KEY` | — | Anthropic API Key |
-| `AGENT_PROXY_DB_PATH` | `~/.agent-proxy/proxies.db` | 数据库路径覆盖 |
 
 ### 限流配置
 
@@ -554,8 +558,8 @@ curl -H "Authorization: Bearer $env:AGENT_PROXY_API_KEY" https://api.example.com
 ```
 原因：DB 为空或 ID 不存在
 解决：
-  .\agent-proxy.exe list   # 查看现有记录
-  .\agent-proxy.exe add    # 添加新记录
+  .\agent-proxy.exe db query   # 查看现有记录
+  .\agent-proxy.exe db add     # 添加新记录
 ```
 
 ### 问题 4：端口被占用
