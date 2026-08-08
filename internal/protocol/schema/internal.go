@@ -43,13 +43,15 @@ const (
 //   - Gemini 的 parts 是 []Part（又是另一套结构）
 // 在 Central Schema 保留原始 JSON 最安全，翻译时按需解组
 type InternalMessage struct {
-	Role      Role               `json:"role"`
-	Content   json.RawMessage    `json:"content,omitempty"`
-	ToolCalls []InternalToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string            `json:"tool_call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	// Metadata 用于保存协议特有但需要跨协议传递的信息
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	Role     Role               `json:"role"`
+	Content  json.RawMessage    `json:"content,omitempty"`
+	// ContentBlocks 存储入站翻译器解析出的多模态内容块（text + image），
+	// 出站时优先使用此字段还原图片内容块，确保图片不丢失。纯文本消息为 nil。
+	ContentBlocks []InternalContentBlock `json:"content_blocks,omitempty"`
+	ToolCalls   []InternalToolCall `json:"tool_calls,omitempty"`
+	ToolCallID  string            `json:"tool_call_id,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // ─── 内容块 (多模态) ─────────────────────────────────────────────────
