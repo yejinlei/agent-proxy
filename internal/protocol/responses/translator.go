@@ -78,7 +78,7 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	// --- 1. Instructions → SystemPrompt ---
 	var systemContent json.RawMessage
 	if req.Instructions != "" {
-		systemContent = json.RawMessage(`"` + req.Instructions + `"`)
+		systemContent, _ = json.Marshal(req.Instructions)
 	}
 
 	// --- 2. Input → Messages ---
@@ -156,7 +156,7 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 			}
 			text = joinText(textParts)
 		}
-		msg.Content = json.RawMessage(`"` + text + `"`)
+		msg.Content, _ = json.Marshal(text)
 
 		// Tool calls
 		for _, tc := range item.ToolCalls {
@@ -521,7 +521,7 @@ func (t *ResponsesTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 		choiceMessage.ToolCalls = toolCalls
 	}
 
-	choiceMessage.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
 
 	var usage *schema.InternalUsage
 	if resp.Usage != nil {
@@ -603,7 +603,7 @@ func (t *ResponsesTranslator) TranslateStreamEvent(event *StreamEvent) *schema.I
 							Index: data.OutputIndex,
 							Message: schema.InternalMessage{
 								Role:    schema.RoleAssistant,
-								Content: json.RawMessage(`"` + data.Delta.Text + `"`),
+								Content: func() json.RawMessage { b, _ := json.Marshal(data.Delta.Text); return b }(),
 							},
 						},
 					},
@@ -707,7 +707,7 @@ func (t *ResponsesTranslator) translateOutputDelta(data *EventData) *schema.Inte
 					Index: data.OutputIndex,
 					Message: schema.InternalMessage{
 						Role:    schema.RoleAssistant,
-						Content: json.RawMessage(`"` + deltaText + `"`),
+						Content: func() json.RawMessage { b, _ := json.Marshal(deltaText); return b }(),
 					},
 				},
 			},

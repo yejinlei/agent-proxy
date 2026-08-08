@@ -458,12 +458,11 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 			if msg.Content != nil {
 				json.Unmarshal(msg.Content, &contentText)
 			}
-			escaped := strings.ReplaceAll(contentText, `"`, `\"`)
 			toolContent, _ := json.Marshal([]ContentBlock{
 				{
 					Type:      "tool_result",
 					ToolUseID: msg.ToolCallID,
-					Content:   json.RawMessage(`[{"type":"text","text":"` + escaped + `"}]`),
+					Content:   func() json.RawMessage { b, _ := json.Marshal([]ContentBlock{{Type: "text", Text: contentText}}); return b }(),
 				},
 			})
 			result = append(result, Message{
@@ -479,7 +478,7 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 			}
 			result = append(result, Message{
 				Role:    "user",
-				Content: json.RawMessage(`"` + text + `"`),
+				Content: func() json.RawMessage { b, _ := json.Marshal(text); return b }(),
 			})
 		}
 	}
