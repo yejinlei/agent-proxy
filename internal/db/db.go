@@ -28,6 +28,7 @@ type ProxyRecord struct {
 	CapabilitiesJSON string  `db:"capabilities_json"` // JSON: ["openai","anthropic","gemini","responses"]
 	ModelsMapJSON    string  `db:"models_map_json"`   // JSON: {"openai":["gpt-4"],"anthropic":["claude-3"]}
 	Weight         int       `db:"weight"`
+
 	CreatedAt      time.Time `db:"created_at"`
 }
 
@@ -77,7 +78,18 @@ func (r *ProxyRecord) HasCapability(proto string) bool {
 	return slices.Contains(r.Capabilities(), proto)
 }
 
-// TotalModelCount 返回所有协议下检测到的模型总数
+// ModelsMap 解析 models_map_json 为 map[string][]string
+func (r *ProxyRecord) ModelsMap() map[string][]string {
+	var m map[string][]string
+	if r.ModelsMapJSON == "" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(r.ModelsMapJSON), &m); err != nil {
+		return nil
+	}
+	return m
+}
+// 返回所有协议下检测到的模型总数
 func (r *ProxyRecord) TotalModelCount() int {
 	if r.ModelsMapJSON != "" {
 		var m map[string][]string

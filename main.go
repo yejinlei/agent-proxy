@@ -352,7 +352,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Han
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), 60, clientKey, clientKeyEnabled, verboseLevel)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 60, clientKey, clientKeyEnabled, verboseLevel)
 	return quick.Routes(), nil
 }
 

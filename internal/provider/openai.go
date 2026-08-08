@@ -262,6 +262,7 @@ func (c *AnthropicClient) BaseURL() string { return c.baseURL }
 func (c *AnthropicClient) DefaultHeaders(info *schema.ProviderInfo) http.Header {
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")
+	headers.Set("Authorization", "Bearer "+info.APIToken)
 	headers.Set("x-api-key", info.APIToken)
 	headers.Set("anthropic-version", c.apiVersion)
 	headers.Set("Accept", "application/json")
