@@ -135,7 +135,7 @@ func messageToInternal(msg Message) (schema.InternalMessage, error) {
 		}
 	}
 
-	im.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+	im.Content, _ = json.Marshal(joinText(textParts))
 	if len(toolCalls) > 0 {
 		im.ToolCalls = toolCalls
 	}
@@ -191,14 +191,14 @@ func messagesToInternal(msg Message) ([]schema.InternalMessage, error) {
 			}
 			result = append(result, schema.InternalMessage{
 				Role:       schema.RoleTool,
-				Content:    json.RawMessage(`"` + contentText + `"`),
+				Content:    func() json.RawMessage { b, _ := json.Marshal(contentText); return b }(),
 				ToolCallID: block.ToolUseID,
 			})
 		}
 	}
 
 	if userMsg != nil {
-		userMsg.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+		userMsg.Content, _ = json.Marshal(strings.Join(textParts, "\n"))
 		result = append(result, *userMsg)
 	}
 
@@ -574,7 +574,7 @@ func (t *AnthropicTranslator) TranslateFromProvider(raw json.RawMessage) (*schem
 		choiceMessage.ToolCalls = toolCalls
 	}
 
-	choiceMessage.Content = json.RawMessage(`"` + joinText(textParts) + `"`)
+	choiceMessage.Content, _ = json.Marshal(joinText(textParts))
 
 	var usage *schema.InternalUsage
 	if resp.Usage != nil {
@@ -653,7 +653,7 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 						Index: event.Index,
 						Message: schema.InternalMessage{
 							Role:    schema.RoleAssistant,
-							Content: json.RawMessage(`"` + deltaText + `"`),
+							Content: func() json.RawMessage { b, _ := json.Marshal(deltaText); return b }(),
 						},
 					},
 				},

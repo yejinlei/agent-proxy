@@ -598,8 +598,12 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 						},
 					})
 				}
+				eventType := "delta"
+				if choice.FinishReason != "" {
+					eventType = "done"
+				}
 				events <- schema.InternalStreamEvent{
-					Type: "delta",
+					Type: eventType,
 					Data: &schema.InternalStreamChunk{
 						ID:    ccChunk.ID,
 						Model: ccChunk.Model,
