@@ -212,7 +212,8 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 
 	if normalizedIngress == providerType && model != "" {
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
-		if quickDetectStream(body) {
+		stream := quickDetectStream(body)
+		if stream {
 			q.handlePassthroughStream(p, ctx, w, r, model, startTime)
 		} else {
 			q.handlePassthroughNonStream(p, ctx, w, r, model, startTime)
@@ -422,7 +423,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			lastUsage = usage
 		}
 		w.Write(line)
-		w.Write([]byte("\n"))
+		w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 		flusher.Flush()
 	}
 
