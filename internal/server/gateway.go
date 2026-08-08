@@ -541,8 +541,12 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 						},
 					})
 				}
-				events <- schema.InternalStreamEvent{
-					Type: "delta",
+				eventType := "delta"
+					if choice.FinishReason != "" {
+						eventType = "done"
+					}
+					events <- schema.InternalStreamEvent{
+						Type: eventType,
 					Data: &schema.InternalStreamChunk{
 						ID:    ccChunk.ID,
 						Model: ccChunk.Model,
