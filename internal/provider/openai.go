@@ -151,7 +151,7 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		// 上游返回错误状态码时，不解析为 SSE，直接转为一条错误事件并关闭 channel
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-			errSSE, _ := json.Marshal(map[string]interface{}{
+			errSSE, _ := json.Marshal(map[string]any{
 				"_type":    "error",
 				"_status":  resp.StatusCode,
 				"data":     string(errBody),
