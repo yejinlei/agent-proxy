@@ -850,17 +850,25 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(bodyBytes, &resp2)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+		// 收集上游模型ID
+		upstreamModels := make(map[string]bool)
+		for _, m := range resp2.Data {
+			upstreamModels[m.ID] = true
+		}
+
+		// 第一部分：上游真实模型
+		fmt.Fprintln(w, "=== 上游模型 ===")
 		for _, m := range resp2.Data {
 			fmt.Fprintln(w, m.ID)
 		}
-		// 追加别名映射
-		if q.aliasFile != nil {
+
+		// 第二部分：别名映射表
+		if q.aliasFile != nil && len(q.aliasFile.Entries()) > 0 {
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "=== 别名映射 ===")
 			for alias, target := range q.aliasFile.Entries() {
-				if alias == target {
-					fmt.Fprintln(w, alias)
-				} else {
-					fmt.Fprintf(w, "%s <-> %s\n", alias, target)
-				}
+				fmt.Fprintf(w, "%s <-> %s\n", alias, target)
 			}
 		}
 		return
