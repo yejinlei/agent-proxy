@@ -818,7 +818,12 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		q.sendError(w, http.StatusInternalServerError, "proxy_error", err.Error())
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+q.proxyKey)
+	// 支持 ?key= 查询参数覆盖 proxyKey，方便浏览器直接测试
+	apiKey := r.URL.Query().Get("key")
+	if apiKey == "" {
+		apiKey = q.proxyKey
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
