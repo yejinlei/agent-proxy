@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -79,13 +80,16 @@ func (c *OpenAIClient) Endpoint(model string, stream bool) (method string, url s
 }
 
 func (c *OpenAIClient) Call(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (body json.RawMessage, headers http.Header, err error) {
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, info.Name, false), bytes.NewReader(req))
+	url := c.BuildURL(info, info.Name, false)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	headers = c.DefaultHeaders(info)
 	httpReq.Header = headers
+
+	log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -152,9 +156,9 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			errSSE, _ := json.Marshal(map[string]any{
-				"_type":    "error",
-				"_status":  resp.StatusCode,
-				"data":     string(errBody),
+				"_type":   "error",
+				"_status": resp.StatusCode,
+				"data":    string(errBody),
 			})
 			linesCh <- errSSE
 			return
@@ -344,9 +348,9 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			errSSE, _ := json.Marshal(map[string]interface{}{
-				"_type":    "error",
-				"_status":  resp.StatusCode,
-				"data":     string(errBody),
+				"_type":   "error",
+				"_status": resp.StatusCode,
+				"data":    string(errBody),
 			})
 			linesCh <- errSSE
 			return
@@ -495,9 +499,9 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			errSSE, _ := json.Marshal(map[string]interface{}{
-				"_type":    "error",
-				"_status":  resp.StatusCode,
-				"data":     string(errBody),
+				"_type":   "error",
+				"_status": resp.StatusCode,
+				"data":    string(errBody),
 			})
 			linesCh <- errSSE
 			return
