@@ -467,57 +467,72 @@ func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.P
 }
 
 // quickReplaceModelInBody 将请求体 JSON 中的 model 字段从 from 替换为 to
-// 同时兼容 Anthropic 根 model、OpenAI model、Responses input[].model、Gemini URL 中
-// 含 model 等情况。仅当 model 字段存在且等于 from（大小写敏感）时才替换。
+// 使用字符串替换而非 JSON 重新序列化，保持原始 JSON 结构（字段顺序、缩进、数字类型）不变。
 func quickReplaceModelInBody(body json.RawMessage, from, to string) json.RawMessage {
 	if from == "" || to == "" || from == to {
 		return body
 	}
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
-		return body
+	s := string(body)
+	// 尝试 "model": "from" 格式（带空格）
+	old := `"model": "` + from + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model": "`+to+`"`, 1))
 	}
-	changed := false
-	if v, ok := m["model"]; ok {
-		if s, ok := v.(string); ok && s == from {
-			m["model"] = to
-			changed = true
-		}
+	// 尝试 "model":"from" 格式（无空格）
+	old = `"model":"` + from + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model":"`+to+`"`, 1))
 	}
-	if !changed {
-		return body
-	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		return body
-	}
-	return out
+	return body
 }
 
 // echoAliasInResponse 将响应 JSON 中的 model 字段回显为客户端原始模型名
+// 使用字符串替换，保持原始 JSON 结构不变。
 func (q *QuickGateway) echoAliasInResponse(resp json.RawMessage, aliasModel string) json.RawMessage {
-	var m map[string]interface{}
-	if json.Unmarshal(resp, &m) != nil {
+	if aliasModel == "" {
 		return resp
 	}
-	if aliasModel != "" {
-		m["model"] = aliasModel
+	// 快速解析当前 model 值
+	var cur struct {
+		Model string `json:"model"`
 	}
-	out, _ := json.Marshal(m)
-	return out
+	if json.Unmarshal(resp, &cur) != nil || cur.Model == "" {
+		return resp
+	}
+	s := string(resp)
+	old := `"model": "` + cur.Model + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model": "`+aliasModel+`"`, 1))
+	}
+	old = `"model":"` + cur.Model + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model":"`+aliasModel+`"`, 1))
+	}
+	return resp
 }
 
 // echoAliasInStreamLine 将流式 SSE 行中的 model 字段回显为客户端原始模型名
+// 使用字符串替换，保持原始 JSON 结构不变。
 func (q *QuickGateway) echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
-	var m map[string]interface{}
-	if json.Unmarshal(line, &m) != nil {
+	if aliasModel == "" {
 		return line
 	}
-	if aliasModel != "" {
-		m["model"] = aliasModel
+	var cur struct {
+		Model string `json:"model"`
 	}
-	out, _ := json.Marshal(m)
-	return out
+	if json.Unmarshal(line, &cur) != nil || cur.Model == "" {
+		return line
+	}
+	s := string(line)
+	old := `"model": "` + cur.Model + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model": "`+aliasModel+`"`, 1))
+	}
+	old = `"model":"` + cur.Model + `"`
+	if strings.Contains(s, old) {
+		return json.RawMessage(strings.Replace(s, old, `"model":"`+aliasModel+`"`, 1))
+	}
+	return line
 }
 
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
