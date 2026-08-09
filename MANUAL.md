@@ -2,74 +2,58 @@
 
 ## 目录
 
-1. [概述](#概述)
+1. [功能概览](#功能概览)
 2. [安装](#安装)
 3. [快速模式使用](#快速模式使用)
 4. [复杂模式使用](#复杂模式使用)
 5. [CLI 命令参考](#cli-命令参考)
-6. [客户端认证](#客户端认证)
-7. [协议兼容性详解](#协议兼容性详解)
-8. [Web UI 使用](#web-ui-使用)
-9. [高级配置](#高级配置)
-10. [故障排查](#故障排查)
-11. [扩展开发](#扩展开发)
+6. [模型别名映射](#模型别名映射)
+7. [客户端认证](#客户端认证)
+8. [协议兼容性详解](#协议兼容性详解)
+9. [-v / -vv 日志](#v--vv-日志)
+10. [Web UI 使用](#web-ui-使用)
+11. [高级配置](#高级配置)
+12. [故障排查](#故障排查)
+13. [扩展开发](#扩展开发)
 
----
+***
 
-## 概述
+## 功能概览
 
-agent-proxy 是一个 **4×4 全协议互转** 的 AI 消息协议网关，提供两种启动模式：
+- **4×4 协议互转**：OpenAI Compatible / Anthropic Messages / Google Gemini / OpenAI Responses — 任意入站可转任意出站，协议匹配时零开销透传
+- **模型别名映射**：三层加载策略（CLI `--aliases` > 同目录 `model-aliases.yaml` > 代码内置 `DefaultAliases()`），64 个内置假模型名 + `_default_=@default` 动态上游路由，支持 `@db:<id>,<model>` 引用 DB 记录
+- **双向模型名替换**：请求体 `model` 字段（假模型 → 真实上游模型）+ 响应体 / SSE 每行（真实模型 → 回显客户端假模型名），客户端始终无感知
+- **单二进制**：纯 Go 编译，内嵌 SQLite（`modernc.org/sqlite`），无外部依赖、无 CGO
+- **两种启动模式**：快速模式（`run --db`，从 SQLite 选一条记录立即启动）+ 复杂模式（`run --mode complex`，多 Provider + 路由 + Web UI）
+- **智能嗅探**：`db add` / `detect` 自动探测上游 4 种协议能力和模型列表，交互确认后入库
+- **快速模式客户端认证**：三选一（随机生成 48 位 hex / `--key` 固定 / `--nokey` 免密钥），`/v1/models` 额外支持 `?key=<clientKey>` URL 参数，便于浏览器直接访问
+- **两级日志**：`-v` 摘要（IP / 协议 / 模型 / 状态 / 耗时 / Token），`-vv` 四向全链路（入站 / 上游请求 / 上游响应 / 出站）
+- **Web UI**：复杂模式 `/ui`，深色主题面板 — 指标卡片、Provider 状态圆点、60 秒 QPS + 延迟趋势图、SSE 实时请求日志
 
-```
-┌── 快速模式（--mode simple）── 从 SQLite 选一条记录，立即启动 ──┐
-│  命令: agent-proxy run --mode simple --db 1                     │
-│  适用：单一端点、快速试用、脚本调用                               │
-│  特点：零配置、开箱即用、4×4 协议自动识别与互转                   │
-└────────────────────────────────────────────────────────────────┘
-
-┌── 复杂模式（--mode complex）── 多 Provider、路由、Web UI ──┐
-│  命令: agent-proxy run --mode complex                          │
-│        agent-proxy run --mode complex --conf config.json       │
-│  适用：生产环境、多厂商调度、需要监控                           │
-│  特点：路由前缀匹配、限流、实时指标、4×4 全协议互转、美观面板   │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### 4×4 全协议互转
-
-OpenAI Compatible、Anthropic Messages、Google Gemini、OpenAI Responses **任意入站可转任意出站**：
-
-| 入站 ↓ \ 出站 → | OpenAI Compatible | Anthropic Messages | Google Gemini | OpenAI Responses |
-|----------------|------------------|-------------------|---------------|-----------------|
-| OpenAI Compatible | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 |
-| Anthropic Messages | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 | ✅ 双向翻译 |
-| Google Gemini | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 | ✅ 双向翻译 |
-| OpenAI Responses | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 双向翻译 | ✅ 透传 |
-
-### 核心设计
-
-- **Central Schema 中枢模型**：定义与所有外部协议无关的统一消息结构
-- **CombinedTranslator 接口**：每个协议实现 `TranslateRequest` / `TranslateResponse` / `TranslateStream` 双向翻译
-- **Provider 统一接口**：`Call()` / `CallStream()` 屏蔽下游差异
-
----
+***
 
 ## 安装
 
-### 二进制
+### 方式一：使用编译好的可执行文件
 
-直接运行 `agent-proxy` 或 `agent-proxy.exe`，无需额外依赖：
+从 GitHub Release 下载对应平台的裸二进制（不打包 ZIP），直接运行：
 
 ```powershell
-# 确认运行正常
 .\agent-proxy.exe --help
 ```
 
-### 从源码编译
+每个 Release 附带 `sha256sums.txt`，下载后建议校验：
+
+```powershell
+Get-FileHash .\agent-proxy-windows-amd64.exe -Algorithm SHA256
+# 与 sha256sums.txt 中对应条目对比
+```
+
+### 方式二：从源码编译
 
 ```powershell
 go mod download
-go build -o agent-proxy .
+go build -trimpath -ldflags "-s -w" -o agent-proxy.exe .
 ```
 
 依赖：
@@ -77,112 +61,49 @@ go build -o agent-proxy .
 | 包 | 用途 |
 |----|------|
 | `github.com/go-chi/chi/v5` | HTTP 路由 |
-| `modernc.org/sqlite` | 纯 Go SQLite（无需系统库） |
+| `modernc.org/sqlite` | 纯 Go SQLite（无需 CGO / 系统库） |
 
----
+跨平台编译参考 README 的「编译」章节。
+
+***
 
 ## 快速模式使用
 
 ### 30 秒上手
 
 ```powershell
-# ① 嗅探并添加代理（自动探测所有支持的协议）
-agent-proxy db add --url https://token.sensenova.cn/v1 \
-                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
-                   --name sensenova
-# 等价别名
-agent-proxy detect --url https://token.sensenova.cn/v1 \
-                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf \
+# ① 嗅探并添加代理（自动探测所有协议和模型，交互确认入库）
+agent-proxy db add --url https://token.sensenova.cn/v1 ^
+                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf ^
                    --name sensenova
 
-# ② 快速模式启动（--nokey 本地开发无需客户端密钥）
-agent-proxy run --db 1 --nokey
+# ② 快速模式启动（--nokey 本地开发，无需客户端认证）
+agent-proxy run --db 1 --nokey -v
 
-# ③ 使用任意入站协议调用（4 种协议全支持，自动翻译到下游）
-# 3a. OpenAI Compatible 入站
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hello"}]}'
+# ③ 任意协议调用（启动后 4 种协议入口同时可用）
+# 3a. OpenAI Compatible — 直接写假模型名 o1，自动映射到上游真实模型
+curl -X POST http://localhost:8080/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d '{"model":"o1","messages":[{"role":"user","content":"hello"}]}'
 
-# 3b. Anthropic Messages 入站
-curl -X POST http://localhost:8080/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"sensenova-6.7-flash-lite","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
+# 3b. Anthropic Messages — gpt-5 同样是假模型名
+curl -X POST http://localhost:8080/v1/messages ^
+  -H "Content-Type: application/json" ^
+  -H "x-api-key: dummy" ^
+  -d '{"model":"gpt-5","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
 
-# 3c. Google Gemini 入站
-curl -X POST "http://localhost:8080/v1/models/sensenova-6.7-flash-lite:generateContent" \
-  -H "Content-Type: application/json" \
+# 3c. Google Gemini — vmodel 是内置占位假模型
+curl -X POST "http://localhost:8080/v1/models/vmodel:generateContent" ^
+  -H "Content-Type: application/json" ^
   -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
 
-# 3d. OpenAI Responses 入站
-curl -X POST http://localhost:8080/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model":"sensenova-6.7-flash-lite","input":[{"type":"message","role":"user","content":"hello"}]}'
-```
-
-> **注意**：以上 curl 示例省略了 `Authorization` 头，因为启动时使用了 `--nokey`。默认情况下快速模式会要求客户端认证，详见下方[客户端认证](#客户端认证)章节。
-
-### 客户端认证
-
-快速模式默认要求客户端通过 `Authorization: Bearer <key>` 头认证后才能连接。三种使用方式：
-
-#### 方式一：随机生成密钥（默认）
-
-不传 `--key` 也不传 `--nokey`，启动时自动随机生成一个 48 位 hex 密钥并打印到控制台：
-
-```powershell
-agent-proxy run --db 1
-```
-
-```
-🚀 Agent-Proxy (快速模式) running on http://127.0.0.1:8080
-🔑 Proxy Key:      sk-a1b2c3d4e5f6...
-🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
-```
-
-```powershell
-curl -X POST http://localhost:8080/v1/chat/completions ^
-  -H "Authorization: Bearer sk-a1b2c3d4e5f6..." ^
+# 3d. OpenAI Responses
+curl -X POST http://localhost:8080/v1/responses ^
   -H "Content-Type: application/json" ^
-  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-sonnet-5","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
-> 密钥每次重启都会变化，适合本地临时使用。如需固定密钥请用方式二。
-
-#### 方式二：指定固定密钥
-
-```powershell
-agent-proxy run --db 1 --key sk-my-fixed-key
-```
-
-客户端连接时使用同一个 `sk-my-fixed-key`。
-
-#### 方式三：无需密钥（本地开发用）
-
-```powershell
-agent-proxy run --db 1 --nokey
-```
-
-任何客户端均可直接连接，无需 `Authorization` 头。**不要在生产环境使用此模式。**
-
-```powershell
-curl -X POST http://localhost:8080/v1/chat/completions ^
-  -H "Content-Type: application/json" ^
-  -d '{"model":"sensenova-6.7-flash-lite","messages":[{"role":"user","content":"hi"}]}'
-```
-
-#### 认证行为说明
-
-| 标志 | 密钥来源 | 客户端是否需要 `Authorization` 头 | 适用场景 |
-|------|---------|----------------------------------|---------|
-| （不传） | 随机生成 | ✅ 需要 | 本地临时使用、快速试用 |
-| `--key <k>` | 指定值 | ✅ 需要 | 固定环境、自动化脚本 |
-| `--nokey` | 无 | ❌ 不需要 | 本地开发、内网直连 |
-
-- 缺密钥或密钥错误时返回 `401 Unauthorized`，响应体为标准错误格式（`error.type`, `error.message`）
-- `/health` 端点始终**不受认证影响**，可用于健康检查或负载均衡探测
-- 未认证的请求会被拒绝，不会到达下游 Provider
+> 以上 `o1` / `gpt-5` / `vmodel` / `claude-sonnet-5` 都是假模型名，agent-proxy 根据别名映射算法自动替换为上游真实模型。
 
 ### 数据库存储
 
@@ -190,37 +111,42 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
 
 ```sql
 CREATE TABLE proxies (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  name            TEXT NOT NULL DEFAULT '',
-  url             TEXT NOT NULL,
-  key             TEXT NOT NULL,
-  provider_type   TEXT NOT NULL DEFAULT 'openai',
-  detected_format TEXT,
-  openai_cap      INTEGER NOT NULL DEFAULT 0,
-  anthropic_cap   INTEGER NOT NULL DEFAULT 0,
-  model_count     INTEGER NOT NULL DEFAULT 0,
-  models_json     TEXT,
-  capabilities_json TEXT,   -- 嗅探到的所有协议 ["openai","anthropic","gemini","responses"]
-  models_map_json   TEXT,   -- 每协议模型 {"openai":["gpt-4"],"anthropic":["claude-3"]}
-  weight          INTEGER NOT NULL DEFAULT 100,
-  created_at      TEXT NOT NULL
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  name              TEXT NOT NULL DEFAULT '',
+  url               TEXT NOT NULL,
+  key               TEXT NOT NULL,
+  provider_type     TEXT NOT NULL DEFAULT 'openai',
+  detected_format   TEXT,
+  openai_cap        INTEGER NOT NULL DEFAULT 0,
+  anthropic_cap     INTEGER NOT NULL DEFAULT 0,
+  model_count       INTEGER NOT NULL DEFAULT 0,
+  models_json       TEXT,
+  capabilities_json TEXT,   -- 嗅探到的协议 ["openai","anthropic","gemini","responses"]
+  models_map_json   TEXT,   -- 每协议模型 {"openai":[...],"anthropic":[...]}
+  weight            INTEGER NOT NULL DEFAULT 100,
+  created_at        TEXT NOT NULL
 );
 ```
 
+| 平台 | 数据库路径 |
+|------|-----------|
+| Windows | `%USERPROFILE%\.agent-proxy\proxies.db` |
+| macOS / Linux | `~/.agent-proxy/proxies.db` |
+
 > **安全提示**：Key 以明文存储在 SQLite 中。不要将 `.db` 文件上传到公开仓库。
 
-### 多 Provider 快速模式
+### 多 Provider 说明
 
-快速模式**只支持一条记录**。如需多 Provider 调度，使用复杂模式。
+快速模式只支持从 DB 选**一条记录**启动。如需多 Provider 调度、路由前缀匹配、Web UI 实时监控，请使用复杂模式。
 
----
+***
 
 ## 复杂模式使用
 
 ### 默认配置启动
 
 ```powershell
-# 设置主代理 Key
+# 设置主代理 Key（复杂模式默认从环境变量读取）
 $env:AGENT_PROXY_API_KEY = "sk-your-key-here"
 
 # 复杂模式启动
@@ -238,10 +164,10 @@ agent-proxy run --mode complex --host 0.0.0.0 --port 8080
 ### 配置文件启动
 
 ```powershell
-agent-proxy run --mode complex --host 0.0.0.0 --port 8080 --conf config.json
+agent-proxy run --mode complex --host 0.0.0.0 --port 8080 --conf agent-proxy.yaml
 ```
 
-配置文件示例见 `config.example.json`。
+配置模板参考仓库根目录下的 `agent-proxy.yaml`。
 
 ### 自定义监听地址
 
@@ -249,9 +175,9 @@ agent-proxy run --mode complex --host 0.0.0.0 --port 8080 --conf config.json
 agent-proxy run --mode complex --host 127.0.0.1 --port 9090
 ```
 
-### 多 Provider 配置
+### 多 Provider 配置（代码级）
 
-在 `main.go` 中修改 `startComplexMode()` 函数：
+在 `main.go` 的 `startComplexMode()` 函数中注册：
 
 ```go
 cfg.Providers["my-provider"] = &config.ProviderConfig{
@@ -265,7 +191,7 @@ cfg.Providers["my-provider"] = &config.ProviderConfig{
 }
 ```
 
-### 模型路由
+### 模型路由（复杂模式）
 
 ```go
 cfg.ModelRouter.ModelToProvider = map[string]string{
@@ -275,9 +201,11 @@ cfg.ModelRouter.ModelToProvider = map[string]string{
 cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 ```
 
-匹配逻辑：遍历路由表，前缀匹配 → 精确匹配 → 默认 Provider。
+匹配逻辑：遍历路由表，**前缀匹配 → 精确匹配 → 默认 Provider**。
 
----
+路由前缀访问路径：`/p/<name>/v1/chat/completions`。
+
+***
 
 ## CLI 命令参考
 
@@ -285,63 +213,50 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 
 | 命令 | 说明 |
 |------|------|
-| `agent-proxy run --db <id>` | 快速模式（默认，随机密钥） |
-| `agent-proxy run --db <id> --key <k>` | 快速模式（指定密钥） |
-| `agent-proxy run --db <id> --nokey` | 快速模式（无需密钥） |
+| `agent-proxy run --db <id>` | 快速模式（随机密钥，默认启动方式） |
+| `agent-proxy run --db <id> --key <k>` | 快速模式（指定固定密钥） |
+| `agent-proxy run --db <id> --nokey` | 快速模式（免密钥，本地开发用） |
+| `agent-proxy run --mode simple --db 1` | 快速模式（显式指定 mode） |
 | `agent-proxy run --mode complex --host 0.0.0.0 --port 8080` | 复杂模式（默认配置） |
-| `agent-proxy run --mode complex --conf config.json` | 复杂模式 + 配置文件 |
-| `agent-proxy run --mode simple --host 0.0.0.0 --port 8080 --db 1` | 快速模式 |
+| `agent-proxy run --mode complex --conf agent-proxy.yaml` | 复杂模式 + 配置文件 |
+| `agent-proxy run --db 1 -v` / `-vv` | 追加日志级别（摘要 / 四向全链路） |
 | `agent-proxy --help` | 显示帮助 |
 
-### DB 管理
+### db 管理
 
 | 命令 | 示例 | 说明 |
 |------|------|------|
-| `db query` | `agent-proxy db query` | 列出所有代理 |
-| `db query` | `agent-proxy db query 1` | 查看 ID=1 详情 |
-| `db find` | `agent-proxy db find sensenova` | 按关键词搜索（匹配名称 / URL / 协议 / 模型） |
-| `db add` / `db detect` | `agent-proxy db add --url <url> --key <key> [--name <n>]` | 嗅探并添加（自动探测所有协议，确认后写入） |
-| `db check` | `agent-proxy db check` | 核对所有代理有效性（重新嗅探，提示删除无效记录） |
-| `db rm` | `agent-proxy db rm 1` | 删除记录 |
+| `db query` | `agent-proxy db query` | 列出所有代理（id / 名称 / URL / 能力 / 模型数） |
+| `db query` | `agent-proxy db query 1` | 查看 ID=1 详情（含完整协议能力和模型列表） |
+| `db find` | `agent-proxy db find sensenova` | 关键词搜索（匹配名称 / URL / 协议 / 模型） |
+| `db add` | `agent-proxy db add --url <u> --key <k> [--name <n>]` | 嗅探并新增（4 协议自动探测，交互确认入库） |
+| `detect` | `agent-proxy detect --url <u> --key <k>` | `db add` 的兼容别名 |
+| `db check` | `agent-proxy db check` | 核对所有代理有效性（重新嗅探，提示删除失效记录） |
+| `db rm` | `agent-proxy db rm 1` | 删除指定记录 |
 
-### `add` / `detect` 参数详解
+### `db add` / `detect` 参数详解
 
 | 参数 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
-| `--url` | — | ✅ | API 地址，如 `https://api.example.com/v1` |
-| `--key` | — | ✅ | API Key |
-| `--name` | URL 值 | 否 | 友好名称 |
+| `--url` | — | ✅ | 上游 API 地址，如 `https://token.sensenova.cn/v1`（不带尾斜杠，不要含重复 `/v1`） |
+| `--key` | — | ✅ | 上游 API Key（存 DB 明文，注意安全） |
+| `--name` | URL 值 | 否 | 友好名称，用于 `db query` 显示 |
 
-`--type` 参数已废弃（协议由嗅探自动确定）。
+`--type` 参数已废弃，协议由嗅探自动确定。
 
-添加时自动执行：
+**嗅探步骤**：
 
-1. **嗅探 OpenAI**：`GET {url}/v1/models` + Bearer → 200/401 视为支持
-2. **独立探测 Responses**：`POST {url}/v1/responses` + Bearer → 非 5xx
-3. **嗅探 Anthropic**：`POST {url}/v1/messages` + x-api-key
-4. **嗅探 Gemini**：`POST {url}/v1/models/gemini-pro:generateContent`
-5. **汇总**：至少 1 个模型 → 提示确认 → 写入 SQLite
-6. **失败**：0 模型 → 直接报告失败，不提示
+1. `GET {url}/v1/models` + `Authorization: Bearer <key>` — 探测 OpenAI 协议和模型列表
+2. `POST {url}/v1/responses` + `Authorization: Bearer <key>` — 独立探测 Responses 协议
+3. `POST {url}/v1/messages` + `x-api-key: <key>` — 探测 Anthropic 协议
+4. `POST {url}/v1/models/gemini-pro:generateContent` — 探测 Gemini 协议
+5. 至少 1 个协议命中有模型 → 交互提示确认 → 写入 SQLite
+6. 0 模型 → 直接报告失败，不提示
 
-### 协议感知路由
-
-启动快速模式后，每个入站请求按以下逻辑路由：
+### `db query <id>` 输出示例
 
 ```
-入站协议 → normalizeIngress → selectProtocol(capabilities)
-  - 命中 capabilities → 透传（零开销转发）
-  - 未命中          → 回退到 OpenAI 协议转换
-```
-
-示例：
-- 上游支持 openai + anthropic，下游按 Anthropic `/v1/messages` 接入 → **透传**
-- 上游仅支持 openai，下游按 Gemini 接入 → 经 OpenAI 翻译后转发
-- 上游支持 openai，下游按 Responses 接入 → 透传（Responses 与 OpenAI 共享）
-
-### `query` 输出示例
-
-```
-🔍 代理配置详情:
+代理配置详情:
   ID:           1
   Name:         sensenova
   URL:          https://token.sensenova.cn/v1
@@ -359,24 +274,150 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
       4. sensenova-u1-fast
 ```
 
-### 数据库文件位置
+***
 
-数据库文件位于 `~/.agent-proxy/proxies.db`（SQLite 单文件）：
+## 模型别名映射
 
-| 平台 | 路径 |
+### 三层加载策略
+
+| 优先级 | 来源 | 行为 |
+|--------|------|------|
+| 1 | `--aliases <file>` | CLI 显式指定映射文件，优先级最高 |
+| 2 | 可执行文件同目录 `model-aliases.yaml` | 启动时自动检测并加载 |
+| 3 | 代码内置 `DefaultAliases()` | 64 个常见假模型名 + `_default_=@default` 兜底 |
+
+**合并规则**：高层存在时，**以内置 64 个别名为基础**，用高层条目覆盖。这样用户只需在 `model-aliases.yaml` 配 `_default_` 或少量别名，内置别名仍然生效。
+
+### 映射值语法
+
+| 语法 | 说明 |
 |------|------|
-| Windows | `%USERPROFILE%\.agent-proxy\proxies.db` |
-| macOS / Linux | `~/.agent-proxy/proxies.db` |
+| `@default` | 动态取上游 `/v1/models` 返回的第一个模型，换源自动适配 |
+| `@db:<id>,<model>` | 指定 DB 记录编号对应的模型 |
+| 纯字符串（如 `deepseek-v4-flash`） | 直接作为上游模型名使用 |
 
-> Key 以明文存储在 SQLite 中。不要将 `.db` 文件上传到公开仓库。
+`_default_` 是特殊 key：所有未单独配置具体目标的别名，统一走 `_default_` 的值。
 
----
+### 内置假模型名（64 个）
+
+涵盖品牌：Claude（16 个）/ Codex（3 个）/ GPT + o 系列（17 个）/ DeepSeek（3 个）/ Gemini（9 个）/ Qwen（10 个）/ Doubao（2 个）/ GLM（3 个）/ SenseNova（2 个），外加 `vmodel` 自定义占位。
+
+### 自定义映射示例（`model-aliases.yaml`）
+
+```yaml
+# ============ agent-proxy 模型别名映射样板 ============
+#
+# 加载优先级（高→低）：--aliases 指定文件 > 同目录 model-aliases.yaml > 代码内置 DefaultAliases()
+# 合并规则：以内置 64 个别名为基础，用当前文件条目覆盖。
+#
+# _default_ 是特殊 key：所有未单独写目标的别名，统一走 _default_ 的值。
+# 语法：
+#   @default                                动态取上游 /v1/models 第 1 个
+#   @db:<id>,<model>                        指定 DB 记录的某个模型
+#   deepseek-ai/deepseek-v4-flash-0731      直接写上游模型名
+
+# _default_:             deepseek-ai/deepseek-v4-flash-0731
+# claude-opus-4-5:       sensenova-6.7-flash-lite
+# my-custom-model:       @default
+```
+
+### 查看映射关系
+
+启动后访问 `/v1/models`（JSON）或 `/v1/models?simple=1`（纯文本，便于浏览器查看）。`/v1/models` 同时支持 `?key=<clientKey>` URL 参数和 `Authorization: Bearer` 头。
+
+```
+=== 上游模型 ===
+sensenova-6.7-flash-lite
+deepseek-v4-flash
+glm-5.2
+sensenova-u1-fast
+
+=== 别名映射 ===
+o1                 <-> deepseek-ai/deepseek-v4-flash-0731
+gpt-5              <-> deepseek-ai/deepseek-v4-flash-0731
+vmodel             <-> deepseek-ai/deepseek-v4-flash-0731
+claude-opus-4-5    <-> sensenova-6.7-flash-lite
+...
+```
+
+### 四向模型名替换
+
+别名映射**不仅仅改 URL 路径**，还作用于整个四向消息体 JSON：
+
+| 方向 | 替换 | 作用位置 |
+|------|------|---------|
+| 入站 → 上游（请求） | 假模型名 → 真实上游模型名 | 请求体 JSON 的 `model` 字段（透传非流式 / 流式 / 翻译链路 `internalReq.Model` 均覆盖） |
+| 上游 → 客户端（响应） | 真实模型名 → 客户端原始假模型名 | 非流式响应体 `model` 字段；流式 SSE 每行 `model` 字段 |
+
+客户端始终看到自己传入的假模型名，上游始终收到真实模型名，中间全链路自动替换。`@default` 首次解析时通过 `ensureModels` 懒加载上游 `/v1/models`，双重检查锁保证并发安全。
+
+***
+
+## 客户端认证
+
+快速模式默认要求客户端通过 `Authorization: Bearer <key>` 头认证。三种使用方式：
+
+### 方式一：随机生成密钥（默认）
+
+不传 `--key` 也不传 `--nokey`，启动时自动随机生成 48 位 hex 密钥并打印到控制台：
+
+```powershell
+agent-proxy run --db 1
+```
+
+```
+🚀 Agent-Proxy (快速模式) running on http://127.0.0.1:8080
+🔑 Proxy Key:      sk-a1b2c3d4e5f67890abcdef1234567890abcdef12...
+🔐 客户端需使用 Authorization: Bearer sk-a1b2c3d4e5f6... 连接
+```
+
+客户端调用：
+
+```powershell
+curl -X POST http://localhost:8080/v1/chat/completions ^
+  -H "Authorization: Bearer sk-a1b2c3d4e5f6..." ^
+  -H "Content-Type: application/json" ^
+  -d '{"model":"o1","messages":[{"role":"user","content":"hi"}]}'
+```
+
+> 密钥每次重启都会变化，仅适合本地临时使用。
+
+### 方式二：指定固定密钥
+
+```powershell
+agent-proxy run --db 1 --key sk-my-fixed-key
+```
+
+客户端连接时使用同一个 `sk-my-fixed-key`。适合自动化脚本 / 固定环境。
+
+### 方式三：无需密钥（本地开发用）
+
+```powershell
+agent-proxy run --db 1 --nokey
+```
+
+任何客户端均可直接连接，**不要在生产环境使用此模式**。
+
+### 认证行为说明
+
+| 启动标志 | 密钥来源 | 客户端需 `Authorization` 头 | 适用场景 |
+|----------|---------|---------------------------|---------|
+| （不传） | 每次启动随机 48 位 hex | ✅ | 本地临时使用 |
+| `--key sk-xxx` | 用户指定固定值 | ✅ | 自动化脚本 / 固定环境 |
+| `--nokey` | 无 | ❌ | 本地开发、内网直连 |
+
+- 缺密钥或密钥错误 → `401 Unauthorized`，标准错误格式（`error.type` / `error.message`）
+- **`/health` 端点始终不受认证影响**，可用于健康检查 / LB 探针
+- **`/v1/models` 额外支持 `?key=<clientKey>` URL 参数**，与 `Authorization` 头等效，便于浏览器直接访问
+- 未认证的请求不会到达下游 Provider
+
+***
 
 ## 协议兼容性详解
 
-### Central Schema
+### Central Schema（翻译中枢）
 
-所有外部协议先转为 `schema.InternalRequest`，再转为下游格式：
+所有外部协议先转为 `schema.InternalRequest`（统一中枢结构），再转为下游格式。这保证 N 个协议只需 N 个翻译器，而非 N×N。
 
 ```
 ChatCompletionRequest  ─→  InternalRequest  ─→  AnthropicRequest
@@ -384,114 +425,173 @@ ChatCompletionRequest  ─→  InternalRequest  ─→  AnthropicRequest
 ChatCompletionRequest  ─→  InternalRequest  ─→  GeminiRequest
 ```
 
+架构原则：**禁止协议 A 直接翻译到协议 B；必须协议 A → Schema → 协议 B**。
+
 ### 透传优化（Passthrough）
 
-当 **入站协议 == 下游 Provider 类型** 时，网关**跳过翻译链路，直接透传原始请求体**给下游，避免不必要的格式转换：
+当**入站协议 == 下游 Provider 支持的协议**时，网关跳过翻译链路，**直接透传原始请求体**给下游：
 
 ```
-入站协议 == Provider 类型  ─→  直接转发原始 body（零损耗、零开销）
-                              模型名 → 注入 URL 路径 / 请求头
-入站协议 ≠ Provider 类型   ─→  走完整翻译链路（如上）
+入站协议 ∈ Provider capabilities  ─→  直接转发原始 body（零损耗、零重解析）
+                                      模型名注入 URL 路径 / 请求头
+入站协议 ∉ Provider capabilities   ─→  走完整翻译链路（Central Schema）
 ```
-
-示例：Anthropic Messages 入站 → Anthropic Provider 出站，请求体原样发送，不做任何转换。
 
 透传路径要点：
-- 请求体 (`json.RawMessage`) 不经翻译器，直接传给 `ProviderClient.Call` / `CallStream`
+- 请求体 `json.RawMessage` 不经翻译器，直接传给 `ProviderClient.Call` / `CallStream`
 - 模型名通过防御拷贝的 `ProviderInfo.Name` 注入下游 URL（如 Gemini `/v1/models/{model}:generateContent`）
 - 响应体原样回传，仅过滤内部元数据事件（`_type="headers"`）
-- 请求体在入口处已预读取为内存，透传时重包为可读流，避免 body 耗尽
-
-完整翻译链路（协议不匹配时）仍为：
-
-```
-入站协议 TranslateRequest → InternalRequest → 路由 Provider
-→ TranslateToProvider → Provider 调用
-→ TranslateFromProvider → InternalResponse
-→ 入站协议 TranslateResponse → 出站响应
-```
+- 请求体在入口预读取为内存，透传时重包为可读流，避免 body 耗尽
 
 ### InternalMessage 结构
 
 ```go
 type InternalMessage struct {
-    Role    MessageRole         `json:"role"`     // "system" | "user" | "assistant" | "tool"
-    Content json.RawMessage     `json:"content"`  // 保留原始结构，避免信息丢失
-    ToolCalls []InternalToolCall `json:"tool_calls,omitempty"`
-    ToolCallID string           `json:"tool_call_id,omitempty"`
-    Name    string              `json:"name,omitempty"`
+    Role      MessageRole          `json:"role"`       // "system" | "user" | "assistant" | "tool"
+    Content   json.RawMessage      `json:"content"`    // 保留原始结构，避免信息丢失
+    ToolCalls []InternalToolCall   `json:"tool_calls,omitempty"`
+    ToolCallID string              `json:"tool_call_id,omitempty"`
+    Name      string               `json:"name,omitempty"`
 }
 ```
 
-### 8 大差异点处理
+### 8 大协议差异点处理
 
 | # | 差异点 | CC 入口 | Anthropic 输出 | Gemini 输出 |
 |---|--------|---------|---------------|-------------|
 | 1 | System prompt | 提取到 `internalReq.System` | 顶层 `system` 字段 | `systemInstruction` |
 | 2 | Tool 定义 | `tools[].function.parameters` | `tools[].input_schema` | `tools[].functionDeclarations[].parameters` |
-| 3 | Tool call | `tool_calls[]` 独立 | `content[]` 混入 `type: "tool_use"` | `parts[]` 混入 `functionCall` |
-| 4 | Tool args | `arguments` 是 JSON 字符串 | `input` 是 JSON 对象 | `args` 是 JSON 对象 |
+| 3 | Tool call | `tool_calls[]` 独立字段 | `content[]` 混入 `type: "tool_use"` | `parts[]` 混入 `functionCall` |
+| 4 | Tool args | `arguments` JSON 字符串 | `input` JSON 对象 | `args` JSON 对象 |
 | 5 | Tool result | `role: "tool"` | `role: "user"` + `tool_use_id` | `role: "user"` + `functionResponse` |
 | 6 | Usage | `prompt_tokens` | `input_tokens` → 映射回 | `prompt_token_count` → 映射回 |
-| 7 | Stop reason | `stop` / `length` | `end_turn` → `stop`；`max_tokens` → `length` | 同 |
-| 8 | SSE 流式 | 无 `event:` 行 | `type` 字段区分 | 标准 SSE |
+| 7 | Stop reason | `stop` / `length` | `end_turn`→`stop`; `max_tokens`→`length` | 同左 |
+| 8 | SSE 流式 | 纯 data 行，无 event | `type` 字段区分 chunk | 标准 SSE |
 
 ### 流式请求（SSE 翻译链路）
 
-流式请求同样经过完整的翻译链路，不是简单透传：
+流式请求同样经过完整翻译链路，不是简单透传：
 
 ```
 下游 Provider SSE 行 → TranslateStreamEvent → InternalStreamEvent
-→ 入站协议 TranslateStream → 上游 SSE 输出（匹配入站协议格式）
+→ 入站协议 TranslateStream → 出站 SSE 输出（匹配入站协议格式）
 ```
 
-各协议 SSE 格式差异在网关内自动适配：
-- **CC 格式**：纯 `data: {...}\n\n`，无 event 行，以 `data: [DONE]` 结尾
-- **Anthropic 格式**：每行带 `type` 字段（`message_start` / `content_block_delta` / `message_delta`）
-- **Gemini 格式**：每行是完整 `StreamChunk` 对象，带 `candidates` 数组
-- **Responses 格式**：带 named events（`event: response.output_delta` 等）
+各协议 SSE 格式差异：
 
-元数据事件（`_type: "headers"`）会被解析并透传响应头。
+| 协议 | SSE 格式 |
+|------|---------|
+| CC / OpenAI | 纯 `data: {...}\n\n`，无 event 行，以 `data: [DONE]` 结尾 |
+| Anthropic | 每行带 `type` 字段（`message_start` / `content_block_delta` / `message_delta`） |
+| Gemini | 每行是完整 `StreamChunk` 对象，带 `candidates` 数组 |
+| Responses | 带 named events（`event: response.output_delta` 等） |
 
----
+元数据事件（`_type: "headers"`）被解析后用于透传响应头。
+
+### 协议感知路由（快速模式）
+
+```
+入站协议 → 匹配 capabilities
+  ├── 命中 → 透传（零开销）
+  └── 未命中 → 经 OpenAI 协议翻译到上游
+```
+
+| 上游能力 | 入站协议 | 路由方式 |
+|---------|---------|---------|
+| openai + anthropic | Anthropic `/v1/messages` | 透传 |
+| openai | Gemini `generateContent` | 经 OpenAI 翻译 |
+| openai + responses | Responses `/v1/responses` | 透传 |
+| openai | Anthropic `/v1/messages` | 经 OpenAI 翻译 |
+
+***
+
+## -v / -vv 日志
+
+快速模式和复杂模式均支持两级详细日志，作为启动标志追加即可。
+
+### 日志级别
+
+| 级别 | 参数 | 输出内容 |
+|------|------|---------|
+| 默认 | （不传） | 仅启动信息 + 错误日志 |
+| 摘要 | `-v` | 客户端 IP / 入站协议 / 上游协议 / 模型 / 状态码 / 耗时 / Token 用量 |
+| 四向 | `-vv` | `-v` 基础上，依次打印四条完整消息体 |
+
+### 摘要日志（-v）示例
+
+```
+[请求 192.168.1.10]  上游: https://token.sensenova.cn
+  协议: OpenAI → openai  |  模型: sensenova-6.7-flash-lite
+  状态: 200  |  耗时: 3333ms  |  Token: 128/2048
+```
+
+### 四向日志（-vv）顺序
+
+每条请求按顺序依次打印：
+
+```
+[Guest → 代理]  入站原始请求体
+  — 保留客户端传入的假模型名（o1 / vmodel / gpt-5 等）
+
+[代理 → LLM]    上游请求体
+  — model 已替换为解析后的真实上游模型名
+  — 若为翻译链路，body 是下游协议格式；若为透传，body 与入站格式一致但 model 已替换
+
+[LLM → 代理]    上游原始响应体
+  — 保留上游返回的真实模型名
+
+[代理 → Guest]  出站响应体
+  — model 已回显为客户端原始假模型名
+  — 流式透传：SSE 每行独立回显
+```
+
+### body 截断规则
+
+`formatJSON` 逻辑：
+- **< 20 KB**：完整格式化打印（缩进）
+- **≥ 20 KB**：截取前 20 KB + `\n... (body too large)` 标记，避免撑爆终端
+
+***
 
 ## Web UI 使用
 
 ### 访问
 
+复杂模式启动后，浏览器打开：
+
 ```
 http://localhost:8080/ui
 ```
 
-### 功能
+### 功能区域
 
 | 区域 | 内容 | 更新方式 |
 |------|------|---------|
-| 顶部指标卡 | QPS / P99 延迟 / 错误率 / 活跃连接 | 2 秒轮询 |
+| 顶部指标卡 | QPS / P99 延迟 / 错误率 / 活跃连接数 | 2 秒轮询 |
 | Provider 列表 | 名称 / 状态圆点 / 请求数 / 平均延迟 | 2 秒轮询 |
-| QPS 图表 | 60 秒趋势 | SSE 推送 |
-| 延迟图表 | 60 秒趋势 | SSE 推送 |
-| 请求日志 | 时间 / 模型 / Provider / 状态 / 耗时 | SSE 推送 |
+| QPS 图表 | 最近 60 秒 QPS 趋势 | SSE 推送 |
+| 延迟图表 | 最近 60 秒延迟趋势 | SSE 推送 |
+| 请求日志 | 时间 / 模型 / Provider / 状态码 / 耗时 | SSE 推送 |
 
 ### Provider 状态
 
 | 颜色 | 含义 |
 |------|------|
-| 🟢 绿 | 健康（有成功请求） |
-| 🟡 黄 | 降级（部分失败） |
-| 🔴 红 | 宕机（全部失败） |
-| ⚪ 白 | 空闲（无请求） |
+| 绿 | 健康（最近有成功请求） |
+| 黄 | 降级（部分请求失败） |
+| 红 | 宕机（最近全部失败） |
+| 白 | 空闲（无请求） |
 
 ### API 端点
 
 | 端点 | 方法 | 格式 | 说明 |
 |------|------|------|------|
-| `/ui/api/summary` | GET | JSON | 全量指标快照 |
-| `/ui/api/logs` | GET | SSE | 实时请求日志 |
-| `/ui/api/metrics` | GET | SSE | 实时指标流 |
-| `/ui/api/providers` | GET | JSON | Provider 状态列表 |
+| `/ui/api/summary` | GET | JSON | 全量指标快照（指标卡 + Provider 列表） |
+| `/ui/api/logs` | GET | SSE | 实时请求日志流 |
+| `/ui/api/metrics` | GET | SSE | 实时 QPS + 延迟指标流 |
+| `/ui/api/providers` | GET | JSON | Provider 状态列表（含健康度） |
 
----
+***
 
 ## 高级配置
 
@@ -499,8 +599,8 @@ http://localhost:8080/ui
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `AGENT_PROXY_API_KEY` | — | 主代理 API Key |
-| `ANTHROPIC_API_KEY` | — | Anthropic API Key |
+| `AGENT_PROXY_API_KEY` | — | 复杂模式主代理 API Key |
+| `ANTHROPIC_API_KEY` | — | Anthropic Provider 专用 Key |
 
 ### 限流配置
 
@@ -511,55 +611,49 @@ type RateLimitConfig struct {
 }
 ```
 
-使用令牌桶算法，默认 100 QPS / 200 burst。
+令牌桶算法，默认 100 QPS / 200 burst。
 
 ### Provider 超时
 
 ```go
 type ProviderConfig struct {
-    TimeoutSec int `yaml:"timeout_sec"`    // 调用超时
+    TimeoutSec int `yaml:"timeout_sec"`    // 单次调用超时（秒）
     RateLimit  int `yaml:"rate_limit"`     // 本地限流
 }
 ```
 
-### 日志
+### 数据库位置 / 迁移
 
-所有请求日志输出到 stdout：
+数据库是 SQLite 单文件，直接复制 `~/.agent-proxy/proxies.db` 即可跨机器迁移。删除该文件等同于重置所有代理记录。
 
-```
-[17:30:16] sensenova-6.7-flash-lite → sensenova 5234ms
-```
-
----
+***
 
 ## 故障排查
 
-### 问题 1：启动后无法连接 Provider
+### 问题 1：启动后无法连接上游 Provider
 
 ```
-原因：API Key 未设置或失效
-解决：检查环境变量 / DB 中记录的 Key
+症状：所有请求返回 401 / 404 / 超时
+排查：
+  1. 确认 URL 和 Key 是否正确
+  2. 用 db check 重新嗅探并核对有效性
+  3. 运行 curl -H "Authorization: Bearer <key>" <url>/v1/models 直连验证
 ```
 
-```powershell
-# 快速检查
-curl -H "Authorization: Bearer $env:AGENT_PROXY_API_KEY" https://api.example.com/v1/models
-```
-
-### 问题 2：URL 404（/v1/v1/...）
+### 问题 2：URL 404（/v1/v1/... 重复路径）
 
 ```
-原因：URL 末尾带 /v1，BuildURL 又追加了一次
-解决：DB 中 URL 去掉末尾 /v1，或使用 normalizeBaseURL
+原因：proxyBaseURL 末尾带 /v1，请求时 BuildURL 又追加了一次
+解决：DB 中记录的 URL 去掉末尾 /v1，确保是 https://token.sensenova.cn 而不是 https://token.sensenova.cn/v1
 ```
 
-### 问题 3：快速模式报错 "未找到 ID"
+### 问题 3：快速模式报错「未找到 ID」
 
 ```
 原因：DB 为空或 ID 不存在
 解决：
-  .\agent-proxy.exe db query   # 查看现有记录
-  .\agent-proxy.exe db add     # 添加新记录
+  agent-proxy db query   # 查看现有记录
+  agent-proxy db add     # 添加新记录
 ```
 
 ### 问题 4：端口被占用
@@ -570,7 +664,7 @@ curl -H "Authorization: Bearer $env:AGENT_PROXY_API_KEY" https://api.example.com
   netstat -ano | Select-String ":8080"
   taskkill /F /PID <pid>
   # 或启动时指定其他端口
-  .\agent-proxy.exe --port 9090
+  agent-proxy run --db 1 --port 9090
 ```
 
 ### 问题 5：流式请求卡住
@@ -578,12 +672,32 @@ curl -H "Authorization: Bearer $env:AGENT_PROXY_API_KEY" https://api.example.com
 ```
 原因：下游无 SSE 响应或连接超时
 解决：
-  1. 降低 TimeoutSec
-  2. 检查网络连通性
-  3. 确认下游支持 stream=true
+  1. 降低 Provider TimeoutSec
+  2. 检查网络连通性（上游 /v1/models 直连）
+  3. 确认下游支持 stream=true（部分网关需显式开启）
 ```
 
----
+### 问题 6：假模型名报错「模型不存在」
+
+```
+症状：客户端传 o1 / vmodel 等，上游返回 model not found
+排查：
+  1. 确认请求体 JSON 的 model 字段是否被正确替换（加 -vv 看 [代理→LLM] 一行）
+  2. 若仍为假模型名：检查是否是复杂模式（复杂模式暂未集成别名映射，需切换到快速模式）
+  3. 查看 /v1/models?simple=1 的 === 别名映射 === 是否有对应条目
+  4. 若全部为空：确认 model-aliases.yaml 是否被正确加载（启动日志搜索 "merged" / "using built-in"）
+```
+
+### 问题 7：/v1/models 401 Unauthorized
+
+```
+原因：客户端认证未通过
+解决：
+  - Authorization: Bearer <clientKey> 头
+  - 或 GET /v1/models?key=<clientKey>（浏览器访问推荐）
+```
+
+***
 
 ## 扩展开发
 
@@ -600,52 +714,50 @@ type MyRequest struct {
 }
 ```
 
-2. **实现翻译器**（`internal/protocol/mymodule/translator.go`）：
+2. **实现翻译器**（`internal/protocol/mymodule/translator.go`），需实现 `CombinedTranslator` 接口：
 
 ```go
 type MyTranslator struct{}
 
+// 外部协议 → 中枢
 func (t *MyTranslator) TranslateRequest(ctx context.Context, raw json.RawMessage) (*schema.InternalRequest, error) {
-    // ... 解析 → 中枢（路径元数据如模型名通过 ctx 传入）
+    // 模型名等路径元数据通过 ctx 传入
 }
 
-func (t *MyTranslator) TranslateToProvider(req *schema.InternalRequest) (json.RawMessage, error) {
-    // ... 中枢 → 下游格式
-}
+// 中枢 → 下游 Provider 格式
+func (t *MyTranslator) TranslateToProvider(req *schema.InternalRequest) (json.RawMessage, error) {}
 
-func (t *MyTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.InternalResponse, error) {
-    // ... 下游格式 → 中枢
-}
+// 下游 Provider 响应 → 中枢
+func (t *MyTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.InternalResponse, error) {}
 
-func (t *MyTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
-    // ... 中枢 → 响应
-}
+// 中枢 → 外部协议响应
+func (t *MyTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {}
 
-func (t *MyTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func([]byte, bool)) {
-    // ... 中枢事件 → SSE
-}
+// 流式：中枢事件 → 入站协议 SSE
+func (t *MyTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func([]byte, bool)) {}
 
-func (t *MyTranslator) TranslateError(err *schema.StreamError) json.RawMessage {
-    // ... 中枢错误 → 错误 JSON
-}
+// 中枢错误 → 协议错误 JSON
+func (t *MyTranslator) TranslateError(err *schema.StreamError) json.RawMessage {}
 ```
 
 3. **注册 Provider 客户端**（`internal/provider/mymodule.go`）：
 
 ```go
 type MyClient struct {
-    baseURL  string
-    timeout  int
+    baseURL string
+    timeout int
 }
 
 func NewMyClient(name, baseURL string, timeout int) *MyClient { ... }
 
-func (c *MyClient) Call(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (json.RawMessage, map[string][]string, error) {
-    // ... HTTP 调用
+func (c *MyClient) Call(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (
+    json.RawMessage, map[string][]string, error) {
+    // HTTP 调用，返回 body + 响应头 + error
 }
 
-func (c *MyClient) CallStream(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (<-chan json.RawMessage, map[string][]string, error) {
-    // ... SSE 流
+func (c *MyClient) CallStream(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (
+    <-chan json.RawMessage, map[string][]string, error) {
+    // SSE 流，每行一条 json.RawMessage
 }
 ```
 
@@ -660,12 +772,15 @@ case "mymodule":
 
 ```
 ┌──────────────────────────────────────────────┐
-│  所有翻译路径都经过 Central Schema（internal）   │
+│  所有翻译路径都必须经过 Central Schema         │
 │                                              │
-│  禁止：协议 A 直接翻译到 协议 B                 │
-│  必须：协议 A → Schema → 协议 B                │
+│  禁止：协议 A 直接翻译到 协议 B                │
+│  必须：协议 A → Schema → 协议 B               │
 │                                              │
-│  这保证 N 个协议只需 N 个翻译器                 │
-│  而非 N×N 个                                   │
+│  保证 N 个协议只需 N 个翻译器，而非 N×N        │
 └──────────────────────────────────────────────┘
 ```
+
+### 新增假模型名
+
+在 `internal/db/aliasfile.go` 的 `DefaultAliases()` 函数的 `names` 切片追加名字即可，其余逻辑（三层加载、自映射、_default_ 回退、resolveAlias）会自动生效。
