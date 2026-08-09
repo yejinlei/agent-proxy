@@ -841,6 +841,31 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ?simple=1: 返回纯文本模型列表（浏览器友好）
+	if r.URL.Query().Get("simple") == "1" {
+		var resp2 struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		json.Unmarshal(bodyBytes, &resp2)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		for _, m := range resp2.Data {
+			fmt.Fprintln(w, m.ID)
+		}
+		// 追加别名映射
+		if q.aliasFile != nil {
+			for alias, target := range q.aliasFile.Entries() {
+				if alias == target {
+					fmt.Fprintln(w, alias)
+				} else {
+					fmt.Fprintf(w, "%s <-> %s\n", alias, target)
+				}
+			}
+		}
+		return
+	}
+
 	// 解析上游响应，追加别名映射信息
 	var upstreamResp map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &upstreamResp); err != nil {
