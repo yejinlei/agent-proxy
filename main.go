@@ -159,7 +159,8 @@ func runDBAdd(args []string) {
 var validRunFlags = map[string]bool{
 	"--host": true, "--port": true, "--mode": true,
 	"--db": true, "--conf": true, "--key": true, "--nokey": true,
-	"-v": true, "-vv": true,
+	"--aliases": true,
+	"-v":        true, "-vv": true,
 }
 
 // validRunMode 允许的 mode 值
@@ -176,6 +177,7 @@ func runServer(args []string) {
 	clientKey := ""
 	keyGiven := false
 	noClientKey := false
+	aliasPath := ""
 
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
@@ -183,7 +185,7 @@ func runServer(args []string) {
 			fmt.Fprintf(os.Stderr, "❌ 未知参数: %s\n", flag)
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy run [--mode <simple|complex>] [--db <id>]\n")
 			fmt.Fprintf(os.Stderr, "      [--host <h>] [--port <p>] [--conf <f>]\n")
-			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey]\n")
+			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey] [--aliases <f>]\n")
 			os.Exit(1)
 		}
 		switch flag {
@@ -212,6 +214,11 @@ func runServer(args []string) {
 			i++
 			if i < len(args) {
 				conf = args[i]
+			}
+		case "--aliases":
+			i++
+			if i < len(args) {
+				aliasPath = args[i]
 			}
 		case "--key":
 			i++
@@ -264,7 +271,7 @@ func runServer(args []string) {
 
 	var handler http.Handler
 	if quickMode {
-		quickHandler, err := startQuickMode(dbID, quickClientKey, quickClientKeyEnabled)
+		quickHandler, err := startQuickMode(dbID, quickClientKey, quickClientKeyEnabled, aliasPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ 启动快速模式失败: %v\n", err)
 			os.Exit(1)
@@ -325,7 +332,7 @@ func runServer(args []string) {
 }
 
 // startQuickMode 从 DB 读取一条记录启动快速网关
-func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Handler, error) {
+func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath string) (http.Handler, error) {
 	store, err := db.New("")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -353,6 +360,22 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool) (http.Han
 	}
 
 	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 60, clientKey, clientKeyEnabled, verboseLevel)
+	if aliasPath != "" {
+		af, err := db.LoadAliasFile(aliasPath)
+		if err != nil {
+			return nil, err
+		}
+		quick.SetAliasFile(af)
+		fmt.Printf("  Aliases:  %s\n", aliasPath)
+	} else {
+		af, loaded := db.LoadAliasFileAuto("", func(msg string) {
+			fmt.Fprintf(os.Stderr, "⚠  %s\n", msg)
+		})
+		if loaded {
+			fmt.Printf("  Aliases:  %s\n", af.Path())
+		}
+		quick.SetAliasFile(af)
+	}
 	return quick.Routes(), nil
 }
 
