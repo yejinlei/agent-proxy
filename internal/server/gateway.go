@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/config"
+	"github.com/agent-proxy/agent-proxy/internal/db"
 	"github.com/agent-proxy/agent-proxy/internal/middleware"
 	"github.com/agent-proxy/agent-proxy/internal/monitor"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/anthropic"
@@ -56,6 +57,7 @@ type Gateway struct {
 	store              *monitor.Store
 	webServer          *web.Server
 	rateLimiter        *rateLimiter
+	aliasFile          *db.AliasFile
 }
 
 func NewGateway(cfg *config.Config) *Gateway {
@@ -189,8 +191,11 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		return
 	}
 
+	// ── 模型别名解析（优先于 ModelRouter） ──
+	realModel, originalModel, aliasHit := g.resolveAlias(model)
+
 	// ── 路由 Provider ──
-	info, providerName, err := g.router.Resolve(model)
+	info, providerName, err := g.router.Resolve(realModel)
 	if err != nil {
 		g.sendError(w, ingressProtocol, http.StatusNotFound, "model not found", err.Error())
 		return
@@ -211,9 +216,9 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	if ingressProtocol == providerType {
 		ctx := r.Context()
 		if stream {
-			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, model, ingressProtocol, startTime)
+			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, realModel, ingressProtocol, startTime)
 		} else {
-			g.handlePassthroughNonStream(ctx, w, r, providerClient, info, body, model, ingressProtocol, startTime)
+			g.handlePassthroughNonStream(ctx, w, r, providerClient, info, body, realModel, originalModel, aliasHit, ingressProtocol, startTime)
 		}
 		return
 	}
@@ -231,9 +236,13 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		return
 	}
 
+	// 设置模型名和别名回显
+	internalReq.Model = realModel
+	internalReq.AliasModel = originalModel
+
 	// 构造 ProviderInfo：将实际 model 写入 Name（GeminiClient.BuildURL 据此拼 URL）。
 	// 取副本，避免修改路由缓存中的共享 info。
-	callInfo := makeTranslationInfo(info, model)
+	callInfo := makeTranslationInfo(info, realModel)
 
 	// ── 翻译到目标 Provider 协议 ──
 	providerTranslator, downstreamReq := g.translateToProvider(callInfo, internalReq)
@@ -241,7 +250,7 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	// ── 执行 Provider 调用 ──
 	ctx := r.Context()
 	if stream {
-		g.handleStreamRequest(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, startTime)
+		g.handleStreamRequest(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
 	} else {
 		g.handleNonStreamResponse(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
 	}
@@ -259,7 +268,45 @@ func makeTranslationInfo(info *schema.ProviderInfo, model string) *schema.Provid
 	}
 }
 
-// makePassthroughInfo 为透传构造 ProviderInfo：把已解析出的 model 作为 Name，
+// SetAliasFile 设置模型别名映射
+func (g *Gateway) SetAliasFile(af *db.AliasFile) {
+	g.aliasFile = af
+}
+
+// resolveAlias 解析客户端模型名，返回 (真实模型名, 客户端原始模型名, 是否命中别名映射)
+// Gateway 模式下 alias 文件优先于 ModelRouter 的 ModelToProvider 映射
+func (g *Gateway) resolveAlias(clientModel string) (real string, original string, hit bool) {
+	if g.aliasFile == nil || clientModel == "" {
+		return clientModel, clientModel, false
+	}
+
+	rawVal, ok := g.aliasFile.Lookup(clientModel)
+	if !ok {
+		return clientModel, clientModel, false
+	}
+
+	switch {
+	case rawVal == "@default":
+		// @default: 路由到默认 provider 的第一个模型
+		for _, pc := range g.cfg.Providers {
+			if len(pc.Models) > 0 {
+				// 用第一个 provider 的第一个模型
+				return pc.Models[0], clientModel, true
+			}
+		}
+		return rawVal, clientModel, true
+	case strings.HasPrefix(rawVal, "@db:"):
+		rest := strings.TrimPrefix(rawVal, "@db:")
+		parts := strings.SplitN(rest, ",", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			return strings.TrimSpace(parts[1]), clientModel, true
+		}
+		return rawVal, clientModel, true
+	default:
+		return rawVal, clientModel, true
+	}
+}
+
 // 让 provider 的 BuildURL / DefaultHeaders 能拿到正确的 model 与 APIToken。
 // 返回副本以避免修改路由缓存中的共享 ProviderInfo。
 func makePassthroughInfo(info *schema.ProviderInfo, model string) *schema.ProviderInfo {
@@ -273,15 +320,24 @@ func makePassthroughInfo(info *schema.ProviderInfo, model string) *schema.Provid
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
 func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
-	model string, ingressProtocol string, startTime time.Time) {
+	realModel string, aliasModel string, aliasHit bool, ingressProtocol string, startTime time.Time) {
 
-	callInfo := makePassthroughInfo(info, model)
+	callInfo := makePassthroughInfo(info, realModel)
 	resp, headers, err := client.Call(ctx, rawBody, callInfo)
 	if err != nil {
 		latency := time.Since(startTime).Milliseconds()
 		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider error", err.Error())
 		return
+	}
+
+	// 别名回显：将响应 JSON 中的 model 字段替换为客户端原始模型名
+	if aliasHit && aliasModel != "" {
+		var bodyMap map[string]interface{}
+		if json.Unmarshal(resp, &bodyMap) == nil {
+			bodyMap["model"] = aliasModel
+			resp, _ = json.Marshal(bodyMap)
+		}
 	}
 
 	for k, v := range headers {
@@ -301,7 +357,7 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
 func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
-	model string, ingressProtocol string, startTime time.Time) {
+	realModel string, ingressProtocol string, startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -314,7 +370,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	callInfo := makePassthroughInfo(info, model)
+	callInfo := makePassthroughInfo(info, realModel)
 	lines, headers, err := client.CallStream(ctx, rawBody, callInfo)
 	if err != nil {
 		flusher.Flush()
@@ -447,6 +503,9 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	}
 
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
+	if internalReq != nil && internalReq.AliasModel != "" {
+		internalResp.Model = internalReq.AliasModel
+	}
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
 		latency := time.Since(startTime).Milliseconds()
@@ -474,7 +533,7 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, downstreamReq json.RawMessage,
 	providerTranslator interface{}, ingressTranslator translator.CombinedTranslator,
-	ingressProtocol string, startTime time.Time) {
+	ingressProtocol string, internalReq *schema.InternalRequest, startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -513,6 +572,9 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 				})
 				event := pte.TranslateStreamEvent(line)
 				if event != nil {
+					if internalReq != nil && internalReq.AliasModel != "" && event.Data != nil {
+						event.Data.Model = internalReq.AliasModel
+					}
 					events <- *event
 				}
 			} else {
@@ -543,14 +605,18 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 					})
 				}
 				eventType := "delta"
-					if choice.FinishReason != "" {
-						eventType = "done"
-					}
-					events <- schema.InternalStreamEvent{
-						Type: eventType,
+				if choice.FinishReason != "" {
+					eventType = "done"
+				}
+				modelName := ccChunk.Model
+				if internalReq != nil && internalReq.AliasModel != "" {
+					modelName = internalReq.AliasModel
+				}
+				events <- schema.InternalStreamEvent{
+					Type: eventType,
 					Data: &schema.InternalStreamChunk{
 						ID:    ccChunk.ID,
-						Model: ccChunk.Model,
+						Model: modelName,
 						Choices: []schema.InternalChoice{{
 							Index:        choice.Index,
 							Message:      msg,
@@ -733,7 +799,7 @@ func buildCCContentFromBlocks(blocks []schema.InternalContentBlock) chatcompleti
 				url = "data:" + mt + ";base64," + url
 			}
 			block, _ := json.Marshal(map[string]any{
-				"type":     "image_url",
+				"type":      "image_url",
 				"image_url": map[string]any{"url": url},
 			})
 			ccBlocks = append(ccBlocks, block)
@@ -859,11 +925,39 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+
+	resp := map[string]interface{}{
 		"object": "list",
 		"data":   models,
-	})
+	}
+
+	// 若有别名映射，追加别名模型到列表 + metadata.aliases
+	if g.aliasFile != nil && len(g.aliasFile.Entries()) > 0 {
+		aliases := g.aliasFile.Entries()
+		mapping := make(map[string]string, len(aliases))
+		existing := make(map[string]bool)
+		for _, m := range models {
+			existing[m["id"].(string)] = true
+		}
+		for alias, target := range aliases {
+			mapping[alias] = target
+			if !existing[alias] {
+				models = append(models, map[string]interface{}{
+					"id":      alias,
+					"object":  "model",
+					"owner":   "proxy-alias",
+					"aliased": true,
+				})
+			}
+		}
+		resp["data"] = models
+		resp["metadata"] = map[string]interface{}{
+			"aliases": mapping,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {

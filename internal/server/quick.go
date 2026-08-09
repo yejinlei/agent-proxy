@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/agent-proxy/agent-proxy/internal/db"
 	"github.com/agent-proxy/agent-proxy/internal/middleware"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/anthropic"
 	"github.com/agent-proxy/agent-proxy/internal/protocol/chatcompletion"
@@ -41,6 +42,8 @@ type QuickGateway struct {
 	providerCache sync.Map // string → provider.Provider
 	// 详细日志级别（0=关闭 1=-v 2=-vv，仅快速模式有效）
 	verboseLevel int
+	// 模型别名映射文件（外部配置，支持 @default / @db:<id>,<model> / 纯字符串）
+	aliasFile *db.AliasFile
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -72,6 +75,53 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, models
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
 		verboseLevel:       verboseLevel,
+	}
+}
+
+// SetAliasFile 设置模型别名映射（可延迟设置，在 Routes() 之前调用）
+func (q *QuickGateway) SetAliasFile(af *db.AliasFile) {
+	q.aliasFile = af
+}
+
+// resolveAlias 解析客户端模型名：
+//   - 若 aliasFile 为 nil，透传原始模型名
+//   - 若命中映射，处理 @default / @db:<id>,<model> / 纯字符串三种语法
+//   - 返回 (真实模型名, 原始模型名, 是否命中映射)
+func (q *QuickGateway) resolveAlias(clientModel string) (real string, original string, hit bool) {
+	if q.aliasFile == nil || clientModel == "" {
+		return clientModel, clientModel, false
+	}
+
+	rawVal, ok := q.aliasFile.Lookup(clientModel)
+	if !ok {
+		// 未在映射文件中 → 透传原始模型名（保留到上游验证的入口）
+		return clientModel, clientModel, false
+	}
+
+	switch {
+	case rawVal == "@default":
+		// @default: 解析为上游 /v1/models 返回的第一个模型（OpenAI 协议）
+		if models, ok := q.modelsMap["openai"]; ok && len(models) > 0 {
+			return models[0], clientModel, true
+		}
+		// fallback: 使用第一个非空协议
+		for _, p := range q.capabilities {
+			if models, ok := q.modelsMap[p]; ok && len(models) > 0 {
+				return models[0], clientModel, true
+			}
+		}
+		return rawVal, clientModel, true
+	case strings.HasPrefix(rawVal, "@db:"):
+		// @db:<id>,<model_name>: 取逗号后面的模型名
+		rest := strings.TrimPrefix(rawVal, "@db:")
+		parts := strings.SplitN(rest, ",", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			return strings.TrimSpace(parts[1]), clientModel, true
+		}
+		return rawVal, clientModel, true
+	default:
+		// 纯字符串：直接当模型名使用
+		return rawVal, clientModel, true
 	}
 }
 
@@ -189,8 +239,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		}
 	}
 
+	// ── 模型别名解析 ──
+	// resolveAlias 返回 (真实模型名, 客户端原始模型名, 是否命中映射)
+	// 命中映射时：上游用 realModel 调用，响应回显 originalModel
+	// 未命中映射时：realModel == originalModel，透传
+	realModel, originalModel, aliasHit := q.resolveAlias(model)
+
 	// ── 协议感知路由：按模型归属选择上游协议（本地变量，不修改 q.info 共享结构） ──
-	providerType := q.selectProtocol(ingressProtocol, model)
+	providerType := q.selectProtocol(ingressProtocol, realModel)
 	p := q.getProvider(providerType)
 
 	// ── 透传 vs 翻译 ──
@@ -208,18 +264,18 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		clientIP:        clientIP,
 		ingressProtocol: ingressProtocol,
 		providerType:    providerType,
-		model:           model,
+		model:           realModel,
 		reqBody:         body,
 		upstream:        q.proxyBaseURL,
 	}
 
-	if normalizedIngress == providerType && model != "" {
+	if normalizedIngress == providerType && realModel != "" {
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
-			q.handlePassthroughStream(p, ctx, w, r, model, startTime)
+			q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 		} else {
-			q.handlePassthroughNonStream(p, ctx, w, r, model, startTime)
+			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 		}
 		return
 	}
@@ -237,6 +293,10 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		return
 	}
 
+	// 覆盖模型名：上游用 realModel，响应回显 originalModel
+	internalReq.Model = realModel
+	internalReq.AliasModel = originalModel
+
 	// ── 翻译到目标 Provider 协议 ──
 	providerTranslator, downstreamReq := q.translateToProvider(providerType, internalReq)
 
@@ -244,7 +304,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	stream := internalReq.Stream
 	ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 	if stream {
-		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, startTime)
+		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	} else {
 		q.handleNonStreamResponse(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	}
@@ -309,7 +369,7 @@ func quickDetectStream(body json.RawMessage) bool {
 }
 
 // makeQuickPassthroughInfo 为 Quick 透传构造 ProviderInfo：把 model 写入 Name
-//（各 provider BuildURL 的 model 参数来自 info.Name），并带上 APIToken 用于认证。
+// （各 provider BuildURL 的 model 参数来自 info.Name），并带上 APIToken 用于认证。
 func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.ProviderInfo {
 	return &schema.ProviderInfo{
 		Name:     model,
@@ -318,14 +378,40 @@ func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.P
 	}
 }
 
+// echoAliasInResponse 将响应 JSON 中的 model 字段回显为客户端原始模型名
+func (q *QuickGateway) echoAliasInResponse(resp json.RawMessage, aliasModel string) json.RawMessage {
+	var m map[string]interface{}
+	if json.Unmarshal(resp, &m) != nil {
+		return resp
+	}
+	if aliasModel != "" {
+		m["model"] = aliasModel
+	}
+	out, _ := json.Marshal(m)
+	return out
+}
+
+// echoAliasInStreamLine 将流式 SSE 行中的 model 字段回显为客户端原始模型名
+func (q *QuickGateway) echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
+	var m map[string]interface{}
+	if json.Unmarshal(line, &m) != nil {
+		return line
+	}
+	if aliasModel != "" {
+		m["model"] = aliasModel
+	}
+	out, _ := json.Marshal(m)
+	return out
+}
+
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
 func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
-	r *http.Request, model string, startTime time.Time) {
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time) {
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
-	callInfo := makeQuickPassthroughInfo(q.info, model)
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
@@ -351,18 +437,26 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		}
 	}
 
+	// 若命中别名映射，将响应中 model 字段回显为原始模型名
+	var outResp json.RawMessage
+	if aliasHit && aliasModel != "" {
+		outResp = q.echoAliasInResponse(resp, aliasModel)
+	} else {
+		outResp = resp
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(resp)
+	w.Write(outResp)
 
-	usage := q.extractUsage(resp)
+	usage := q.extractUsage(outResp)
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-	q.logRequest(vctx, startTime, http.StatusOK, usage, resp)
+	q.logRequest(vctx, startTime, http.StatusOK, usage, outResp)
 }
 
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
 func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
-	r *http.Request, model string, startTime time.Time) {
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -378,7 +472,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
-	callInfo := makeQuickPassthroughInfo(q.info, model)
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		flusher.Flush()
@@ -425,7 +519,11 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		if usage != nil {
 			lastUsage = usage
 		}
-		w.Write(line)
+		writeLine := line
+		if aliasHit && aliasModel != "" {
+			writeLine = q.echoAliasInStreamLine(line, aliasModel)
+		}
+		w.Write(writeLine)
 		w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 		flusher.Flush()
 	}
@@ -476,6 +574,11 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 		internalResp = chatCompletionToInternal(&ccResp)
 	}
 
+	// ── 若命中别名映射，将响应中的模型名回显为客户端原始模型名 ──
+	if internalReq != nil && internalReq.AliasModel != "" {
+		internalResp.Model = internalReq.AliasModel
+	}
+
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
@@ -502,7 +605,7 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 // handleStreamRequest 流式请求
 func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
-	ingressTranslator translator.CombinedTranslator,
+	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
 	startTime time.Time) {
 
 	flusher, ok := w.(http.Flusher)
@@ -526,6 +629,12 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 		return
 	}
 
+	// 别名模型回显：若命中别名映射，将 InternalStreamChunk 中的 Model 覆盖为客户端原始模型名
+	aliasModel := ""
+	if internalReq != nil {
+		aliasModel = internalReq.AliasModel
+	}
+
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
 	var accumulatedUsage *schema.InternalUsage
@@ -539,24 +648,24 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 					continue
 				}
 				if meta["_type"] == "error" {
-				status, _ := meta["_status"].(float64)
-				if status == 0 {
-					status = 502
+					status, _ := meta["_status"].(float64)
+					if status == 0 {
+						status = 502
+					}
+					data, _ := meta["data"].(string)
+					if data == "" {
+						data = fmt.Sprintf("upstream error: HTTP %.0f", status)
+					}
+					events <- schema.InternalStreamEvent{
+						Type: "error",
+						Error: &schema.StreamError{
+							Message: data,
+							Type:    "upstream_error",
+							Code:    int(status),
+						},
+					}
+					return
 				}
-				data, _ := meta["data"].(string)
-				if data == "" {
-					data = fmt.Sprintf("upstream error: HTTP %.0f", status)
-				}
-				events <- schema.InternalStreamEvent{
-					Type: "error",
-					Error: &schema.StreamError{
-						Message: data,
-						Type:    "upstream_error",
-						Code:    int(status),
-					},
-				}
-				return
-			}
 			}
 
 			// Provider 翻译器解析流式事件
@@ -575,6 +684,9 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				if event != nil {
 					if event.Data != nil && event.Data.Usage != nil {
 						accumulatedUsage = event.Data.Usage
+					}
+					if aliasModel != "" && event.Data != nil {
+						event.Data.Model = aliasModel
 					}
 					events <- *event
 				}
@@ -613,11 +725,15 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				if choice.FinishReason != "" {
 					eventType = "done"
 				}
+				modelName := ccChunk.Model
+				if aliasModel != "" {
+					modelName = aliasModel
+				}
 				events <- schema.InternalStreamEvent{
 					Type: eventType,
 					Data: &schema.InternalStreamChunk{
 						ID:    ccChunk.ID,
-						Model: ccChunk.Model,
+						Model: modelName,
 						Choices: []schema.InternalChoice{{
 							Index:        choice.Index,
 							Message:      msg,
@@ -718,14 +834,69 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		q.sendError(w, http.StatusInternalServerError, "read_body", err.Error())
+		return
+	}
+
+	// 解析上游响应，追加别名映射信息
+	var upstreamResp map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &upstreamResp); err != nil {
+		// 解析失败则原样返回
+		w.WriteHeader(resp.StatusCode)
+		w.Write(bodyBytes)
+		return
+	}
+
+	// 若有别名映射，追加别名模型到 data 列表 + metadata.aliases
+	if q.aliasFile != nil && len(q.aliasFile.Entries()) > 0 {
+		aliases := q.aliasFile.Entries()
+		mapping := make(map[string]string, len(aliases))
+		for alias, target := range aliases {
+			mapping[alias] = target
+		}
+		// 将别名模型也加入 data 列表，让客户端能发现它们
+		if dataArr, ok := upstreamResp["data"].([]interface{}); ok {
+			existing := make(map[string]bool)
+			for _, item := range dataArr {
+				if m, ok := item.(map[string]interface{}); ok {
+					if id, ok := m["id"].(string); ok {
+						existing[id] = true
+					}
+				}
+			}
+			for alias := range aliases {
+				if !existing[alias] {
+					dataArr = append(dataArr, map[string]interface{}{
+						"id":      alias,
+						"object":  "model",
+						"owner":   "proxy-alias",
+						"aliased": true,
+					})
+				}
+			}
+			upstreamResp["data"] = dataArr
+		}
+		metadata := upstreamResp["metadata"]
+		if metadata == nil {
+			metadata = make(map[string]interface{})
+			upstreamResp["metadata"] = metadata
+		}
+		if metaMap, ok := metadata.(map[string]interface{}); ok {
+			metaMap["aliases"] = mapping
+		}
+	}
+
 	// 透传上游响应头
 	for k, v := range resp.Header {
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	json.NewEncoder(w).Encode(upstreamResp)
 }
 
 // parseCallError 解析 provider.Call 返回的错误。
