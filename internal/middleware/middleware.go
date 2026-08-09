@@ -36,9 +36,10 @@ func CORS(next http.Handler) http.Handler {
 	})
 }
 
-// Auth API Key 认证，支持两种认证方式：
+// Auth API Key 认证，支持三种认证方式：
 //   - Authorization: Bearer <key>（OpenAI 兼容 / Responses / Gemini 客户端）
 //   - x-api-key: <key>           （Anthropic 客户端）
+//   - ?key=<key>                 （URL 查询参数，浏览器友好）
 func Auth(apiKey string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,11 +52,16 @@ func Auth(apiKey string) func(http.Handler) http.Handler {
 				return
 			}
 			auth := r.Header.Get("Authorization")
-			if auth != "Bearer "+apiKey {
-				sendUnauthorizedJSON(w)
+			if auth == "Bearer "+apiKey {
+				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r)
+			// 支持 ?key= 查询参数（浏览器友好）
+			if r.URL.Query().Get("key") == apiKey {
+				next.ServeHTTP(w, r)
+				return
+			}
+			sendUnauthorizedJSON(w)
 		})
 	}
 }

@@ -818,18 +818,6 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		q.sendError(w, http.StatusInternalServerError, "proxy_error", err.Error())
 		return
 	}
-	// 客户端鉴权：支持 ?key= 查询参数（浏览器友好）
-	if q.clientKeyEnabled {
-		clientKey := r.URL.Query().Get("key")
-		if clientKey == "" {
-			clientKey = r.Header.Get("Authorization")
-			clientKey = strings.TrimPrefix(clientKey, "Bearer ")
-		}
-		if clientKey != q.clientKey {
-			q.sendError(w, http.StatusUnauthorized, "invalid_api_key", "invalid api key")
-			return
-		}
-	}
 	// 上游请求始终使用 proxyKey
 	req.Header.Set("Authorization", "Bearer "+q.proxyKey)
 	req.Header.Set("Accept", "application/json")
