@@ -1,5 +1,6 @@
 # Database
 *.db
+*.db-journal
 ~/.agent-proxy/
 
 # IDE
@@ -9,20 +10,44 @@
 # Env (keep .env.example, ignore actual .env)
 .env
 
-# Binaries (released via GitHub Releases)
+# ── Binaries & compiled artifacts (released via GitHub Releases) ──
+# Go build outputs
 *.exe
-agent-proxy
-dist/
+/agent-proxy
+/agent-proxy.exe
+/server
+/server.exe
 
-# Temp
-test-request.json
-test-stream.json
+# OS-specific binaries (no extension)
+/agent-proxy-darwin-*
+/agent-proxy-linux-*
+/agent-proxy-windows-*
 
-# Release body (generated)
-release_body.json
-agent-proxy.bundle
-dist/
-.tmp/
+# Shared libraries
+*.dll
+*.so
+*.dylib
+
+# Generic binary patterns
+*.bin
+
+# ── Release & packaging ──
 # Release directories
 _release/
 _release_v*/
+dist/
+
+# Archives
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
+*.bundle
+
+# Release metadata (generated)
+release_body.json
+
+# ── Temp & test files ──
+.tmp/
+test-request.json
+test-stream.json
