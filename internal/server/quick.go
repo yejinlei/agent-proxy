@@ -70,7 +70,7 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, models
 		capabilities:       capabilities,
 		modelsMap:          modelsMap,
 		translatorRegistry: registry,
-		proxyBaseURL:       strings.TrimSuffix(baseURL, "/"),
+		proxyBaseURL:       strings.TrimSuffix(strings.TrimSuffix(baseURL, "/"), "/v1"),
 		proxyKey:           apiKey,
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
