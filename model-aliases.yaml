@@ -1,11 +1,31 @@
 # ============================================================
-# 模型别名映射文件 - Model Aliases
-# 格式: 别名: 目标
-#   @default       → 上游 /v1/models 第一个模型（换源自动适配）
-#   @db:<id>,<m>   → 指定 DB 记录的模型
-#   纯字符串       → 直接用该模型名
+# 模型别名映射文件 (model-aliases.yaml)
+# ------------------------------------------------------------
+# 放置在 agent-proxy 可执行文件同目录下，启动时自动加载。
+# 也可通过 --aliases <path> 显式指定路径。
+#
+# 优先级（从高到低）：
+#   1. --aliases <path>          CLI 参数显式指定
+#   2. model-aliases.yaml        同目录自动检测
+#   3. DefaultAliases()          代码内置（62 个常见模型，alias→alias）
+#
+# 映射值支持三种语法：
+#   @default       动态取上游 /v1/models 返回的第一个模型（换源自动适配）
+#   @db:<id>,<m>   指定 DB 记录对应的模型
+#   纯字符串       直接作为上游模型名使用
+#
+# 特殊 key：
+#   _default_      所有未单独配置的别名，统一走此目标
+#
+# 示例：
+#   _default_:             glm-5.2           # 所有别名走 glm-5.2
+#   gpt-5:                 deepseek-v4-flash  # gpt-5 单独走 deepseek-v4-flash
+#   claude-opus-4-5:       glm-5.2           # 单独指定
+#   my-custom-model:       @default          # 新增自定义别名
 # ============================================================
 
-# 示例：添加新模型时取消注释并修改
-# my-custom-model:       @default
-# gpt-6:                 @default
+# --- 取消注释并修改以下内容即可使用 ---
+
+# _default_:             glm-5.2
+# gpt-5:                 deepseek-v4-flash
+# claude-opus-4-5:       glm-5.2
