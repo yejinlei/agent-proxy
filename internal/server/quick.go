@@ -31,6 +31,7 @@ type QuickGateway struct {
 	timeout            int
 	capabilities       []string
 	modelsMap          map[string][]string
+	modelsMu           sync.RWMutex // 保护 modelsMap/capabilities 的并发读写(ensureModels)
 	translatorRegistry *translator.TranslatorRegistry
 	// 透传上游 /v1/models 用的
 	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
@@ -101,16 +102,30 @@ func (q *QuickGateway) resolveAlias(clientModel string) (real string, original s
 	switch {
 	case rawVal == "@default":
 		// @default: 解析为上游 /v1/models 返回的第一个模型（OpenAI 协议）
-		if models, ok := q.modelsMap["openai"]; ok && len(models) > 0 {
+		// 首次调用时 modelsMap 可能为空 → 同步嗅探上游 /v1/models
+		q.modelsMu.RLock()
+		models, okM := q.modelsMap["openai"]
+		q.modelsMu.RUnlock()
+		if !okM || len(models) == 0 {
+			q.ensureModels()
+			q.modelsMu.RLock()
+			models = q.modelsMap["openai"]
+			q.modelsMu.RUnlock()
+		}
+		if len(models) > 0 {
 			return models[0], clientModel, true
 		}
 		// fallback: 使用第一个非空协议
+		q.modelsMu.RLock()
 		for _, p := range q.capabilities {
-			if models, ok := q.modelsMap[p]; ok && len(models) > 0 {
-				return models[0], clientModel, true
+			if m, okCap := q.modelsMap[p]; okCap && len(m) > 0 {
+				q.modelsMu.RUnlock()
+				return m[0], clientModel, true
 			}
 		}
-		return rawVal, clientModel, true
+		q.modelsMu.RUnlock()
+		// 二次兜底：仍然失败就透传原始值，上游会报错提示用户
+		return clientModel, clientModel, false
 	case strings.HasPrefix(rawVal, "@db:"):
 		// @db:<id>,<model_name>: 取逗号后面的模型名
 		rest := strings.TrimPrefix(rawVal, "@db:")
@@ -123,6 +138,70 @@ func (q *QuickGateway) resolveAlias(clientModel string) (real string, original s
 		// 纯字符串：直接当模型名使用
 		return rawVal, clientModel, true
 	}
+}
+
+// ensureModels 懒加载上游模型列表：首次调用 resolveAlias 遇到 @default 且 modelsMap 为空时触发
+// 直接构造 HTTP 请求调用上游 /v1/models，避免共享 provider 状态导致数据竞争
+func (q *QuickGateway) ensureModels() {
+	// 双重检查：先读锁判断，非空直接返回
+	q.modelsMu.RLock()
+	if len(q.modelsMap) > 0 {
+		q.modelsMu.RUnlock()
+		return
+	}
+	q.modelsMu.RUnlock()
+
+	// 加写锁，再检查一次（并发场景下可能已经被其他 goroutine 填充）
+	q.modelsMu.Lock()
+	if len(q.modelsMap) > 0 {
+		q.modelsMu.Unlock()
+		return
+	}
+
+	modelsURL := q.proxyBaseURL + "/v1/models"
+	req, err := http.NewRequest("GET", modelsURL, nil)
+	if err != nil {
+		q.modelsMu.Unlock()
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+q.proxyKey)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: time.Duration(q.timeout) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		q.modelsMu.Unlock()
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		io.Copy(io.Discard, resp.Body)
+		q.modelsMu.Unlock()
+		return
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	q.modelsMu.Unlock()
+	if err != nil {
+		return
+	}
+	var mResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(bodyBytes, &mResp) != nil || len(mResp.Data) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(mResp.Data))
+	for _, m := range mResp.Data {
+		ids = append(ids, m.ID)
+	}
+	q.modelsMu.Lock()
+	if q.modelsMap == nil {
+		q.modelsMap = make(map[string][]string)
+	}
+	q.modelsMap["openai"] = ids
+	q.modelsMu.Unlock()
 }
 
 // normalizeIngress 将入站协议名归一化为存储名
@@ -378,6 +457,34 @@ func makeQuickPassthroughInfo(info *schema.ProviderInfo, model string) *schema.P
 	}
 }
 
+// quickReplaceModelInBody 将请求体 JSON 中的 model 字段从 from 替换为 to
+// 同时兼容 Anthropic 根 model、OpenAI model、Responses input[].model、Gemini URL 中
+// 含 model 等情况。仅当 model 字段存在且等于 from（大小写敏感）时才替换。
+func quickReplaceModelInBody(body json.RawMessage, from, to string) json.RawMessage {
+	if from == "" || to == "" || from == to {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	changed := false
+	if v, ok := m["model"]; ok {
+		if s, ok := v.(string); ok && s == from {
+			m["model"] = to
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // echoAliasInResponse 将响应 JSON 中的 model 字段回显为客户端原始模型名
 func (q *QuickGateway) echoAliasInResponse(resp json.RawMessage, aliasModel string) json.RawMessage {
 	var m map[string]interface{}
@@ -416,6 +523,10 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	if err != nil {
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
 		return
+	}
+	// 命中别名映射时，同步改写请求体中的 model 字段（URL 中已用 realModel，body 也要改）
+	if aliasHit && aliasModel != "" {
+		body = quickReplaceModelInBody(body, aliasModel, realModel)
 	}
 
 	resp, headers, err := p.Call(callCtx, body, callInfo)
@@ -478,6 +589,10 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		flusher.Flush()
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
 		return
+	}
+	// 命中别名映射时，同步改写请求体中的 model 字段
+	if aliasHit && aliasModel != "" {
+		body = quickReplaceModelInBody(body, aliasModel, realModel)
 	}
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)

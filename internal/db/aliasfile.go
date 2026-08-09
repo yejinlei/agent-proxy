@@ -161,6 +161,8 @@ func DefaultAliases() *AliasFile {
 		"doubao-1-5-pro", "doubao-pro",
 		// GLM / 智谱
 		"glm-4-plus", "glm-4", "glm-4-flash",
+		// 自定义虚拟模型（走 @default 动态映射）
+		"vmodel",
 	}
 	for _, name := range names {
 		m[name] = name
