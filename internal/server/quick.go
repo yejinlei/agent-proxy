@@ -262,10 +262,14 @@ type verboseCtx struct {
 	providerType string
 	// 模型名
 	model string
-	// 请求体（-vv 模式用）
-	reqBody []byte
 	// 上游 URL
 	upstream string
+
+	// -vv 四向日志
+	ingressBody  []byte // 入站原始请求体（Guest → 代理，含客户端假模型名）
+	upstreamReq  []byte // 最终发送给上游的请求体（代理 → LLM，已替换为真实模型名）
+	upstreamResp []byte // 上游原始响应体（LLM → 代理，含真实模型名）
+	outgoingBody []byte // 最终发回客户端的响应体（代理 → Guest，已回显客户端模型名）
 }
 
 func (q *QuickGateway) Routes() chi.Router {
@@ -344,8 +348,8 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ingressProtocol: ingressProtocol,
 		providerType:    providerType,
 		model:           realModel,
-		reqBody:         body,
 		upstream:        q.proxyBaseURL,
+		ingressBody:     body,
 	}
 
 	if normalizedIngress == providerType && realModel != "" {
@@ -382,6 +386,11 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	// ── 执行 Provider 调用 ──
 	stream := internalReq.Stream
 	ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
+	// 把构建后的下游请求体记录到日志上下文（代理→LLM）
+	if downstreamReq != nil {
+		vctx.upstreamReq = downstreamReq
+	}
+	ctx = context.WithValue(ctx, verboseCtxKey{}, vctx)
 	if stream {
 		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	} else {
@@ -560,9 +569,11 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	w.WriteHeader(http.StatusOK)
 	w.Write(outResp)
 
-	usage := q.extractUsage(outResp)
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-	q.logRequest(vctx, startTime, http.StatusOK, usage, outResp)
+	vctx.upstreamReq = body
+	vctx.upstreamResp = resp
+	vctx.outgoingBody = outResp
+	q.logRequest(vctx, startTime, http.StatusOK, q.extractUsage(outResp), nil)
 }
 
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
@@ -644,6 +655,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	vctx.upstreamReq = body
 	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
@@ -714,7 +726,9 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 
 	usage := internalResp.Usage
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-	q.logRequest(vctx, startTime, http.StatusOK, usage, outgoingResp)
+	vctx.upstreamResp = resp
+	vctx.outgoingBody = outgoingResp
+	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
 }
 
 // handleStreamRequest 流式请求
@@ -1094,8 +1108,12 @@ func parseCallError(err error) (int, string) {
 
 // logRequest 输出 -v / -vv 级别的请求日志。
 // -v 级别: 显示客户端 IP、入站协议、上游协议、模型、状态码、token 用量
-// -vv 级别: 在 -v 基础上额外显示 Guest 侧请求体和 LLM 侧响应内容
-func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status int, usage *schema.InternalUsage, respBody []byte) {
+// -vv 级别: 在 -v 基础上依次显示四向消息体（不截断）：
+//  1. [Guest → 代理] 入站原始请求体（客户端假模型名）
+//  2. [代理 → LLM]   最终发送给上游的请求体（真实模型名）
+//  3. [LLM → 代理]   上游原始响应体（真实模型名）
+//  4. [代理 → Guest] 最终发回客户端的响应体（回显客户端模型名）
+func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status int, usage *schema.InternalUsage, _ []byte) {
 	if q.verboseLevel == 0 {
 		return
 	}
@@ -1117,11 +1135,17 @@ func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status i
 	}
 
 	if q.verboseLevel >= 2 {
-		if len(vctx.reqBody) > 0 {
-			fmt.Printf("[Guest → 代理] 请求体:\n%s\n", truncateJSON(vctx.reqBody, 600))
+		if len(vctx.ingressBody) > 0 {
+			fmt.Printf("[Guest → 代理] 入站原始请求体:\n%s\n", formatJSON(vctx.ingressBody))
 		}
-		if len(respBody) > 0 {
-			fmt.Printf("[代理 → LLM] 响应体:\n%s\n", truncateJSON(respBody, 800))
+		if len(vctx.upstreamReq) > 0 {
+			fmt.Printf("[代理 → LLM] 上游请求体:\n%s\n", formatJSON(vctx.upstreamReq))
+		}
+		if len(vctx.upstreamResp) > 0 {
+			fmt.Printf("[LLM → 代理] 上游原始响应体:\n%s\n", formatJSON(vctx.upstreamResp))
+		}
+		if len(vctx.outgoingBody) > 0 {
+			fmt.Printf("[代理 → Guest] 出站响应体:\n%s\n", formatJSON(vctx.outgoingBody))
 		}
 	}
 }
@@ -1186,20 +1210,18 @@ func normalizeProtocolName(proto string) string {
 	}
 }
 
-// truncateJSON 将 JSON 字节切片格式化为缩进 JSON 并截断到 maxLen 字节
-func truncateJSON(raw []byte, maxLen int) string {
+// formatJSON 将 JSON 字节切片格式化为缩进 JSON，限制到 20 KB 并附加省略标记，避免超大 body 撑爆终端。
+func formatJSON(raw []byte) string {
+	if len(raw) > 20*1024 {
+		return string(raw[:20*1024]) + fmt.Sprintf("\n... (body too large, %d bytes total)\n", len(raw))
+	}
 	var data any
 	if json.Unmarshal(raw, &data) != nil {
-		return truncateString(string(raw), maxLen)
+		return string(raw)
 	}
-	pretty, _ := json.MarshalIndent(data, "", "  ")
-	return truncateString(string(pretty), maxLen)
-}
-
-// truncateString 截断字符串到 maxLen，并附加省略标记
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+	pretty, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return string(raw)
 	}
-	return s[:maxLen] + "...\n  (truncated, " + fmt.Sprintf("%d bytes total", len(s)) + ")"
+	return string(pretty)
 }
