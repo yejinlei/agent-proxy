@@ -333,11 +333,7 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 
 	// 别名回显：将响应 JSON 中的 model 字段替换为客户端原始模型名
 	if aliasHit && aliasModel != "" {
-		var bodyMap map[string]interface{}
-		if json.Unmarshal(resp, &bodyMap) == nil {
-			bodyMap["model"] = aliasModel
-			resp, _ = json.Marshal(bodyMap)
-		}
+		resp = echoAliasInResponseBody(resp, aliasModel)
 	}
 
 	for k, v := range headers {

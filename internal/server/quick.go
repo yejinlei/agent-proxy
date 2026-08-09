@@ -486,9 +486,9 @@ func quickReplaceModelInBody(body json.RawMessage, from, to string) json.RawMess
 	return body
 }
 
-// echoAliasInResponse 将响应 JSON 中的 model 字段回显为客户端原始模型名
+// echoAliasInResponseBody 将响应 JSON 中的 model 字段回显为客户端原始模型名
 // 使用字符串替换，保持原始 JSON 结构不变。
-func (q *QuickGateway) echoAliasInResponse(resp json.RawMessage, aliasModel string) json.RawMessage {
+func echoAliasInResponseBody(resp json.RawMessage, aliasModel string) json.RawMessage {
 	if aliasModel == "" {
 		return resp
 	}
@@ -513,7 +513,7 @@ func (q *QuickGateway) echoAliasInResponse(resp json.RawMessage, aliasModel stri
 
 // echoAliasInStreamLine 将流式 SSE 行中的 model 字段回显为客户端原始模型名
 // 使用字符串替换，保持原始 JSON 结构不变。
-func (q *QuickGateway) echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
+func echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
 	if aliasModel == "" {
 		return line
 	}
@@ -575,7 +575,7 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	// 若命中别名映射，将响应中 model 字段回显为原始模型名
 	var outResp json.RawMessage
 	if aliasHit && aliasModel != "" {
-		outResp = q.echoAliasInResponse(resp, aliasModel)
+		outResp = echoAliasInResponseBody(resp, aliasModel)
 	} else {
 		outResp = resp
 	}
@@ -662,7 +662,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		}
 		writeLine := line
 		if aliasHit && aliasModel != "" {
-			writeLine = q.echoAliasInStreamLine(line, aliasModel)
+			writeLine = echoAliasInStreamLine(line, aliasModel)
 		}
 		w.Write(writeLine)
 		w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
