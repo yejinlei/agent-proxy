@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 780" width="1200" height="780" font-family="monospace, monospace">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#0a0a1a"/>
+<stop offset="1" stop-color="#1a1a3e"/>
+</linearGradient>
+<pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+<path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+</pattern>
+<filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+<feGaussianBlur stdDeviation="3" result="b"/>
+<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+</filter>
+<filter id="glow-strong" x="-40%" y="-40%" width="180%" height="180%">
+<feGaussianBlur stdDeviation="6" result="b"/>
+<feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+</filter>
+<marker id="arr-cy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#00e5ff" filter="url(#glow)"/>
+</marker>
+<marker id="arr-mg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#ff55ff" filter="url(#glow)"/>
+</marker>
+<marker id="arr-gr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#39ff14" filter="url(#glow)"/>
+</marker>
+<marker id="arr-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#ffaa00" filter="url(#glow)"/>
+</marker>
+</defs><rect x="0" y="0" width="1200" height="780" fill="url(#bg)"/>
+<rect x="0" y="0" width="1200" height="780" fill="url(#grid)"/>
+<text x="600" y="40" text-anchor="middle" font-size="30" font-weight="bold" fill="#ffffff" filter="url(#glow-strong)">agent-proxy</text>
+<text x="600" y="66" text-anchor="middle" font-size="13" fill="rgba(255,255,255,0.6)">$ 4x4 AI Protocol Gateway  ·  Model Alias Mapping  ·  Single Binary</text>
+<line x1="180" y1="80" x2="1020" y2="80" stroke="#00e5ff" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="90" x2="1140" y2="90" stroke="#ff55ff" stroke-width="1" opacity="0.15"/>
+<g id="left-cards">
+<rect x="40" y="110" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#00e5ff" stroke-width="1.5" filter="url(#glow)"/>
+<text x="130" y="132" text-anchor="middle" font-size="11" fill="#00e5ff">[ INBOUND ]</text>
+<text x="130" y="155" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">OpenAI</text>
+<text x="130" y="172" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Compatible</text>
+<text x="130" y="192" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/chat/completions</text>
+
+<rect x="40" y="225" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#ff55ff" stroke-width="1.5" filter="url(#glow)"/>
+<text x="130" y="247" text-anchor="middle" font-size="11" fill="#ff55ff">[ INBOUND ]</text>
+<text x="130" y="270" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">Anthropic</text>
+<text x="130" y="287" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Messages</text>
+<text x="130" y="307" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/messages</text>
+
+<rect x="40" y="340" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#39ff14" stroke-width="1.5" filter="url(#glow)"/>
+<text x="130" y="362" text-anchor="middle" font-size="11" fill="#39ff14">[ INBOUND ]</text>
+<text x="130" y="385" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">Google</text>
+<text x="130" y="402" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Gemini</text>
+<text x="130" y="422" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.5)">/v1/models/{m}:generate</text>
+
+<rect x="40" y="455" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#ffaa00" stroke-width="1.5" filter="url(#glow)"/>
+<text x="130" y="477" text-anchor="middle" font-size="11" fill="#ffaa00">[ INBOUND ]</text>
+<text x="130" y="500" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">OpenAI</text>
+<text x="130" y="517" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Responses</text>
+<text x="130" y="537" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/responses</text>
+</g>
+<g id="engine-panel">
+<rect x="410" y="100" width="380" height="560" rx="10" fill="rgba(0,0,0,0.30)" stroke="rgba(255,255,255,0.15)" stroke-width="2" filter="url(#glow-strong)"/>
+<text x="600" y="126" text-anchor="middle" font-size="14" font-weight="bold" fill="#ffffff" letter-spacing="2">/ agent-proxy / engine /</text>
+<line x1="430" y1="135" x2="770" y2="135" stroke="rgba(255,255,255,0.2)" stroke-width="1"/>
+</g>
+<g id="engine-sec1">
+<rect x="425" y="150" width="350" height="120" rx="6" fill="rgba(0,0,0,0.35)" stroke="#00e5ff" stroke-width="1"/>
+<text x="600" y="172" text-anchor="middle" font-size="11" fill="#00e5ff">[ ALIAS RESOLVER ]</text>
+<line x1="440" y1="180" x2="760" y2="180" stroke="#00e5ff" stroke-width="0.5" opacity="0.3"/>
+<text x="445" y="200" font-size="10" fill="rgba(255,255,255,0.85)">  aliases &gt; o1  gpt-5  vmodel  claude-sonnet-5</text>
+<text x="445" y="220" font-size="10" fill="rgba(255,255,255,0.85)">  vmodel  &gt;  _default_  &gt;  @default</text>
+<text x="445" y="240" font-size="10" fill="rgba(255,255,255,0.85)">  @default  &gt;  gpt-4.1-mini  (real upstream)</text>
+<text x="445" y="260" font-size="9" fill="rgba(255,255,255,0.5)">  3-tier: CLI --aliases  &gt;  YAML  &gt;  DefaultAliases(64)</text>
+</g>
+
+<g id="engine-sec2">
+<rect x="425" y="278" width="350" height="130" rx="6" fill="rgba(0,0,0,0.35)" stroke="#ff55ff" stroke-width="1"/>
+<text x="600" y="300" text-anchor="middle" font-size="11" fill="#ff55ff">[ 4x4 TRANSLATION MATRIX ]</text>
+<line x1="440" y1="308" x2="760" y2="308" stroke="#ff55ff" stroke-width="0.5" opacity="0.3"/>
+<text x="445" y="328" font-size="9" fill="rgba(255,255,255,0.7)">  OA  AN  GM  OR</text>
+<text x="445" y="345" font-size="9" fill="#39ff14">  OA  [==][TX][TX][TX]</text>
+<text x="445" y="360" font-size="9" fill="rgba(255,255,255,0.7)">  AN  [TX][==][TX][TX]</text>
+<text x="445" y="375" font-size="9" fill="rgba(255,255,255,0.7)">  GM  [TX][TX][==][TX]</text>
+<text x="445" y="390" font-size="9" fill="rgba(255,255,255,0.7)">  OR  [TX][TX][TX][==]</text>
+<text x="620" y="393" font-size="8" fill="rgba(255,255,255,0.5)">== passthrough  TX translate</text>
+</g>
+
+<g id="engine-sec3">
+<rect x="425" y="416" width="350" height="115" rx="6" fill="rgba(0,0,0,0.35)" stroke="#39ff14" stroke-width="1"/>
+<text x="600" y="438" text-anchor="middle" font-size="11" fill="#39ff14">[ BIDIR MODEL SWAP ]</text>
+<line x1="440" y1="446" x2="760" y2="446" stroke="#39ff14" stroke-width="0.5" opacity="0.3"/>
+<text x="445" y="466" font-size="10" fill="rgba(255,255,255,0.85)">  req :  fake &gt;  real       (client  -&gt;  upstream)</text>
+<text x="445" y="486" font-size="10" fill="rgba(255,255,255,0.85)">  resp:  real &gt;  fake       (upstream  -&gt;  client)</text>
+<text x="445" y="506" font-size="10" fill="rgba(255,255,255,0.85)">  body.JSON  &amp;&amp;  SSE stream  both directions</text>
+<text x="445" y="524" font-size="9" fill="rgba(255,255,255,0.5)">  transparent to both sides - no leak of real provider</text>
+</g>
+
+<g id="engine-sec4">
+<rect x="425" y="539" width="350" height="108" rx="6" fill="rgba(0,0,0,0.35)" stroke="#ffaa00" stroke-width="1"/>
+<text x="600" y="561" text-anchor="middle" font-size="11" fill="#ffaa00">[ LOGGING / DEBUG ]</text>
+<line x1="440" y1="569" x2="760" y2="569" stroke="#ffaa00" stroke-width="0.5" opacity="0.3"/>
+<text x="445" y="589" font-size="10" fill="rgba(255,255,255,0.85)">  -v     :  request/response summary (1 line)</text>
+<text x="445" y="609" font-size="10" fill="rgba(255,255,255,0.85)">  -vv    :  full 4-direction body dump</text>
+<text x="445" y="629" font-size="9" fill="rgba(255,255,255,0.5)">  inbound-req  |  outbound-req  |  outbound-resp  |  inbound-resp</text>
+</g>
+<g id="right-cards">
+<rect x="980" y="110" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#00e5ff" stroke-width="1.5" filter="url(#glow)"/>
+<text x="1070" y="132" text-anchor="middle" font-size="11" fill="#00e5ff">[ OUTBOUND ]</text>
+<text x="1070" y="155" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">OpenAI</text>
+<text x="1070" y="172" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Compatible</text>
+<text x="1070" y="192" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/chat/completions</text>
+
+<rect x="980" y="225" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#ff55ff" stroke-width="1.5" filter="url(#glow)"/>
+<text x="1070" y="247" text-anchor="middle" font-size="11" fill="#ff55ff">[ OUTBOUND ]</text>
+<text x="1070" y="270" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">Anthropic</text>
+<text x="1070" y="287" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Messages</text>
+<text x="1070" y="307" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/messages</text>
+
+<rect x="980" y="340" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#39ff14" stroke-width="1.5" filter="url(#glow)"/>
+<text x="1070" y="362" text-anchor="middle" font-size="11" fill="#39ff14">[ OUTBOUND ]</text>
+<text x="1070" y="385" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">Google</text>
+<text x="1070" y="402" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Gemini</text>
+<text x="1070" y="422" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.5)">/v1/models/{m}:generate</text>
+
+<rect x="980" y="455" width="180" height="100" rx="6" fill="rgba(0,0,0,0.20)" stroke="#ffaa00" stroke-width="1.5" filter="url(#glow)"/>
+<text x="1070" y="477" text-anchor="middle" font-size="11" fill="#ffaa00">[ OUTBOUND ]</text>
+<text x="1070" y="500" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffffff">OpenAI</text>
+<text x="1070" y="517" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.7)">Responses</text>
+<text x="1070" y="537" text-anchor="middle" font-size="9" fill="rgba(255,255,255,0.5)">/v1/responses</text>
+</g>
+<g id="arrows">
+<!-- 4 solid same-protocol passthrough lines -->
+<path d="M220,160 C320,160 380,160 410,160 M790,160 C850,160 900,160 980,160" fill="none" stroke="#00e5ff" stroke-width="1.8" opacity="1" marker-end="url(#arr-cy)"/>
+<path d="M220,275 C320,275 380,275 410,275 M790,275 C850,275 900,275 980,275" fill="none" stroke="#ff55ff" stroke-width="1.8" opacity="1" marker-end="url(#arr-mg)"/>
+<path d="M220,390 C320,390 380,390 410,390 M790,390 C850,390 900,390 980,390" fill="none" stroke="#39ff14" stroke-width="1.8" opacity="1" marker-end="url(#arr-gr)"/>
+<path d="M220,505 C320,505 380,505 410,505 M790,505 C850,505 900,505 980,505" fill="none" stroke="#ffaa00" stroke-width="1.8" opacity="1" marker-end="url(#arr-am)"/>
+<!-- 12 cross-protocol dashed lines: 8 left->center + 4 center->right -->
+<path d="M220,160 C320,200 380,275 410,275" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,160 C320,250 380,390 410,390" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,160 C320,300 380,505 410,505" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,275 C320,220 380,160 410,160" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,275 C320,250 380,390 410,390" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,275 C320,300 380,505 410,505" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,390 C320,200 380,160 410,160" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,390 C320,250 380,275 410,275" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,390 C320,300 380,505 410,505" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,505 C320,200 380,160 410,160" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,505 C320,250 380,275 410,275" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M220,505 C320,300 380,390 410,390" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,160 C850,250 900,275 980,275" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,160 C850,300 900,390 980,390" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,160 C850,350 900,505 980,505" fill="none" stroke="#00e5ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,275 C850,200 900,160 980,160" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,275 C850,300 900,390 980,390" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,275 C850,350 900,505 980,505" fill="none" stroke="#ff55ff" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,390 C850,200 900,160 980,160" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,390 C850,250 900,275 980,275" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,390 C850,350 900,505 980,505" fill="none" stroke="#39ff14" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,505 C850,200 900,160 980,160" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,505 C850,250 900,275 980,275" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+<path d="M790,505 C850,300 900,390 980,390" fill="none" stroke="#ffaa00" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+</g>
+<g id="bottom-bar">
+<rect x="40" y="680" width="1120" height="70" rx="8" fill="rgba(0,0,0,0.35)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
+<line x1="40" y1="695" x2="1160" y2="695" stroke="#00e5ff" stroke-width="1" opacity="0.4"/>
+<text x="60" y="712" font-size="11" fill="#00e5ff">[ MODEL ALIAS MAPPING ]</text>
+<text x="60" y="732" font-size="10" fill="rgba(255,255,255,0.85)">  3-tier load :  --aliases  &gt;  model-aliases.yaml  &gt;  DefaultAliases() 64 built-in</text>
+<text x="60" y="748" font-size="10" fill="rgba(255,255,255,0.85)">  bidir swap  :  inbound (fake &gt; real)  |  outbound (real &gt; fake)  |  body.JSON + SSE</text>
+<text x="780" y="712" font-size="10" fill="#ff55ff">[ BUILT-IN FAKE NAMES ]</text>
+<text x="780" y="732" font-size="9" fill="rgba(255,255,255,0.7)">  o1  gpt-5  vmodel  claude-sonnet-5  claude-opus-5  gemini-3</text>
+<text x="780" y="748" font-size="9" fill="rgba(255,255,255,0.7)">  ... + 58 more  |  source-agnostic auto-adapter</text>
+</g>
+</svg>
