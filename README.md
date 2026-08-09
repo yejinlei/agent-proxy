@@ -33,36 +33,15 @@ agent-proxy 是 AI 协议领域的 `/etc/hosts` + `翻译器`：单二进制，�
 ## 快速开始
 
 ```powershell
-# 1. 嗅探并添加代理（自动探测所有支持的协议和模型）
 agent-proxy db add --url https://token.sensenova.cn/v1 --key sk-xxx --name sensenova
-
-# 2. 快速模式启动（--nokey 本地开发，无需客户端认证）
 agent-proxy run --db 1 --nokey
-
-# 3. 任意协议调用（启动后 4 种协议入口同时可用）
-# 3a. OpenAI Compatible
+# 任意协议调用（OpenAI / Anthropic / Gemini / Responses 四个入口同时可用）
 curl -X POST http://localhost:8080/v1/chat/completions ^
   -H "Content-Type: application/json" ^
   -d '{"model":"o1","messages":[{"role":"user","content":"hello"}]}'
-
-# 3b. Anthropic Messages
-curl -X POST http://localhost:8080/v1/messages ^
-  -H "Content-Type: application/json" ^
-  -H "x-api-key: dummy" ^
-  -d '{"model":"gpt-5","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}'
-
-# 3c. Google Gemini
-curl -X POST "http://localhost:8080/v1/models/vmodel:generateContent" ^
-  -H "Content-Type: application/json" ^
-  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
-
-# 3d. OpenAI Responses
-curl -X POST http://localhost:8080/v1/responses ^
-  -H "Content-Type: application/json" ^
-  -d '{"model":"claude-sonnet-5","input":[{"type":"message","role":"user","content":"hello"}]}'
 ```
 
-> 上面 `o1` / `gpt-5` / `vmodel` / `claude-sonnet-5` 都是**假模型名**，由 agent-proxy 自动解析映射到上游真实模型，上游无需真实提供这些模型。
+> `o1` / `gpt-5` / `vmodel` 等均为假模型名，agent-proxy 自动解析映射到上游真实模型。完整命令、协议调用示例和故障排查见 [MANUAL.md](MANUAL.md)。
 
 ***
 
@@ -188,123 +167,6 @@ claude-opus-4-5    <-> sensenova-6.7-flash-lite
 | 上游 → 客户端（响应） | 真实模型 → 客户端原始假模型名 | 响应体 / SSE 每行 `model` 字段回显，终端无感知 |
 
 > 客户端始终看到自己传入的假模型名，上游始终收到真实模型名，中间全链路自动替换。
-
-***
-
-## -v / -vv 日志
-
-快速模式和复杂模式都支持两级详细日志：
-
-| 级别 | 参数 | 输出内容 |
-|------|------|---------|
-| 摘要 | `-v` | 客户端 IP / 入站协议 / 上游协议 / 模型 / 状态码 / 耗时 / Token 用量 |
-| 四向 | `-vv` | 在 `-v` 基础上依次打印四条消息体 |
-
-四向日志顺序（每条请求）：
-
-```
-[Guest → 代理]  入站原始请求体   — 客户端传入的假模型名原样保留
-[代理 → LLM]    上游请求体       — model 已替换为真实上游模型名
-[LLM → 代理]    上游原始响应体   — 上游返回的真实模型名原样保留
-[代理 → Guest]  出站响应体       — model 已回显为客户端原始假模型名
-```
-
-> body 超过 20 KB 时截取前 20 KB 并附 `... (body too large)` 标记，避免撑爆终端。
-
-***
-
-## db 命令：代理数据库管理
-
-底层为 SQLite 单文件（`~/.agent-proxy/proxies.db`），持久保存已嗅探的代理。
-
-```powershell
-# 新增代理（自动嗅探协议和模型，交互确认）
-agent-proxy db add --url <url> --key <key> [--name <name>]
-
-# 列出所有代理（显示 id / 名称 / URL / 能力）
-agent-proxy db query
-
-# 查看单条详情（含完整协议能力和模型列表）
-agent-proxy db query <id>
-
-# 搜索代理（匹配名称 / URL / 协议 / 模型关键词）
-agent-proxy db find sensenova
-
-# 核对所有代理有效性（重新嗅探，提示删除失效记录）
-agent-proxy db check
-
-# 删除指定记录
-agent-proxy db rm <id>
-```
-
-`detect` 是 `db add` 的兼容别名，参数完全相同。
-
-***
-
-## run 命令：启动网关
-
-两种启动模式：
-
-| | 快速模式（`--db`） | 复杂模式（`--mode complex`） |
-|---|---|---|
-| 启动命令 | `agent-proxy run --db 1` | `agent-proxy run --mode complex` |
-| 配置来源 | SQLite 中选取一条记录 | 内置默认 / `--conf <file>` 配置文件 |
-| 多 Provider | 单条 | 路由前缀匹配（`/p/<name>/...`） |
-| 协议互转 | 协议感知路由 + 翻译 | 完整 4×4 支持 |
-| 客户端认证 | 内置 Bearer Token 三选一 | 配置文件自定义 |
-| Web UI | — | `/ui` 深色主题面板 |
-| 限流 / 监控 | — | 令牌桶 + 实时指标 |
-| 适用场景 | 快速试用、单一端点 | 生产、多厂商调度 |
-
-### 快速模式客户端认证
-
-| 启动标志 | 密钥来源 | 客户端需 `Authorization` 头 | 适用场景 |
-|----------|---------|---------------------------|---------|
-| （不传） | 每次启动随机生成 48 位 hex | ✅ | 本地临时使用 |
-| `--key sk-xxx` | 用户指定固定值 | ✅ | 自动化脚本 / 固定环境 |
-| `--nokey` | 无 | ❌ | 本地开发、内网直连 |
-
-> `/health` 端点始终不受认证影响。`/v1/models` 额外支持 `?key=<clientKey>` URL 参数，便于浏览器直接访问。
-
-***
-
-## 协议感知路由
-
-快速模式下，入站请求按以下逻辑路由：
-
-```
-入站协议 → 匹配 capabilities
-  ├── 命中 → 透传（零开销，JSON 不重解析）
-  └── 未命中 → 经 OpenAI 协议翻译到上游
-```
-
-| 上游能力 | 入站协议 | 路由方式 |
-|---------|---------|---------|
-| openai + anthropic | Anthropic `/v1/messages` | 透传 |
-| openai | Gemini `generateContent` | 经 OpenAI 翻译 |
-| openai + responses | Responses `/v1/responses` | 透传 |
-| openai | Anthropic `/v1/messages` | 经 OpenAI 翻译 |
-
-***
-
-## 编译
-
-```bash
-# 本地编译
-go build -o agent-proxy .
-
-# 跨平台（6 平台）
-GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agent-proxy-linux-amd64 .
-GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agent-proxy-linux-arm64 .
-GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agent-proxy-darwin-amd64 .
-GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agent-proxy-darwin-arm64 .
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agent-proxy-windows-amd64.exe .
-GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agent-proxy-windows-arm64.exe .
-```
-
-Release 发布为裸二进制（不打包 ZIP），附带 `sha256sums.txt`。
-
-***
 
 ## 项目结构
 
