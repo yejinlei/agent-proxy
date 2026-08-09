@@ -165,8 +165,10 @@ func DefaultAliases() *AliasFile {
 	for _, name := range names {
 		m[name] = name
 	}
+	// 无映射文件时，所有别名动态映射到上游 /v1/models 返回的第一个模型
+	m["_default_"] = "@default"
 
 	af := &AliasFile{path: "(built-in)", entries: m}
-	log.Printf("[aliases] built-in defaults: %d entries", len(m))
+	log.Printf("[aliases] built-in defaults: %d entries (incl. _default_=@default)", len(m))
 	return af
 }
