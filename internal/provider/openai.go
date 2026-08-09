@@ -282,13 +282,16 @@ func (c *AnthropicClient) Endpoint(model string, stream bool) (method string, ur
 }
 
 func (c *AnthropicClient) Call(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (body json.RawMessage, headers http.Header, err error) {
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, "", false), bytes.NewReader(req))
+	url := c.BuildURL(info, "", false)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	headers = c.DefaultHeaders(info)
 	httpReq.Header = headers
+
+	log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -316,7 +319,8 @@ func (c *AnthropicClient) Call(ctx context.Context, req json.RawMessage, info *s
 func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (lines <-chan json.RawMessage, headers http.Header, err error) {
 	linesCh := make(chan json.RawMessage, 50)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, "", true), bytes.NewReader(req))
+	url := c.BuildURL(info, "", true)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -324,6 +328,8 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 	headers = c.DefaultHeaders(info)
 	headers.Set("Accept", "text/event-stream")
 	httpReq.Header = headers
+
+	log.Printf("[provider] SSE POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
 
 	go func() {
 		defer close(linesCh)
@@ -429,13 +435,16 @@ func (c *GeminiClient) Call(ctx context.Context, req json.RawMessage, info *sche
 	if info != nil {
 		model = info.Name
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, model, false), bytes.NewReader(req))
+	url := c.BuildURL(info, model, false)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	headers = c.DefaultHeaders(info)
 	httpReq.Header = headers
+
+	log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -467,7 +476,8 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 	if info != nil {
 		model = info.Name
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, model, true), bytes.NewReader(req))
+	url := c.BuildURL(info, model, true)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -475,6 +485,8 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 	headers = c.DefaultHeaders(info)
 	headers.Set("Accept", "text/event-stream")
 	httpReq.Header = headers
+
+	log.Printf("[provider] SSE POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
 
 	go func() {
 		defer close(linesCh)
