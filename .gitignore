@@ -23,4 +23,6 @@ release_body.json
 agent-proxy.bundle
 dist/
 .tmp/
+# Release directories
 _release/
+_release_v*/
