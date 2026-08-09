@@ -164,7 +164,9 @@ type InternalRequest struct {
 	// 原始请求（协议特有，用于回显或调试）
 	RawRequest json.RawMessage `json:"-"`
 	// 原始协议名（用于选择翻译器）
-	Protocol string `json:"-"`
+	Protocol   string `json:"-"`
+	// AliasModel 客户端原始模型名（用于响应回显，避免暴露上游真实模型名）
+	AliasModel string `json:"-"`
 }
 
 // ResponseFormat 格式差异：
