@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"slices"
 	"strings"
@@ -550,11 +551,22 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	}
 	// 命中别名映射时，同步改写请求体中的 model 字段（URL 中已用 realModel，body 也要改）
 	if aliasHit && aliasModel != "" {
+		bodyBefore := string(body)
 		body = quickReplaceModelInBody(body, aliasModel, realModel)
+		if q.verboseLevel > 0 {
+			preview := string(body)
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			log.Printf("[passthrough] alias=%s real=%s body_len=%d→%d preview=%s",
+				aliasModel, realModel, len(bodyBefore), len(body), preview)
+		}
 	}
 
 	resp, headers, err := p.Call(callCtx, body, callInfo)
 	if err != nil {
+		log.Printf("[passthrough] upstream error: %s=%s url=%s body_len=%d err=%v",
+			aliasModel, realModel, q.proxyBaseURL, len(body), err)
 		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(httpStatus)
