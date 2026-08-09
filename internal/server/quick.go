@@ -865,6 +865,11 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 
 		// 第二部分：别名映射表
 		if q.aliasFile != nil && len(q.aliasFile.Entries()) > 0 {
+			// 解析 @default 到上游第一个模型（用于显示）
+			defaultDisplay := "@default"
+			if len(resp2.Data) > 0 {
+				defaultDisplay = resp2.Data[0].ID
+			}
 			fmt.Fprintln(w)
 			fmt.Fprintln(w, "=== 别名映射 ===")
 			for alias := range q.aliasFile.Entries() {
@@ -872,6 +877,9 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				target, _ := q.aliasFile.Resolve(alias)
+				if target == "@default" {
+					target = defaultDisplay
+				}
 				fmt.Fprintf(w, "%s <-> %s\n", alias, target)
 			}
 		}
