@@ -636,6 +636,8 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	if err != nil {
 		flusher.Flush()
+		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v",
+			aliasModel, realModel, q.proxyBaseURL, len(body), err)
 		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
 		return
 	}
