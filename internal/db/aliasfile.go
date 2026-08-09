@@ -92,6 +92,17 @@ func (af *AliasFile) Set(alias, target string) {
 	af.entries[strings.ToLower(alias)] = target
 }
 
+// Merge 用 other 中的条目覆盖 af 中的同名 key（other 优先级更高）
+func (af *AliasFile) Merge(other *AliasFile) {
+	af.mu.Lock()
+	defer af.mu.Unlock()
+	other.mu.RLock()
+	defer other.mu.RUnlock()
+	for k, v := range other.entries {
+		af.entries[k] = v
+	}
+}
+
 func (af *AliasFile) String() string {
 	af.mu.RLock()
 	defer af.mu.RUnlock()
@@ -125,7 +136,12 @@ func LoadAliasFileAuto(dir string, warn func(string)) (*AliasFile, bool) {
 			}
 			return DefaultAliases(), false
 		}
-		return af, true
+		// 以内置 DefaultAliases() 为基础，用文件中的条目覆盖
+		// 这样用户只需在文件中配置 _default_ 或少量别名，内置的 64 个别名仍然生效
+		base := DefaultAliases()
+		base.Merge(af)
+		log.Printf("[aliases] merged %s with built-in defaults (%d entries total)", fp, len(base.entries))
+		return base, true
 	}
 	if warn != nil {
 		warn(fmt.Sprintf("alias file %s not found, using built-in defaults", fp))

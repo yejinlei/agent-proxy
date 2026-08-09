@@ -473,7 +473,7 @@ func printUsage() {
     --key <k>    快速模式客户端密钥（默认随机生成并显示）
     --nokey      快速模式不要求客户端密钥（本地开发用）
     -v           快速模式请求日志：客户端 IP / 入站协议 / 上游 / token 用量 / 耗时
-    -vv          快速模式详细日志：-v 基础上额外显示 Guest 侧请求体和 LLM 侧响应内容
+    -vv          快速模式四向日志：依次显示 [Guest→代理] [代理→LLM] [LLM→代理] [代理→Guest]
 
 数据库命令:
   agent-proxy db add      --url <u> --key <k> [--name <n>]  新增代理

@@ -1,8 +1,10 @@
 # agent-proxy — AI 协议网关
 
-> **4×4 全协议互转** · 单二进制部署 · 零外部依赖
+## 一句话
 
-agent-proxy 是一个 AI 消息协议中间件：任意入站协议（OpenAI / Anthropic / Gemini / Responses）可转换为任意出站协议，彻底打通不同厂商的 API 格式差异。
+agent-proxy 是 AI 协议领域的瑞士军刀：单二进制，把 OpenAI / Anthropic / Gemini / Responses 四种 API 格式互相转换，让任何 agent 能用任何上游模型。
+
+## 核心能力
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -33,6 +35,19 @@ agent-proxy 是一个 AI 消息协议中间件：任意入站协议（OpenAI / A
 | 📦 **单二进制** | 纯 Go 编译，内嵌 SQLite，无外部依赖 |
 | 🛡️ **客户端认证** | 快速模式内置 Bearer Token 认证 |
 | 📊 **Web UI** | 深色主题面板：实时指标、请求日志、Provider 状态 |
+| 🧩 **模型别名映射** | 64 个内置假模型名（o1 / gpt-5 / claude-* 等）+ 动态 `@default` 上游路由 |
+| 🔍 **四向 -vv 日志** | 入站 / 上游请求 / 上游响应 / 出站响应全链路查看 |
+
+---
+
+## 4×4 协议互转矩阵
+
+| 入站 ↓ \ 出站 → | OpenAI CC | Anthropic | Gemini | Responses |
+|---|---|---|---|---|
+| **OpenAI CC** `/v1/chat/completions` | ✅ 透传 | ✅ 翻译 | ✅ 翻译 | ✅ 翻译 |
+| **Anthropic** `/v1/messages` | ✅ 翻译 | ✅ 透传 | ✅ 翻译 | ✅ 翻译 |
+| **Gemini** `/v1/models/{m}:generateContent` | ✅ 翻译 | ✅ 翻译 | ✅ 透传 | ✅ 翻译 |
+| **Responses** `/v1/responses` | ✅ 翻译 | ✅ 翻译 | ✅ 翻译 | ✅ 透传 |
 
 ---
 
@@ -69,7 +84,7 @@ agent-proxy run --db 1 --nokey
 
 ### 3. 任意协议调用
 
-启动后网关同时暴露 4 种协议入口：
+启动后网关同时暴露 4 种协议入口（示例省略认证头）：
 
 ```bash
 # ① OpenAI Compatible
@@ -96,7 +111,68 @@ curl -X POST http://localhost:8080/v1/responses \
 
 ---
 
-## 📋 CLI 命令参考
+## 🧩 模型别名映射
+
+agent-proxy 内置一套假模型名到真实上游模型的映射机制，让你可以在任何 agent 里直接用 `o1`、`gpt-5`、`claude-opus-4-5` 等常见名字，而无需上游真的提供这些模型。
+
+### 映射算法
+
+| 优先级 | 来源 | 行为 |
+|--------|------|------|
+| 1 | `--aliases <file>` CLI 参数 | 显式指定映射文件，优先级最高 |
+| 2 | 同目录 `model-aliases.yaml` | 自动检测可执行文件同目录下的映射文件 |
+| 3 | 代码内置 `DefaultAliases()` | 64 个常见假模型名 + `_default_=@default` 兜底 |
+
+映射值支持三种语法：
+
+- `@default` — 动态取上游 `/v1/models` 返回的第一个模型，换源自动适配
+- `@db:<id>,<model>` — 指定 DB 记录对应的模型
+- `纯字符串` — 直接作为上游模型名
+
+`_default_` 是一个特殊 key：所有未单独配置具体目标的别名统一走 `_default_` 的值。
+
+### 内置假模型名（64 个）
+
+涵盖 Claude / Codex / GPT / o 系列 / DeepSeek / Gemini / Qwen / Doubao / GLM 等主流品牌，包括 `vmodel` 自定义占位。
+
+### 自定义映射示例
+
+在 `model-aliases.yaml` 中：
+
+```yaml
+# 所有别名统一走 sensenova-6.7-flash-lite
+_default_:             sensenova-6.7-flash-lite
+
+# 单独指定：claude-opus-4-5 走 deepseek-v4-flash
+claude-opus-4-5:       deepseek-v4-flash
+
+# 动态取上游第一个模型
+my-custom-model:       @default
+```
+
+> 样板文件 `model-aliases.yaml` 已包含上述配置，默认全部注释；取消注释并修改值即可启用。
+
+---
+
+## 🔍 -v / -vv 日志
+
+快速模式支持两级详细日志：
+
+| 级别 | 参数 | 输出内容 |
+|------|------|---------|
+| 基础 | `-v` | 客户端 IP / 协议 / 模型 / 状态码 / 耗时 / Token 用量 |
+| 四向 | `-vv` | `-v` 基础上依次打印四条消息体 |
+
+四向日志顺序：
+
+```
+[Guest → 代理]  入站原始请求体（客户端假模型名）
+[代理 → LLM]    上游请求体（已替换为真实模型名）
+[LLM → 代理]    上游原始响应体
+[代理 → Guest]  出站响应体（已回显客户端模型名）
+```
+
+> body 超过 20 KB 时仅截取前 20 KB 并附省略标记，避免撑爆终端。
 
 ```
 agent-proxy <command> [options]
