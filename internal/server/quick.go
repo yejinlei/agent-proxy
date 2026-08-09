@@ -92,7 +92,7 @@ func (q *QuickGateway) resolveAlias(clientModel string) (real string, original s
 		return clientModel, clientModel, false
 	}
 
-	rawVal, ok := q.aliasFile.Lookup(clientModel)
+	rawVal, ok := q.aliasFile.Resolve(clientModel)
 	if !ok {
 		// 未在映射文件中 → 透传原始模型名（保留到上游验证的入口）
 		return clientModel, clientModel, false
@@ -867,7 +867,11 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		if q.aliasFile != nil && len(q.aliasFile.Entries()) > 0 {
 			fmt.Fprintln(w)
 			fmt.Fprintln(w, "=== 别名映射 ===")
-			for alias, target := range q.aliasFile.Entries() {
+			for alias := range q.aliasFile.Entries() {
+				if alias == "_default_" {
+					continue
+				}
+				target, _ := q.aliasFile.Resolve(alias)
 				fmt.Fprintf(w, "%s <-> %s\n", alias, target)
 			}
 		}
@@ -885,9 +889,13 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// 若有别名映射，追加别名模型到 data 列表 + metadata.aliases
 	if q.aliasFile != nil && len(q.aliasFile.Entries()) > 0 {
-		aliases := q.aliasFile.Entries()
-		mapping := make(map[string]string, len(aliases))
-		for alias, target := range aliases {
+		entries := q.aliasFile.Entries()
+		mapping := make(map[string]string, len(entries))
+		for alias := range entries {
+			if alias == "_default_" {
+				continue
+			}
+			target, _ := q.aliasFile.Resolve(alias)
 			mapping[alias] = target
 		}
 		// 将别名模型也加入 data 列表，让客户端能发现它们
@@ -900,7 +908,10 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			for alias := range aliases {
+			for alias := range entries {
+				if alias == "_default_" {
+					continue
+				}
 				if !existing[alias] {
 					dataArr = append(dataArr, map[string]interface{}{
 						"id":      alias,

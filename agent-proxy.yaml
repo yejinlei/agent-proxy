@@ -1,0 +1,78 @@
+# ============================================================
+# 模型别名映射文件 - Model Aliases
+# 格式: 别名: 目标
+#   @default       → 上游 /v1/models 第一个模型（换源自动适配）
+#   @db:<id>,<m>   → 指定 DB 记录的模型
+#   纯字符串       → 直接用该模型名
+# ============================================================
+
+# ---------- Claude (Anthropic) ----------
+claude-fable-5:          @default
+claude-fable-5-5:        @default
+claude-opus-4:           @default
+claude-opus-4-5:         @default
+claude-sonnet-5:         @db:1,sensenova-6.7-flash-lite
+claude-sonnet-4-5:       @db:1,sensenova-6.7-flash-lite
+claude-sonnet-4:         @db:1,sensenova-6.7-flash-lite
+claude-sonnet-3-7:       @db:1,sensenova-6.7-flash-lite
+claude-sonnet-3-5:       @db:1,sensenova-6.7-flash-lite
+claude-haiku-4-5:        @db:1,sensenova-6.7-flash-lite
+claude-haiku-3-5:        @db:1,sensenova-6.7-flash-lite
+claude-haiku-3-0:        @db:1,sensenova-6.7-flash-lite
+
+# ---------- Codex (GitHub/Claude Code) ----------
+codex-fable-5:           @default
+codex-opus-4:            @default
+codex-sonnet-4:          @db:1,sensenova-6.7-flash-lite
+
+# ---------- GPT / DeepSeek (OpenAI) ----------
+gpt-5.5:                 @default
+gpt-5.5-codex:           @default
+gpt-5:                   @default
+gpt-4.5:                 @default
+gpt-4.5-preview:         @default
+gpt-4.1:                 @default
+gpt-4.1-mini:            @default
+gpt-4.1-nano:            @default
+gpt-4o:                  @default
+gpt-4o-mini:             @default
+gpt-4o-audio-preview:    @default
+gpt-4o-audio-realtime-preview: @default
+gpt-4:                   @default
+gpt-4-turbo:             @default
+gpt-3-5-turbo:           @default
+o1:                      @default
+o1-mini:                 @default
+o1-preview:              @default
+o3:                      @default
+o3-mini:                 @default
+o4-mini:                 @default
+deepseek-v4:             @default
+deepseek-r1:             @default
+deepseek-v3:             @default
+
+# ---------- Gemini (Google) ----------
+gemini-3-pro:            @db:1,sensenova-6.7-flash-lite
+gemini-3-flash:          @db:1,sensenova-6.7-flash-lite
+gemini-3-flash-lite:     @db:1,sensenova-6.7-flash-lite
+gemini-3-flash-thinking: @db:1,sensenova-6.7-flash-lite
+gemini-2-5-pro:          @db:1,sensenova-6.7-flash-lite
+gemini-2-5-flash:        @db:1,sensenova-6.7-flash-lite
+gemini-2-5-flash-lite:   @db:1,sensenova-6.7-flash-lite
+gemini-2-5-flash-thinking: @db:1,sensenova-6.7-flash-lite
+gemini-2-0-pro:          @db:1,sensenova-6.7-flash-lite
+gemini-2-0-flash:        @db:1,sensenova-6.7-flash-lite
+gemini-2-0-flash-lite:   @db:1,sensenova-6.7-flash-lite
+gemini-1-5-pro:          @db:1,sensenova-6.7-flash-lite
+gemini-1-5-flash:        @db:1,sensenova-6.7-flash-lite
+
+# ---------- OpenAI Responses API ----------
+gpt-5-5:                 @default
+gpt-5-5-search-preview:  @default
+
+# ---------- 其他主流模型（备用） ----------
+qwen3-30b-a3b:           @db:1,sensenova-6.7-flash-lite
+qwen3-max:               @db:1,sensenova-6.7-flash-lite
+doubao-1-5-pro:          @db:1,sensenova-6.7-flash-lite
+glm-4-5:                 @db:1,sensenova-6.7-flash-lite
+qwen-2-5-coder:          @db:1,sensenova-6.7-flash-lite

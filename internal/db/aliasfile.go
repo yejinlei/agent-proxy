@@ -55,6 +55,27 @@ func (af *AliasFile) Lookup(alias string) (string, bool) {
 	return v, ok
 }
 
+// Resolve 解析别名：
+//  1. 先 Lookup(alias) 取原始映射值
+//  2. 如果 target == alias（即没有单独配置具体映射目标），且 entries 中存在特殊
+//     key "_default_"，则返回 _default_ 的值作为单目标兜底
+//  3. 否则返回原始 target
+func (af *AliasFile) Resolve(alias string) (target string, hit bool) {
+	af.mu.RLock()
+	defer af.mu.RUnlock()
+	key := strings.ToLower(alias)
+	v, ok := af.entries[key]
+	if !ok {
+		return alias, false
+	}
+	if strings.ToLower(v) == key {
+		if defv, ok := af.entries["_default_"]; ok && defv != "" {
+			return defv, true
+		}
+	}
+	return v, true
+}
+
 func (af *AliasFile) Entries() map[string]string {
 	af.mu.RLock()
 	defer af.mu.RUnlock()
@@ -115,60 +136,34 @@ func LoadAliasFileAuto(dir string, warn func(string)) (*AliasFile, bool) {
 func DefaultAliases() *AliasFile {
 	m := make(map[string]string)
 
-	// ── 上游真实模型 ──────────────────────────────────────────
-	//   sensenova-6.7-flash-lite  — 多模态（图文）
-	//   deepseek-v4-flash         — DeepSeek 系列
-	//   glm-5.2                   — 智谱旗舰（长上下文）
-	//   sensenova-u1-fast         — 图片生成
-	// ───────────────────────────────────────────────────────────
-
-	// Claude 系列 → glm-5.2（长上下文+稳定推理）
-	for _, name := range []string{"claude-opus-4-5", "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-5",
+	names := []string{
+		// Claude 系列
+		"claude-opus-4-5", "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-5",
 		"claude-sonnet-3-5", "claude-sonnet-3-7", "claude-sonnet-3-0", "claude-sonnet-2-5",
 		"claude-haiku-4-5", "claude-haiku-4-0", "claude-haiku-3-5", "claude-haiku-3-0",
-		"claude-haiku-2-5", "claude-opus-4", "claude-opus-3-5", "claude-fable-5"} {
-		m[name] = "glm-5.2"
-	}
-	// Codex 系列 → glm-5.2
-	for _, name := range []string{"codex-fable-5", "codex-opus-4", "codex-sonnet-4"} {
-		m[name] = "glm-5.2"
-	}
-	// GPT / OpenAI 系列 → glm-5.2
-	for _, name := range []string{"gpt-5-5", "gpt-5-4", "gpt-5-3", "gpt-5-2", "gpt-5",
+		"claude-haiku-2-5", "claude-opus-4", "claude-opus-3-5", "claude-fable-5",
+		// Codex 系列
+		"codex-fable-5", "codex-opus-4", "codex-sonnet-4",
+		// GPT / OpenAI 系列
+		"gpt-5-5", "gpt-5-4", "gpt-5-3", "gpt-5-2", "gpt-5",
 		"gpt-4-2", "gpt-4", "gpt-3-5-turbo", "gpt-3-5", "gpt-3",
-		"o1", "o3", "o4-mini", "o4"} {
-		m[name] = "glm-5.2"
+		"o1", "o3", "o4-mini", "o4",
+		// DeepSeek 系列
+		"deepseek-v4", "deepseek-r1", "deepseek-v3",
+		// Gemini 系列
+		"gemini-3-pro", "gemini-2-5-pro", "gemini-2-pro", "gemini-1-5-pro",
+		"gemini-3-flash", "gemini-2-5-flash", "gemini-2-flash", "gemini-2-flash-lite", "gemini-1-5-flash",
+		// Qwen / 通义千问
+		"qwen3-235b", "qwen3-max", "qwen3-plus", "qwen3-30b",
+		"qwen3-8b", "qwen3-4b", "qwen3-flash",
+		"qwen-2-5-coder-32b", "qwen-2-5-coder-14b", "qwen-2-5-coder-7b", "qwen-2-5-coder-3b",
+		// Doubao / 豆包
+		"doubao-1-5-pro", "doubao-pro",
+		// GLM / 智谱
+		"glm-4-plus", "glm-4", "glm-4-flash",
 	}
-	// DeepSeek 系列 → deepseek-v4-flash
-	for _, name := range []string{"deepseek-v4", "deepseek-r1", "deepseek-v3"} {
-		m[name] = "deepseek-v4-flash"
-	}
-	// Gemini 系列 → glm-5.2（多模态走 sensenova-6.7）
-	for _, name := range []string{"gemini-3-pro",
-		"gemini-2-5-pro", "gemini-2-pro",
-		"gemini-1-5-pro"} {
-		m[name] = "glm-5.2"
-	}
-	for _, name := range []string{"gemini-3-flash", "gemini-2-5-flash",
-		"gemini-2-flash", "gemini-2-flash-lite", "gemini-1-5-flash"} {
-		m[name] = "sensenova-6.7-flash-lite"
-	}
-	// Qwen / 通义千问 → glm-5.2（大参数）/ deepseek-v4-flash（小参数/flash）
-	for _, name := range []string{"qwen3-235b", "qwen3-max", "qwen3-plus",
-		"qwen3-30b"} {
-		m[name] = "glm-5.2"
-	}
-	for _, name := range []string{"qwen3-8b", "qwen3-4b", "qwen3-flash",
-		"qwen-2-5-coder-32b", "qwen-2-5-coder-14b", "qwen-2-5-coder-7b", "qwen-2-5-coder-3b"} {
-		m[name] = "deepseek-v4-flash"
-	}
-	// Doubao / 豆包 → glm-5.2
-	for _, name := range []string{"doubao-1-5-pro", "doubao-pro"} {
-		m[name] = "glm-5.2"
-	}
-	// GLM / 智谱 → glm-5.2
-	for _, name := range []string{"glm-4-plus", "glm-4", "glm-4-flash"} {
-		m[name] = "glm-5.2"
+	for _, name := range names {
+		m[name] = name
 	}
 
 	af := &AliasFile{path: "(built-in)", entries: m}
