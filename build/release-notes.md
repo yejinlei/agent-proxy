@@ -1,3 +1,26 @@
+## v0.2.35
+
+### 修复
+- **`--stream-mode non-stream` 对 Claude Code（Anthropic Messages）无效的根本原因修复**：`quickDetectStream()` 在请求体中找不到 `stream` 字段时返回 `false`，Claude Code 的 Anthropic Messages 请求体不包含该字段，导致 `if stream` 守卫拦截了所有 `--stream-mode` 分支。Claude Code 请求被路由到 `handlePassthroughNonStream`（raw JSON，无 SSE 包装、无心跳），客户端的 SSE 解析器收到纯 JSON 响应后等待 SSE 事件永不送达 → 客户端超时 → ECONNRESET。
+- 修复策略：当显式设置 `--stream-mode`（非 auto）时，**不再经过 `stream` 字段判断**，直接按模式路由。Claude Code 请求现在正确到达 `handlePassthroughNonStreamAsSSE`（SSE 包装 + 500ms 心跳）。
+- 新增 `quickInjectStreamFlag()`：`--stream-mode stream` 模式下，无 `stream` 字段的请求自动注入 `"stream": true`，确保上游也按流式处理。
+- 新增 `handlePassthroughStreamWithBody()`：与 `handlePassthroughStream` 行为一致，但 body 在调用方已读取，避免重复读 `r.Body`。
+
+### 根因分析
+```
+--stream-mode non-stream
+  ↓
+handleRequest()
+  stream = quickDetectStream(body) → false  ← Claude Code 不带 stream 字段
+  if stream {                        ← 进不来！
+    switch q.streamMode {
+    case "non-stream": ...          ← 死代码，Claude Code 永远到不了
+    }
+  } else {
+    handlePassthroughNonStream(...)  ← Claude Code 实际走这里
+  }
+```
+
 ## v0.2.34
 
 ### 修复

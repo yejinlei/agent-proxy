@@ -385,14 +385,22 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	if normalizedIngress == providerType && realModel != "" {
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
-		if stream {
-			// --stream-mode: non-stream 强制非流式, stream 强制 SSE, passthrough HTTP 直连透传, auto 自适应竞速
+
+		// 显式设置了 --stream-mode 时，不经过 stream 字段判断，直接按模式路由
+		// 否则 Claude Code（不带 stream 字段）会绕过这里，走 handlePassthroughNonStream
+		// 导致 SSE 解析器收到 raw JSON 而非 SSE 事件 → 超时 → ECONNRESET
+		if q.streamMode != "auto" {
 			switch q.streamMode {
 			case "non-stream":
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 				return
 			case "stream":
-				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+				// 上游无 stream 标记时注入，确保 Claude Code 等客户端的上游也收到 stream=true
+				bodyStream := body
+				if !stream {
+					bodyStream = quickInjectStreamFlag(body)
+				}
+				q.handlePassthroughStreamWithBody(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, bodyStream)
 				return
 			case "passthrough":
 				// HTTP 直连透传：上游返回什么就发什么，不注入心跳、不做 SSE 包装
@@ -400,6 +408,10 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				q.handlePassthroughRaw(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 				return
 			}
+		}
+
+		// auto 模式：按 stream 字段判断
+		if stream {
 			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台竞速 SSE
 			q.streamPreferMu.RLock()
 			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]
@@ -601,6 +613,124 @@ func quickRemoveStreamFlag(body []byte) []byte {
 	s = strings.Replace(s, `"stream":true`, `"stream":false`, 1)
 	s = strings.Replace(s, `"stream": true`, `"stream": false`, 1)
 	return []byte(s)
+}
+
+// quickInjectStreamFlag 在请求体 JSON 中插入 "stream": true（用于 Anthropic Messages 等无 stream 字段的协议）
+func quickInjectStreamFlag(body json.RawMessage) json.RawMessage {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	_, exists := m["stream"]
+	if !exists {
+		// 先 unmarshal 再加字段再 marshal，保证 JSON 格式正确
+		m["stream"] = true
+		out, err := json.Marshal(m)
+		if err != nil {
+			return body
+		}
+		return json.RawMessage(out)
+	}
+	return body
+}
+
+// handlePassthroughStreamWithBody 与 handlePassthroughStream 一致，但 body 已在调用方读取
+// 供 --stream-mode stream 路径使用，避免重复读取 r.Body
+func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	defer cancel()
+
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+	if aliasHit && aliasModel != "" {
+		body = quickReplaceModelInBody(body, aliasModel, realModel)
+	}
+
+	lines, headers, err := p.CallStream(callCtx, body, callInfo)
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("stream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+		return
+	}
+
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	var lastUsage *schema.InternalUsage
+	heartbeat := time.NewTicker(500 * time.Millisecond)
+	defer heartbeat.Stop()
+	if !writeSSE(w, heartbeatEvent) {
+		return
+	}
+	flusher.Flush()
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				goto streamDone
+			}
+			heartbeat.Reset(500 * time.Millisecond)
+			var meta map[string]any
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					// 已在上方透传，跳过
+				} else if meta["_type"] == "error" {
+					w.Write([]byte("event: error\ndata: "))
+					w.Write(line)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					return
+				} else {
+					if !writeSSE(w, line) {
+						return
+					}
+					flusher.Flush()
+					continue
+				}
+			} else {
+				if !writeSSE(w, line) {
+					return
+				}
+				flusher.Flush()
+			}
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if !writeSSE(w, heartbeatEvent) {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+streamDone:
+	w.Write([]byte("event: done\ndata: {}\n\n"))
+	flusher.Flush()
+
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	vctx.upstreamReq = body
+	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
