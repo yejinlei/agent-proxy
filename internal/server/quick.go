@@ -806,27 +806,25 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		lastUsage *schema.InternalUsage
 	}
 	resultCh := make(chan raceResult, 2)
+	sseDone := make(chan struct{})
+	// sseWrote 标记 SSE goroutine 是否已写数据到 w（提交了 SSE 头）
+	sseWrote := false
+	var sseWroteMu sync.Mutex
 
-	// SSE 数据缓冲通道：竞速期间不写 w，数据缓存到 channel，竞速结束后胜出者统一写
-	type sseLine struct {
-		data    []byte
-		headers http.Header // 非 nil 表示这是上游响应头
-		done    bool
-		err     error
-		usage   *schema.InternalUsage
-	}
-	sseLineCh := make(chan sseLine, 200)
-
-	// 并行发 SSE 流式（不写 w，缓冲到 channel）
+	// 并行发 SSE 流式（直接写 w，不缓冲）
 	go func() {
-		defer close(sseLineCh)
+		defer close(sseDone)
 		lines, headers, err := p.CallStream(sseCtx, sseBody, callInfo)
 		if err != nil {
-			sseLineCh <- sseLine{err: err}
 			resultCh <- raceResult{stream: true, err: err}
 			return
 		}
-		sseLineCh <- sseLine{headers: headers}
+		// 设置上游响应头（在内存中，未提交）
+		for k, v := range headers {
+			for _, val := range v {
+				w.Header().Add(k, val)
+			}
+		}
 
 		var lastUsage *schema.InternalUsage
 		heartbeat := time.NewTicker(2 * time.Second)
@@ -834,11 +832,9 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		for {
 			select {
 			case <-sseCtx.Done():
-				// 竞速结束被取消，停止缓冲
 				return
 			case line, ok := <-lines:
 				if !ok {
-					sseLineCh <- sseLine{done: true, usage: lastUsage}
 					resultCh <- raceResult{stream: true, lastUsage: lastUsage}
 					return
 				}
@@ -852,7 +848,6 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 						errData, _ := meta["data"].(string)
 						log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
 							aliasModel, realModel, q.proxyBaseURL, len(sseBody), status, errData)
-						sseLineCh <- sseLine{err: fmt.Errorf("upstream error: %s", errData)}
 						resultCh <- raceResult{stream: true, err: fmt.Errorf("upstream error: %s", errData)}
 						return
 					}
@@ -865,10 +860,26 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 				if aliasHit && aliasModel != "" {
 					writeLine = echoAliasInStreamLine(line, aliasModel)
 				}
-				sseLineCh <- sseLine{data: writeLine}
+				sseWroteMu.Lock()
+				if !sseWrote {
+					sseWrote = true
+					// 首次写数据前设置 SSE 头
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("Cache-Control", "no-cache")
+					w.Header().Set("Connection", "keep-alive")
+					w.Header().Set("X-Accel-Buffering", "no")
+				}
+				sseWroteMu.Unlock()
+				if _, err := w.Write(writeLine); err != nil {
+					log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
+						aliasModel, realModel, q.proxyBaseURL, err)
+					resultCh <- raceResult{stream: true, err: err}
+					return
+				}
+				w.Write([]byte("\n\n"))
+				flusher.Flush()
 			case <-heartbeat.C:
-				// 竞速期间不写 w，ping 仅记录不发送
-				// 心跳防止上游 SSE 连接空闲断开，但不需要写入 w
+				// 竞速期间不发 ping，避免提交 SSE 头
 			}
 		}
 	}()
@@ -946,60 +957,31 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		aliasModel, realModel, !result.stream, result.err)
 
 	if result.stream {
-		// SSE 胜出：设置 SSE 头，回放缓冲数据，继续流式写入
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.Write([]byte("event: ping\ndata: {}\n\n"))
-		flusher.Flush()
-		// 回放 SSE goroutine 缓冲的数据
-		var lastUsage *schema.InternalUsage
-		for sl := range sseLineCh {
-			if sl.headers != nil {
-				for k, v := range sl.headers {
-					for _, val := range v {
-						w.Header().Add(k, val)
-					}
-				}
-				continue
-			}
-			if sl.err != nil {
-				log.Printf("[passthrough] upstream stream error: %s=%s url=%s err=%v",
-					aliasModel, realModel, q.proxyBaseURL, sl.err)
-				break
-			}
-			if sl.done {
-				lastUsage = sl.usage
-				break
-			}
-			if sl.data != nil {
-				if _, err := w.Write(sl.data); err != nil {
-					log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
-						aliasModel, realModel, q.proxyBaseURL, err)
-					break
-				}
-				w.Write([]byte("\n\n"))
-				flusher.Flush()
-			}
-		}
+		// SSE 胜出：数据已由 goroutine 写入 w，只需记录日志
 		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 		vctx.upstreamReq = sseBody
-		q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
+		q.logRequest(vctx, startTime, http.StatusOK, result.lastUsage, nil)
 	} else {
-		// 非流式胜出：取消 SSE goroutine，等其退出，写 JSON 响应
-		// 竞速期间 SSE goroutine 未写 w，HTTP 头未提交，可自由设置
+		// 非流式胜出：取消 SSE goroutine，等其退出
 		sseCancel()
-		// 清空 SSE 缓冲 channel（等待 goroutine 退出关闭 channel）
-		for range sseLineCh {
-		}
-		for k, v := range result.headers {
-			for _, val := range v {
-				w.Header().Add(k, val)
+		<-sseDone
+		// 根据 SSE 是否已写数据决定响应格式
+		sseWroteMu.Lock()
+		wrote := sseWrote
+		sseWroteMu.Unlock()
+		if wrote {
+			// SSE 已提交头，写 JSON body（与 handlePassthroughNonStreamAsSSE 一致）
+			w.Write(result.body)
+		} else {
+			// SSE 未写数据，HTTP 头未提交，可自由设置
+			for k, v := range result.headers {
+				for _, val := range v {
+					w.Header().Add(k, val)
+				}
 			}
+			w.WriteHeader(http.StatusOK)
+			w.Write(result.body)
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(result.body)
 		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 		vctx.upstreamReq = nsBody
 		q.logRequest(vctx, startTime, http.StatusOK, nil, nil)
