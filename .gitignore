@@ -23,6 +23,10 @@
 /agent-proxy-linux-*
 /agent-proxy-windows-*
 
+# build/ directory: multi-platform release binaries (published via GitHub Releases)
+build/agent-proxy-*
+build/sha256sums.txt
+
 # Shared libraries
 *.dll
 *.so
@@ -51,3 +55,6 @@ release_body.json
 .tmp/
 test-request.json
 test-stream.json
+
+# Runtime logs
+*.log

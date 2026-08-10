@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/db"
@@ -49,9 +52,11 @@ type QuickGateway struct {
 	// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
 	streamPreferMu sync.RWMutex
 	streamPrefer   map[string]bool // baseURL -> true=非流式更快, false=SSE 更快; key 不存在=未探测
-	// 流式模式：auto(自适应探测) / non-stream(强制非流式) / stream(强制SSE直连)
+	// 流式模式：auto(自适应竞速) / non-stream(强制非流式) / stream(强制SSE直连) / passthrough(HTTP直连透传)
 	streamMode string
 }
+
+var heartbeatEvent = []byte("event: ping\ndata: \n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
@@ -223,7 +228,7 @@ func (q *QuickGateway) normalizeIngress(p string) string {
 
 // selectProtocol 根据入站协议选择匹配的上游协议
 // 策略：归一化后，若该协议在 capabilities 中则使用它（透传）；否则回退到 openai（翻译转换）
-func (q *QuickGateway) selectProtocol(ingressProtocol, model string) string {
+func (q *QuickGateway) selectProtocol(ingressProtocol string) string {
 	normalized := q.normalizeIngress(ingressProtocol)
 	if slices.Contains(q.capabilities, normalized) {
 		return normalized
@@ -349,7 +354,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	realModel, originalModel, aliasHit := q.resolveAlias(model)
 
 	// ── 协议感知路由：按模型归属选择上游协议（本地变量，不修改 q.info 共享结构） ──
-	providerType := q.selectProtocol(ingressProtocol, realModel)
+	providerType := q.selectProtocol(ingressProtocol)
 	p := q.getProvider(providerType)
 
 	// ── 透传 vs 翻译 ──
@@ -376,7 +381,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
-			// --stream-mode: non-stream 强制非流式, stream 强制 SSE, auto 自适应探测
+			// --stream-mode: non-stream 强制非流式, stream 强制 SSE, passthrough HTTP 直连透传, auto 自适应竞速
 			switch q.streamMode {
 			case "non-stream":
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
@@ -384,8 +389,13 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			case "stream":
 				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 				return
+			case "passthrough":
+				// HTTP 直连透传：上游返回什么就发什么，不注入心跳、不做 SSE 包装
+				// 适用于已知上下游协议完全对齐的场景（零损耗）
+				q.handlePassthroughRaw(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+				return
 			}
-			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台探测 SSE
+			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台竞速 SSE
 			q.streamPreferMu.RLock()
 			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]
 			q.streamPreferMu.RUnlock()
@@ -725,8 +735,10 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	heartbeat := time.NewTicker(2 * time.Second)
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
-	// 必须用 data: 事件而非 SSE 注释（: 开头），因为注释会被客户端忽略不重置超时
-	w.Write([]byte("event: ping\ndata: {}\n\n"))
+	// 心跳格式 event: ping + data: \n（空数据）符合 Anthropic SSE 规范
+	if !writeSSE(w, heartbeatEvent) {
+		return
+	}
 	flusher.Flush()
 	for {
 		select {
@@ -772,9 +784,10 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 			flusher.Flush()
 		case <-heartbeat.C:
-			// SSE ping 事件：防止客户端因上游思考时间过长而超时断开
-			// 必须用 data: 事件而非 SSE 注释，否则客户端不重置流式超时
-			w.Write([]byte("event: ping\ndata: {}\n\n"))
+			if !writeSSE(w, heartbeatEvent) {
+				// 客户端已断开，退出循环
+				return
+			}
 			flusher.Flush()
 		}
 	}
@@ -851,6 +864,8 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	}
 
 	// 在等待非流式上游响应期间发送 SSE 心跳，防止客户端（Claude Code 等）超时断开
+	// 互斥锁保护 w，防止心跳与后续响应写入并发（TOCTOU 竞态）
+	var writeMu sync.Mutex
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -862,8 +877,13 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				w.Write([]byte("event: ping\ndata: {}\n\n"))
+				writeMu.Lock()
+				if !writeSSE(w, heartbeatEvent) {
+					writeMu.Unlock()
+					return
+				}
 				flusher.Flush()
+				writeMu.Unlock()
 			}
 		}
 	}()
@@ -1486,4 +1506,207 @@ func formatJSON(raw []byte) string {
 		return string(raw)
 	}
 	return string(pretty)
+}
+
+// writeSSE 安全写 SSE 事件：返回 true 表示成功，false 表示客户端已断开（ECONNRESET/BROKEN PIPE）
+func writeSSE(w http.ResponseWriter, data []byte) bool {
+	_, err := w.Write(data)
+	if err != nil && isConnReset(err) {
+		log.Printf("[passthrough] client disconnected (SSE write error): %v", err)
+		return false
+	}
+	return true
+}
+
+// isConnReset 判断错误是否为连接断开（ECONNRESET / BROKEN PIPE / EOF / 底层连接关闭）
+func isConnReset(err error) bool {
+	if err == nil || err == io.EOF {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		// Windows: WSAECONNRESET=10054, WSAEPIPE=10058; Linux: ECONNRESET=104, EPIPE=32
+		// macOS: ECONNRESET=54, EPIPE=32
+		eno := int(syscallErr)
+		return eno == 104 || eno == 32 || eno == 54 || eno == 10054 || eno == 10058
+	}
+	return strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection reset") ||
+		strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// handlePassthroughRaw HTTP 直连透传：客户端要什么协议就发什么协议，上游返回什么客户端收到什么
+// 不注入心跳、不做 SSE 包装，仅替换 model 名
+// streamMode=="passthrough" 时调用，适用于已知上下游协议完全对齐的场景（零损耗）
+func (q *QuickGateway) handlePassthroughRaw(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time) {
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		return
+	}
+
+	// 命中别名映射时，同步改写请求体中的 model 字段
+	if aliasHit && aliasModel != "" {
+		body = quickReplaceModelInBody(body, aliasModel, realModel)
+	}
+
+	stream := quickDetectStream(body)
+	if stream {
+		q.handlePassthroughRawStream(p, ctx, w, r, body, aliasHit, aliasModel, startTime, realModel)
+	} else {
+		q.handlePassthroughRawNonStream(p, ctx, w, r, body, aliasHit, aliasModel, startTime, realModel)
+	}
+}
+
+// handlePassthroughRawStream 透传流式：上游 SSE 原样管道转发，零注入
+func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, body []byte, aliasHit bool, aliasModel string, startTime time.Time, realModel string) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming_not_supported", "server does not support streaming")
+		return
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+	lines, headers, err := p.CallStream(ctx, body, callInfo)
+	if err != nil {
+		log.Printf("[passthrough] upstream stream error: %s url=%s body_len=%d err=%v",
+			aliasModel, q.proxyBaseURL, len(body), err)
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("stream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+		return
+	}
+
+	// 透传下游响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	var lastUsage *schema.InternalUsage
+streamLoop:
+	for {
+		select {
+		case <-callCtx.Done():
+			log.Printf("[passthrough] raw stream context cancelled: %v", callCtx.Err())
+			return
+		case line, ok := <-lines:
+			if !ok {
+				break streamLoop
+			}
+			var meta map[string]any
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					continue
+				}
+				if meta["_type"] == "error" {
+					status, _ := meta["_status"].(float64)
+					if status == 0 {
+						status = 502
+					}
+					errData, _ := meta["data"].(string)
+					log.Printf("[passthrough] upstream stream error: %s url=%s status=%v err=%s",
+						aliasModel, q.proxyBaseURL, status, errData)
+					if errData != "" {
+						w.Write([]byte(errData))
+					}
+					return
+				}
+			}
+
+			usage := q.extractUsage(line)
+			if usage != nil {
+				lastUsage = usage
+			}
+
+			writeLine := line
+			if aliasHit && aliasModel != "" {
+				writeLine = echoAliasInStreamLine(line, aliasModel)
+			}
+
+			if !writeSSE(w, writeLine) {
+				return
+			}
+			if !writeSSE(w, []byte("\n\n")) {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+
+	q.logRequest(buildVerboseCtx(r, aliasModel, startTime, q.proxyBaseURL, body, realModel),
+		startTime, http.StatusOK, lastUsage, nil)
+}
+
+// handlePassthroughRawNonStream 透传非流式：上游 JSON 原样返回，不做 SSE 包装
+func (q *QuickGateway) handlePassthroughRawNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, body []byte, aliasHit bool, aliasModel string, startTime time.Time, realModel string) {
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	defer cancel()
+
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+	resp, headers, err := p.Call(callCtx, body, callInfo)
+	if err != nil {
+		log.Printf("[passthrough] upstream error: %s url=%s body_len=%d err=%v",
+			aliasModel, q.proxyBaseURL, len(body), err)
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			return
+		}
+		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
+		return
+	}
+
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	if aliasHit && aliasModel != "" {
+		resp = echoAliasInResponseBody(resp, aliasModel)
+	}
+
+	w.Write(resp)
+
+	q.logRequest(buildVerboseCtx(r, aliasModel, startTime, q.proxyBaseURL, body, realModel),
+		startTime, http.StatusOK, nil, nil)
+}
+
+// buildVerboseCtx 从已有上下文重建 verboseCtx（用于 handlePassthroughRaw 分支）
+func buildVerboseCtx(r *http.Request, _ string, _ time.Time, upstreamURL string, body []byte, model string) verboseCtx {
+	return verboseCtx{
+		clientIP:        r.RemoteAddr,
+		ingressProtocol: "",
+		providerType:    "",
+		model:           model,
+		upstream:        upstreamURL,
+		ingressBody:     body,
+	}
 }
