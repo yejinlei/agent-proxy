@@ -134,7 +134,12 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		defer close(linesCh)
 		resp, err := c.client.Do(httpReq)
 		if err != nil {
-			linesCh <- json.RawMessage(`{"error":{"message":"connection failed: ` + err.Error() + `"}}`)
+			errMsg, _ := json.Marshal(map[string]interface{}{
+				"_type":   "error",
+				"_status": 502,
+				"data":    "connection failed: " + err.Error(),
+			})
+			linesCh <- errMsg
 			return
 		}
 		defer resp.Body.Close()
@@ -335,7 +340,12 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 		defer close(linesCh)
 		resp, err := c.client.Do(httpReq)
 		if err != nil {
-			linesCh <- json.RawMessage(`{"error":{"message":"connection failed: ` + err.Error() + `"}}`)
+			errMsg, _ := json.Marshal(map[string]interface{}{
+				"_type":   "error",
+				"_status": 502,
+				"data":    "connection failed: " + err.Error(),
+			})
+			linesCh <- errMsg
 			return
 		}
 		defer resp.Body.Close()
@@ -492,7 +502,12 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 		defer close(linesCh)
 		resp, err := c.client.Do(httpReq)
 		if err != nil {
-			linesCh <- json.RawMessage(`{"error":{"message":"connection failed: ` + err.Error() + `"}}`)
+			errMsg, _ := json.Marshal(map[string]interface{}{
+				"_type":   "error",
+				"_status": 502,
+				"data":    "connection failed: " + err.Error(),
+			})
+			linesCh <- errMsg
 			return
 		}
 		defer resp.Body.Close()

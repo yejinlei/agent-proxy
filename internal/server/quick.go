@@ -661,10 +661,13 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 				if status == 0 {
 					status = 502
 				}
+				errData, _ := meta["data"].(string)
+				log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
+					aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(int(status))
-				if data, ok := meta["data"].(string); ok {
-					w.Write([]byte(data))
+				if errData != "" {
+					w.Write([]byte(errData))
 				}
 				return
 			}
