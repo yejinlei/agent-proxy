@@ -835,6 +835,9 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		defer heartbeat.Stop()
 		for {
 			select {
+			case <-sseCtx.Done():
+				// 竞速结束被取消，不再写入
+				return
 			case line, ok := <-lines:
 				if !ok {
 					resultCh <- raceResult{stream: true, lastUsage: lastUsage}
@@ -958,21 +961,17 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		vctx.upstreamReq = sseBody
 		q.logRequest(vctx, startTime, http.StatusOK, result.lastUsage, nil)
 	} else {
-		// 非流式胜出：包装成 SSE 返回
+		// 非流式胜出：SSE 头已由 SSE goroutine 提交（初始 ping），无法撤回
+		// 必须将非流式结果包装为 SSE 格式，避免客户端协议解析失败（ECONNRESET）
 		// 取消 SSE goroutine，等待其完全退出后再写响应（避免并发写 w）
 		sseCancel()
 		<-sseDone
-		// 透传响应头
-		for k, v := range result.headers {
-			for _, val := range v {
-				w.Header().Add(k, val)
-			}
-		}
-		// 直接写入完整响应（非流式一次返回）
-		if _, err := w.Write(result.body); err != nil {
-			log.Printf("[passthrough] race write error: %s=%s err=%v", aliasModel, realModel, err)
-			return
-		}
+		// 将 JSON 响应体包装为 SSE event: message，换行转为多行 data: 前缀
+		w.Write([]byte("event: message\ndata: "))
+		escaped := bytes.ReplaceAll(result.body, []byte("\n"), []byte("\ndata: "))
+		w.Write(escaped)
+		w.Write([]byte("\n\nevent: done\ndata: [DONE]\n\n"))
+		flusher.Flush()
 		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 		vctx.upstreamReq = nsBody
 		q.logRequest(vctx, startTime, http.StatusOK, nil, nil)
