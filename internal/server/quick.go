@@ -46,10 +46,9 @@ type QuickGateway struct {
 	verboseLevel int
 	// 模型别名映射文件（外部配置，支持 @default / @db:<id>,<model> / 纯字符串）
 	aliasFile *db.AliasFile
-	// 流式偏好：首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
-	streamPreferMu        sync.RWMutex
-	streamPreferTested    bool // 是否已完成首次竞速探测
-	streamPreferNonStream bool // true=非流式更快, false=SSE 更快
+	// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+	streamPreferMu sync.RWMutex
+	streamPrefer   map[string]bool // baseURL -> true=非流式更快, false=SSE 更快; key 不存在=未探测
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -374,10 +373,9 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
-			// 流式偏好：首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+			// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
 			q.streamPreferMu.RLock()
-			tested := q.streamPreferTested
-			preferNonStream := q.streamPreferNonStream
+			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]
 			q.streamPreferMu.RUnlock()
 			if !tested {
 				q.handlePassthroughRace(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
@@ -881,10 +879,12 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		result = result2
 	}
 
-	// 记录胜出方式
+	// 记录胜出方式（按上游地址）
 	q.streamPreferMu.Lock()
-	q.streamPreferTested = true
-	q.streamPreferNonStream = !result.stream
+	if q.streamPrefer == nil {
+		q.streamPrefer = make(map[string]bool)
+	}
+	q.streamPrefer[q.proxyBaseURL] = !result.stream
 	q.streamPreferMu.Unlock()
 	log.Printf("[passthrough] race result: %s=%s prefer_nonstream=%v sse_err=%v",
 		aliasModel, realModel, !result.stream, result.err)
