@@ -36,7 +36,7 @@ func NewOpenAIClient(name, baseURL string, timeout int) *OpenAIClient {
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+				IdleConnTimeout:     300 * time.Second,
 			},
 		},
 	}
@@ -54,7 +54,7 @@ func NewResponsesClient(name, baseURL string, timeout int) *OpenAIClient {
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+				IdleConnTimeout:     300 * time.Second,
 			},
 		},
 	}

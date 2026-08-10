@@ -365,7 +365,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 60, clientKey, clientKeyEnabled, verboseLevel, streamMode)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 300, clientKey, clientKeyEnabled, verboseLevel, streamMode)
 	if aliasPath != "" {
 		af, err := db.LoadAliasFile(aliasPath)
 		if err != nil {
