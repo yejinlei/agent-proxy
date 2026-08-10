@@ -850,6 +850,25 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
 	}
 
+	// 在等待非流式上游响应期间发送 SSE 心跳，防止客户端（Claude Code 等）超时断开
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write([]byte("event: ping\ndata: {}\n\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
 	respBody, headers, err := p.Call(ctx, nsBody, callInfo)
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
