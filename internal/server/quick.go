@@ -831,43 +831,51 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		flusher.Flush()
 
 		var lastUsage *schema.InternalUsage
+		heartbeat := time.NewTicker(2 * time.Second)
+		defer heartbeat.Stop()
 		for {
-			line, ok := <-lines
-			if !ok {
-				break
-			}
-			var meta map[string]any
-			if json.Unmarshal(line, &meta) == nil {
-				if meta["_type"] == "headers" {
-					continue
-				}
-				if meta["_type"] == "error" {
-					status, _ := meta["_status"].(float64)
-					errData, _ := meta["data"].(string)
-					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
-						aliasModel, realModel, q.proxyBaseURL, len(sseBody), status, errData)
-					resultCh <- raceResult{stream: true, err: fmt.Errorf("upstream error: %s", errData)}
+			select {
+			case line, ok := <-lines:
+				if !ok {
+					resultCh <- raceResult{stream: true, lastUsage: lastUsage}
 					return
 				}
+				var meta map[string]any
+				if json.Unmarshal(line, &meta) == nil {
+					if meta["_type"] == "headers" {
+						continue
+					}
+					if meta["_type"] == "error" {
+						status, _ := meta["_status"].(float64)
+						errData, _ := meta["data"].(string)
+						log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
+							aliasModel, realModel, q.proxyBaseURL, len(sseBody), status, errData)
+						resultCh <- raceResult{stream: true, err: fmt.Errorf("upstream error: %s", errData)}
+						return
+					}
+				}
+				usage := q.extractUsage(line)
+				if usage != nil {
+					lastUsage = usage
+				}
+				writeLine := line
+				if aliasHit && aliasModel != "" {
+					writeLine = echoAliasInStreamLine(line, aliasModel)
+				}
+				if _, err := w.Write(writeLine); err != nil {
+					log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
+						aliasModel, realModel, q.proxyBaseURL, err)
+					resultCh <- raceResult{stream: true, err: err}
+					return
+				}
+				w.Write([]byte("\n\n"))
+				flusher.Flush()
+			case <-heartbeat.C:
+				// SSE ping 事件：防止客户端因上游响应慢而超时断开
+				w.Write([]byte("event: ping\ndata: {}\n\n"))
+				flusher.Flush()
 			}
-			usage := q.extractUsage(line)
-			if usage != nil {
-				lastUsage = usage
-			}
-			writeLine := line
-			if aliasHit && aliasModel != "" {
-				writeLine = echoAliasInStreamLine(line, aliasModel)
-			}
-			if _, err := w.Write(writeLine); err != nil {
-				log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
-					aliasModel, realModel, q.proxyBaseURL, err)
-				resultCh <- raceResult{stream: true, err: err}
-				return
-			}
-			w.Write([]byte("\n\n"))
-			flusher.Flush()
 		}
-		resultCh <- raceResult{stream: true, lastUsage: lastUsage}
 	}()
 
 	// 并行发非流式（使用独立 HTTP Client + Transport，避免 SSE 请求取消后影响连接池）
