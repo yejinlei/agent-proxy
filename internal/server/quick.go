@@ -669,8 +669,9 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	var lastUsage *schema.InternalUsage
 	heartbeat := time.NewTicker(2 * time.Second)
 	defer heartbeat.Stop()
-	// 立即发送首次心跳，防止客户端在等待上游首个响应时超时断开
-	w.Write([]byte(": heartbeat\n\n"))
+	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
+	// 必须用 data: 事件而非 SSE 注释（: 开头），因为注释会被客户端忽略不重置超时
+	w.Write([]byte("event: ping\ndata: {}\n\n"))
 	flusher.Flush()
 	for {
 		select {
@@ -716,8 +717,9 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 			flusher.Flush()
 		case <-heartbeat.C:
-			// SSE 心跳：防止客户端因上游思考时间过长而超时断开
-			w.Write([]byte(": heartbeat\n\n"))
+			// SSE ping 事件：防止客户端因上游思考时间过长而超时断开
+			// 必须用 data: 事件而非 SSE 注释，否则客户端不重置流式超时
+			w.Write([]byte("event: ping\ndata: {}\n\n"))
 			flusher.Flush()
 		}
 	}
