@@ -373,12 +373,18 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
-			// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台探测 SSE
 			q.streamPreferMu.RLock()
 			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]
 			q.streamPreferMu.RUnlock()
 			if !tested {
-				q.handlePassthroughRace(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+				// 首次请求：非流式响应，记录耗时，完成后后台探测 SSE 速度
+				nsStart := time.Now()
+				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+				callInfo := q.info
+				callInfo.Name = realModel
+				go q.probeStreamPrefer(p, callInfo, realModel, time.Since(nsStart))
+				return
 			} else if preferNonStream {
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 			} else {
@@ -767,225 +773,46 @@ streamDone:
 	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
-// handlePassthroughRace 首次请求并行竞速 SSE vs 非流式，记录胜出方式
-func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Context, w http.ResponseWriter,
-	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
+// probeStreamPrefer 后台异步探测 SSE 速度，完成后写入 streamPrefer 偏好
+// 在首次请求用非流式响应后调用，不影响当前请求
+func (q *QuickGateway) probeStreamPrefer(p provider.Provider, callInfo *schema.ProviderInfo, realModel string, nonStreamTime time.Duration) {
+	// 构建最小探测请求（Anthropic 格式）
+	probeBody := json.RawMessage(fmt.Sprintf(
+		`{"model":"%s","messages":[{"role":"user","content":"ping"}],"stream":true,"max_tokens":1}`,
+		realModel))
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+	probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	lines, _, err := p.CallStream(probeCtx, probeBody, callInfo)
+	if err != nil {
+		log.Printf("[probe] SSE probe failed: %s err=%v", realModel, err)
 		return
 	}
 
-	// SSE 使用客户端 context（客户端断开则取消）
-	sseCtx, sseCancel := context.WithCancel(ctx)
-	defer sseCancel()
-	// 非流式使用独立 context（不受客户端断开影响）
-	nsCtx, nsCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
-	defer nsCancel()
-
-	callInfo := makeQuickPassthroughInfo(q.info, realModel)
-
-	// 准备非流式请求体：去掉 stream 标记
-	nsBody := quickRemoveStreamFlag(body)
-	if aliasHit && aliasModel != "" {
-		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
-	}
-
-	// 准备 SSE 请求体
-	sseBody := body
-	if aliasHit && aliasModel != "" {
-		sseBody = quickReplaceModelInBody(sseBody, aliasModel, realModel)
-	}
-
-	type raceResult struct {
-		stream    bool
-		body      json.RawMessage
-		headers   http.Header
-		err       error
-		lastUsage *schema.InternalUsage
-	}
-	resultCh := make(chan raceResult, 2)
-	sseDone := make(chan struct{})
-	// sseWrote 标记 SSE goroutine 是否已写数据到 w（提交了 SSE 头）
-	sseWrote := false
-	var sseWroteMu sync.Mutex
-
-	// 并行发 SSE 流式（直接写 w，不缓冲）
-	go func() {
-		defer close(sseDone)
-		lines, headers, err := p.CallStream(sseCtx, sseBody, callInfo)
-		if err != nil {
-			resultCh <- raceResult{stream: true, err: err}
-			return
-		}
-		// 设置上游响应头（在内存中，未提交）
-		for k, v := range headers {
-			for _, val := range v {
-				w.Header().Add(k, val)
+	// 等待第一个有效数据行（跳过 headers 元数据）
+	for line := range lines {
+		var meta map[string]any
+		if json.Unmarshal(line, &meta) == nil {
+			if meta["_type"] == "headers" {
+				continue
 			}
 		}
-
-		var lastUsage *schema.InternalUsage
-		heartbeat := time.NewTicker(2 * time.Second)
-		defer heartbeat.Stop()
-		for {
-			select {
-			case <-sseCtx.Done():
-				return
-			case line, ok := <-lines:
-				if !ok {
-					resultCh <- raceResult{stream: true, lastUsage: lastUsage}
-					return
-				}
-				var meta map[string]any
-				if json.Unmarshal(line, &meta) == nil {
-					if meta["_type"] == "headers" {
-						continue
-					}
-					if meta["_type"] == "error" {
-						status, _ := meta["_status"].(float64)
-						errData, _ := meta["data"].(string)
-						log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
-							aliasModel, realModel, q.proxyBaseURL, len(sseBody), status, errData)
-						resultCh <- raceResult{stream: true, err: fmt.Errorf("upstream error: %s", errData)}
-						return
-					}
-				}
-				usage := q.extractUsage(line)
-				if usage != nil {
-					lastUsage = usage
-				}
-				writeLine := line
-				if aliasHit && aliasModel != "" {
-					writeLine = echoAliasInStreamLine(line, aliasModel)
-				}
-				sseWroteMu.Lock()
-				if !sseWrote {
-					sseWrote = true
-					// 首次写数据前设置 SSE 头
-					w.Header().Set("Content-Type", "text/event-stream")
-					w.Header().Set("Cache-Control", "no-cache")
-					w.Header().Set("Connection", "keep-alive")
-					w.Header().Set("X-Accel-Buffering", "no")
-				}
-				sseWroteMu.Unlock()
-				if _, err := w.Write(writeLine); err != nil {
-					log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
-						aliasModel, realModel, q.proxyBaseURL, err)
-					resultCh <- raceResult{stream: true, err: err}
-					return
-				}
-				w.Write([]byte("\n\n"))
-				flusher.Flush()
-			case <-heartbeat.C:
-				// 竞速期间不发 ping，避免提交 SSE 头
-			}
-		}
-	}()
-
-	// 并行发非流式（使用独立 HTTP Client + Transport，避免 SSE 请求取消后影响连接池）
-	go func() {
-		nsClient := &http.Client{
-			Timeout:   time.Duration(q.timeout) * time.Second,
-			Transport: &http.Transport{}, // 独立连接池，与 SSE 请求的 DefaultTransport 隔离
-		}
-		url := p.BuildURL(callInfo, "", false)
-		httpReq, err := http.NewRequestWithContext(nsCtx, "POST", url, bytes.NewReader(nsBody))
-		if err != nil {
-			resultCh <- raceResult{stream: false, err: err}
-			return
-		}
-		reqHeaders := p.DefaultHeaders(callInfo)
-		for k, v := range reqHeaders {
-			httpReq.Header[k] = v
-		}
-		log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(nsBody), httpReq.ContentLength)
-
-		resp, err := nsClient.Do(httpReq)
-		if err != nil {
-			resultCh <- raceResult{stream: false, err: err}
-			return
-		}
-		defer resp.Body.Close()
-
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			resultCh <- raceResult{stream: false, err: err}
-			return
-		}
-
-		respHeaders := http.Header{}
-		for k, v := range resp.Header {
-			respHeaders[k] = v
-		}
-
-		if resp.StatusCode >= 400 {
-			resultCh <- raceResult{stream: false, err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))}
-			return
-		}
-
-		// 如果命中别名，回显客户端模型名
-		if aliasHit && aliasModel != "" {
-			respBody = echoAliasInResponseBody(respBody, aliasModel)
-		}
-		resultCh <- raceResult{stream: false, body: respBody, headers: respHeaders}
-	}()
-
-	// 等待先到者
-	result := <-resultCh
-	if result.err != nil {
-		// 第一个失败，等第二个
-		result2 := <-resultCh
-		if result2.err != nil {
-			log.Printf("[passthrough] race: both failed sse=%v ns=%v: %s=%s",
-				result.err, result2.err, aliasModel, realModel)
-			q.sendError(w, http.StatusBadGateway, "both_failed", "both SSE and non-stream failed")
-			return
-		}
-		result = result2
+		break
 	}
 
-	// 记录胜出方式（按上游地址）
+	sseTime := time.Since(start)
+	preferNonStream := sseTime >= nonStreamTime
+	log.Printf("[probe] SSE probe: %s non_stream=%v sse=%v prefer_nonstream=%v",
+		realModel, nonStreamTime, sseTime, preferNonStream)
+
 	q.streamPreferMu.Lock()
 	if q.streamPrefer == nil {
 		q.streamPrefer = make(map[string]bool)
 	}
-	q.streamPrefer[q.proxyBaseURL] = !result.stream
+	q.streamPrefer[q.proxyBaseURL] = preferNonStream
 	q.streamPreferMu.Unlock()
-	log.Printf("[passthrough] race result: %s=%s prefer_nonstream=%v sse_err=%v",
-		aliasModel, realModel, !result.stream, result.err)
-
-	if result.stream {
-		// SSE 胜出：数据已由 goroutine 写入 w，只需记录日志
-		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-		vctx.upstreamReq = sseBody
-		q.logRequest(vctx, startTime, http.StatusOK, result.lastUsage, nil)
-	} else {
-		// 非流式胜出：取消 SSE goroutine，等其退出
-		sseCancel()
-		<-sseDone
-		// 根据 SSE 是否已写数据决定响应格式
-		sseWroteMu.Lock()
-		wrote := sseWrote
-		sseWroteMu.Unlock()
-		if wrote {
-			// SSE 已提交头，写 JSON body（与 handlePassthroughNonStreamAsSSE 一致）
-			w.Write(result.body)
-		} else {
-			// SSE 未写数据，HTTP 头未提交，可自由设置
-			for k, v := range result.headers {
-				for _, val := range v {
-					w.Header().Add(k, val)
-				}
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Write(result.body)
-		}
-		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-		vctx.upstreamReq = nsBody
-		q.logRequest(vctx, startTime, http.StatusOK, nil, nil)
-	}
 }
 
 // handlePassthroughNonStreamAsSSE 非流式调上游，包装成 SSE 返回
