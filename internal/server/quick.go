@@ -852,7 +852,6 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 
 	// 在等待非流式上游响应期间发送 SSE 心跳，防止客户端（Claude Code 等）超时断开
 	done := make(chan struct{})
-	defer close(done)
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -870,6 +869,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	}()
 
 	respBody, headers, err := p.Call(ctx, nsBody, callInfo)
+	close(done) // 立即停止心跳，防止与后续响应写入并发
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
 		// 直接写入 SSE 错误事件
