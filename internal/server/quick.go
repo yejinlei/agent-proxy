@@ -667,15 +667,18 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	var lastUsage *schema.InternalUsage
-	heartbeat := time.NewTicker(5 * time.Second)
+	heartbeat := time.NewTicker(2 * time.Second)
 	defer heartbeat.Stop()
+	// 立即发送首次心跳，防止客户端在等待上游首个响应时超时断开
+	w.Write([]byte(": heartbeat\n\n"))
+	flusher.Flush()
 	for {
 		select {
 		case line, ok := <-lines:
 			if !ok {
 				goto streamDone
 			}
-			heartbeat.Reset(5 * time.Second)
+			heartbeat.Reset(2 * time.Second)
 			var meta map[string]any
 			if json.Unmarshal(line, &meta) == nil {
 				if meta["_type"] == "headers" {
