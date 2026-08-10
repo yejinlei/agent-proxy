@@ -56,7 +56,12 @@ type QuickGateway struct {
 	streamMode string
 }
 
-var heartbeatEvent = []byte("event: ping\ndata: \n\n")
+// 心跳格式：data: \n\n（空 data 行）
+// 不用 event: ping —— Claude Code 的 SSE 解析器会忽略 ping 事件，
+// 只统计 data: 行作为"内容活动"来重置其超时计时器。
+// data: \n\n 确保 HTTP 层有数据流动（保持连接活跃），
+// 同时 SSE 解析器能识别为 data 事件但内容为空（不影响下游解析）。
+var heartbeatEvent = []byte("data: \n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
@@ -732,10 +737,10 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	var lastUsage *schema.InternalUsage
-	heartbeat := time.NewTicker(1 * time.Second)
+	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
-	// 心跳格式 event: ping + data: \n（空数据）符合 Anthropic SSE 规范
+	// 心跳格式 data: \n\n（空 data 行），Claude Code 将其识别为内容活动来重置超时
 	if !writeSSE(w, heartbeatEvent) {
 		return
 	}
@@ -746,7 +751,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			if !ok {
 				goto streamDone
 			}
-			heartbeat.Reset(1 * time.Second)
+			heartbeat.Reset(500 * time.Millisecond)
 			var meta map[string]any
 			if json.Unmarshal(line, &meta) == nil {
 				if meta["_type"] == "headers" {
@@ -868,7 +873,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	var writeMu sync.Mutex
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1607,7 +1612,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	}
 
 	var lastUsage *schema.InternalUsage
-	heartbeat := time.NewTicker(1 * time.Second)
+	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
 	if !writeSSE(w, heartbeatEvent) {
