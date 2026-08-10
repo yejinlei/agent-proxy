@@ -732,7 +732,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	var lastUsage *schema.InternalUsage
-	heartbeat := time.NewTicker(2 * time.Second)
+	heartbeat := time.NewTicker(1 * time.Second)
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
 	// 心跳格式 event: ping + data: \n（空数据）符合 Anthropic SSE 规范
@@ -746,7 +746,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			if !ok {
 				goto streamDone
 			}
-			heartbeat.Reset(2 * time.Second)
+			heartbeat.Reset(1 * time.Second)
 			var meta map[string]any
 			if json.Unmarshal(line, &meta) == nil {
 				if meta["_type"] == "headers" {
@@ -868,7 +868,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	var writeMu sync.Mutex
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1583,7 +1583,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
-	lines, headers, err := p.CallStream(ctx, body, callInfo)
+	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	if err != nil {
 		log.Printf("[passthrough] upstream stream error: %s url=%s body_len=%d err=%v",
 			aliasModel, q.proxyBaseURL, len(body), err)
@@ -1607,12 +1607,24 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	}
 
 	var lastUsage *schema.InternalUsage
+	heartbeat := time.NewTicker(1 * time.Second)
+	defer heartbeat.Stop()
+	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
+	if !writeSSE(w, heartbeatEvent) {
+		return
+	}
+	flusher.Flush()
 streamLoop:
 	for {
 		select {
 		case <-callCtx.Done():
 			log.Printf("[passthrough] raw stream context cancelled: %v", callCtx.Err())
 			return
+		case <-heartbeat.C:
+			if !writeSSE(w, heartbeatEvent) {
+				return
+			}
+			flusher.Flush()
 		case line, ok := <-lines:
 			if !ok {
 				break streamLoop
