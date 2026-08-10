@@ -291,8 +291,8 @@ func runServer(args []string) {
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        handler,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   120 * time.Second,
+		ReadTimeout:    120 * time.Second,
+		WriteTimeout:   600 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
