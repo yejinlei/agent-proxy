@@ -127,7 +127,6 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
 	headers.Set("Connection", "keep-alive")
-	headers.Set("X-Real-IP", "") // 代理头
 	httpReq.Header = headers
 
 	go func() {
@@ -247,6 +246,71 @@ func lineReader(ctx context.Context, r io.Reader) func() ([]byte, error) {
 				}
 				return nil, err
 			}
+		}
+	}
+}
+
+// sseEventReader 从上游 SSE 流读取完整事件，返回 (event_name, data_json)
+// 支持 Anthropic SSE 格式：`:event_name` 注释行 + `data: {json}`
+// 也支持标准 SSE 格式：`event: name` + `data: {json}`
+func sseEventReader(ctx context.Context, r io.Reader) func() (eventName string, data []byte, err error) {
+	lineFn := lineReader(ctx, r)
+
+	return func() (string, []byte, error) {
+		var eventName string
+		var dataParts [][]byte
+
+		for {
+			select {
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			default:
+			}
+
+			line, err := lineFn()
+			if err != nil {
+				if len(dataParts) > 0 {
+					combined := bytes.Join(dataParts, []byte{})
+					return eventName, combined, err
+				}
+				if err == io.EOF {
+					return "", nil, err
+				}
+				return "", nil, err
+			}
+
+			trimmed := strings.TrimSpace(string(line))
+
+			// 跳过空行（事件分隔符）
+			if trimmed == "" {
+				if len(dataParts) > 0 {
+					combined := bytes.Join(dataParts, []byte{})
+					return eventName, combined, nil
+				}
+				continue
+			}
+
+			// 解析 event: name（标准 SSE）
+			if strings.HasPrefix(trimmed, "event: ") {
+				eventName = strings.TrimSpace(trimmed[7:])
+				continue
+			}
+
+			// 解析 data: payload
+			if strings.HasPrefix(trimmed, "data: ") {
+				payload := trimmed[6:]
+				dataParts = append(dataParts, []byte(payload))
+				continue
+			}
+
+			// Anthropic 风格的注释行：:event_name（如 :message_start）
+			if len(trimmed) > 1 && trimmed[0] == ':' && !strings.HasPrefix(trimmed, "://") {
+				eventName = trimmed[1:]
+				continue
+			}
+
+			// 其他情况（原始 data 行，无 data: 前缀），当作 data payload
+			dataParts = append(dataParts, []byte(trimmed))
 		}
 	}
 }
