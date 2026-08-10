@@ -174,12 +174,18 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
 				return
 			default:
 				line, err := reader()
 				if err != nil {
 					if err != io.EOF {
-						linesCh <- json.RawMessage(`{"error":{"message":"` + err.Error() + `"}}`)
+						errMsg, _ := json.Marshal(map[string]interface{}{
+							"_type":   "error",
+							"_status": 502,
+							"data":    "stream read failed: " + err.Error(),
+						})
+						linesCh <- errMsg
 					}
 					return
 				}
@@ -210,6 +216,7 @@ func lineReader(ctx context.Context, r io.Reader) func() ([]byte, error) {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
 				return nil, ctx.Err()
 			default:
 			}
@@ -376,12 +383,18 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
 				return
 			default:
 				line, err := reader()
 				if err != nil {
 					if err != io.EOF {
-						linesCh <- json.RawMessage(`{"error":{"message":"` + err.Error() + `"}}`)
+						errMsg, _ := json.Marshal(map[string]interface{}{
+							"_type":   "error",
+							"_status": 502,
+							"data":    "stream read failed: " + err.Error(),
+						})
+						linesCh <- errMsg
 					}
 					return
 				}
@@ -538,12 +551,18 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
 				return
 			default:
 				line, err := reader()
 				if err != nil {
 					if err != io.EOF {
-						linesCh <- json.RawMessage(`{"error":{"message":"` + err.Error() + `"}}`)
+						errMsg, _ := json.Marshal(map[string]interface{}{
+							"_type":   "error",
+							"_status": 502,
+							"data":    "stream read failed: " + err.Error(),
+						})
+						linesCh <- errMsg
 					}
 					return
 				}

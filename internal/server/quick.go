@@ -594,7 +594,11 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(outResp)
+	if _, err := w.Write(outResp); err != nil {
+		log.Printf("[passthrough] write error: %s=%s url=%s err=%v",
+			aliasModel, realModel, q.proxyBaseURL, err)
+		return
+	}
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = body
@@ -681,7 +685,11 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		if aliasHit && aliasModel != "" {
 			writeLine = echoAliasInStreamLine(line, aliasModel)
 		}
-		w.Write(writeLine)
+		if _, err := w.Write(writeLine); err != nil {
+			log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
+				aliasModel, realModel, q.proxyBaseURL, err)
+			return
+		}
 		w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 		flusher.Flush()
 	}
