@@ -276,6 +276,19 @@ type verboseCtx struct {
 func (q *QuickGateway) Routes() chi.Router {
 	mux := chi.NewRouter()
 
+	// 入口兜底：记录每个到达的请求 + panic 恢复，用于排查 ECONNRESET
+	mux.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("[incoming] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[panic] %s %s from %s: %v", r.Method, r.URL.Path, r.RemoteAddr, rec)
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	})
+
 	if q.clientKeyEnabled {
 		mux.Use(middleware.Auth(q.clientKey))
 	}
