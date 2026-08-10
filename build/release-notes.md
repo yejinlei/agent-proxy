@@ -1,3 +1,15 @@
+## v0.2.36
+
+### 修复
+- **非流模式 SSE 包装格式修正（`handlePassthroughNonStreamAsSSE`）**：响应头从非标准 `event: message\ndata: {JSON}\n\nevent: done\ndata: {}\n\n` 改为标准 unnamed event 格式 `data: {JSON}\n\n`，与 Anthropic 实际 SSE 协议一致。Anthropic SSE 使用 unnamed event（仅 `data:` 行 + `\n\n` 分隔），不依赖 `event:` 字段区分事件类型，而是通过 JSON 内 `type` 字段区分。
+- **移除上游请求的空 `X-Real-IP` 头（`OpenAIClient.CallStream`）**：`headers.Set("X-Real-IP", "")` 发送空值 header，语义不干净且上游会用实际客户端 IP 覆盖，功能无害但清理后更规范。
+
+### 说明
+- 本版本修复源于 BUG 审查参考意见（8 项建议），一对一核对后采纳 2 项：
+  - ✅ `X-Real-IP` 空值头 → 移除
+  - ✅ 非流模式 SSE 非标准 `event:` 标记 → 改为 unnamed event 格式
+  - ❌ 其余 6 项经核对与分析前提不符，详见审查记录
+
 ## v0.2.35
 
 ### 修复
