@@ -667,45 +667,58 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	var lastUsage *schema.InternalUsage
-	for line := range lines {
-		var meta map[string]any
-		if json.Unmarshal(line, &meta) == nil {
-			if meta["_type"] == "headers" {
-				continue
+	heartbeat := time.NewTicker(5 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				goto streamDone
 			}
-			if meta["_type"] == "error" {
-				status, _ := meta["_status"].(float64)
-				if status == 0 {
-					status = 502
+			heartbeat.Reset(5 * time.Second)
+			var meta map[string]any
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					continue
 				}
-				errData, _ := meta["data"].(string)
-				log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
-					aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(int(status))
-				if errData != "" {
-					w.Write([]byte(errData))
+				if meta["_type"] == "error" {
+					status, _ := meta["_status"].(float64)
+					if status == 0 {
+						status = 502
+					}
+					errData, _ := meta["data"].(string)
+					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
+						aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
+					// SSE 流已开始后不能再修改 HTTP 状态码，直接写入错误数据
+					if errData != "" {
+						w.Write([]byte(errData))
+					}
+					return
 				}
+			}
+			// 累积 usage（用于 -v 日志）
+			usage := q.extractUsage(line)
+			if usage != nil {
+				lastUsage = usage
+			}
+			writeLine := line
+			if aliasHit && aliasModel != "" {
+				writeLine = echoAliasInStreamLine(line, aliasModel)
+			}
+			if _, err := w.Write(writeLine); err != nil {
+				log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
+					aliasModel, realModel, q.proxyBaseURL, err)
 				return
 			}
+			w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
+			flusher.Flush()
+		case <-heartbeat.C:
+			// SSE 心跳：防止客户端因上游思考时间过长而超时断开
+			w.Write([]byte(": heartbeat\n\n"))
+			flusher.Flush()
 		}
-		// 累积 usage（用于 -v 日志）
-		usage := q.extractUsage(line)
-		if usage != nil {
-			lastUsage = usage
-		}
-		writeLine := line
-		if aliasHit && aliasModel != "" {
-			writeLine = echoAliasInStreamLine(line, aliasModel)
-		}
-		if _, err := w.Write(writeLine); err != nil {
-			log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
-				aliasModel, realModel, q.proxyBaseURL, err)
-			return
-		}
-		w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
-		flusher.Flush()
 	}
+streamDone:
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = body
