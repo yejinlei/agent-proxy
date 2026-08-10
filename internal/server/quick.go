@@ -46,6 +46,10 @@ type QuickGateway struct {
 	verboseLevel int
 	// 模型别名映射文件（外部配置，支持 @default / @db:<id>,<model> / 纯字符串）
 	aliasFile *db.AliasFile
+	// 流式偏好：首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+	streamPreferMu        sync.RWMutex
+	streamPreferTested    bool // 是否已完成首次竞速探测
+	streamPreferNonStream bool // true=非流式更快, false=SSE 更快
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -370,7 +374,18 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
-			q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+			// 流式偏好：首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+			q.streamPreferMu.RLock()
+			tested := q.streamPreferTested
+			preferNonStream := q.streamPreferNonStream
+			q.streamPreferMu.RUnlock()
+			if !tested {
+				q.handlePassthroughRace(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+			} else if preferNonStream {
+				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+			} else {
+				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+			}
 		} else {
 			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 		}
@@ -547,6 +562,14 @@ func echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMess
 		return json.RawMessage(strings.Replace(s, old, `"model":"`+aliasModel+`"`, 1))
 	}
 	return line
+}
+
+// quickRemoveStreamFlag 将请求体中的 "stream": true 改为 "stream": false
+func quickRemoveStreamFlag(body []byte) []byte {
+	s := string(body)
+	s = strings.Replace(s, `"stream":true`, `"stream":false`, 1)
+	s = strings.Replace(s, `"stream": true`, `"stream": false`, 1)
+	return []byte(s)
 }
 
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
@@ -728,6 +751,224 @@ streamDone:
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = body
 	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
+}
+
+// handlePassthroughRace 首次请求并行竞速 SSE vs 非流式，记录胜出方式
+func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// 两个独立 context，先到者取消另一个
+	sseCtx, sseCancel := context.WithCancel(ctx)
+	defer sseCancel()
+	nsCtx, nsCancel := context.WithCancel(ctx)
+	defer nsCancel()
+
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+
+	// 准备非流式请求体：去掉 stream 标记
+	nsBody := quickRemoveStreamFlag(body)
+	if aliasHit && aliasModel != "" {
+		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
+	}
+
+	// 准备 SSE 请求体
+	sseBody := body
+	if aliasHit && aliasModel != "" {
+		sseBody = quickReplaceModelInBody(sseBody, aliasModel, realModel)
+	}
+
+	type raceResult struct {
+		stream    bool
+		body      json.RawMessage
+		headers   http.Header
+		err       error
+		lastUsage *schema.InternalUsage
+	}
+	resultCh := make(chan raceResult, 2)
+
+	// 并行发 SSE 流式
+	go func() {
+		lines, headers, err := p.CallStream(sseCtx, sseBody, callInfo)
+		if err != nil {
+			resultCh <- raceResult{stream: true, err: err}
+			return
+		}
+		// 透传下游响应头
+		for k, v := range headers {
+			for _, val := range v {
+				w.Header().Add(k, val)
+			}
+		}
+		w.Write([]byte("event: ping\ndata: {}\n\n"))
+		flusher.Flush()
+
+		var lastUsage *schema.InternalUsage
+		for {
+			line, ok := <-lines
+			if !ok {
+				break
+			}
+			var meta map[string]any
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					continue
+				}
+				if meta["_type"] == "error" {
+					status, _ := meta["_status"].(float64)
+					errData, _ := meta["data"].(string)
+					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
+						aliasModel, realModel, q.proxyBaseURL, len(sseBody), status, errData)
+					resultCh <- raceResult{stream: true, err: fmt.Errorf("upstream error: %s", errData)}
+					return
+				}
+			}
+			usage := q.extractUsage(line)
+			if usage != nil {
+				lastUsage = usage
+			}
+			writeLine := line
+			if aliasHit && aliasModel != "" {
+				writeLine = echoAliasInStreamLine(line, aliasModel)
+			}
+			if _, err := w.Write(writeLine); err != nil {
+				log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
+					aliasModel, realModel, q.proxyBaseURL, err)
+				resultCh <- raceResult{stream: true, err: err}
+				return
+			}
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+		}
+		resultCh <- raceResult{stream: true, lastUsage: lastUsage}
+	}()
+
+	// 并行发非流式
+	go func() {
+		respBody, headers, err := p.Call(nsCtx, nsBody, callInfo)
+		if err != nil {
+			resultCh <- raceResult{stream: false, err: err}
+			return
+		}
+		// 如果命中别名，回显客户端模型名
+		if aliasHit && aliasModel != "" {
+			respBody = echoAliasInResponseBody(respBody, aliasModel)
+		}
+		resultCh <- raceResult{stream: false, body: respBody, headers: headers}
+	}()
+
+	// 等待先到者
+	result := <-resultCh
+	if result.err != nil {
+		// 第一个失败，等第二个
+		result2 := <-resultCh
+		if result2.err != nil {
+			log.Printf("[passthrough] race: both failed sse=%v ns=%v: %s=%s",
+				result.err, result2.err, aliasModel, realModel)
+			q.sendError(w, http.StatusBadGateway, "race_failed", "both SSE and non-stream failed")
+			return
+		}
+		result = result2
+	}
+
+	// 记录胜出方式
+	q.streamPreferMu.Lock()
+	q.streamPreferTested = true
+	q.streamPreferNonStream = !result.stream
+	q.streamPreferMu.Unlock()
+	log.Printf("[passthrough] race result: %s=%s prefer_nonstream=%v sse_err=%v",
+		aliasModel, realModel, !result.stream, result.err)
+
+	if result.stream {
+		// SSE 胜出：数据已由 goroutine 写入 w，只需记录日志
+		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+		vctx.upstreamReq = sseBody
+		q.logRequest(vctx, startTime, http.StatusOK, result.lastUsage, nil)
+	} else {
+		// 非流式胜出：包装成 SSE 返回
+		// 取消 SSE goroutine
+		sseCancel()
+		// 透传响应头
+		for k, v := range result.headers {
+			for _, val := range v {
+				w.Header().Add(k, val)
+			}
+		}
+		// 直接写入完整响应（非流式一次返回）
+		if _, err := w.Write(result.body); err != nil {
+			log.Printf("[passthrough] race write error: %s=%s err=%v", aliasModel, realModel, err)
+			return
+		}
+		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+		vctx.upstreamReq = nsBody
+		q.logRequest(vctx, startTime, http.StatusOK, nil, nil)
+	}
+}
+
+// handlePassthroughNonStreamAsSSE 非流式调上游，包装成 SSE 返回
+func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+
+	// 去掉 stream 标记
+	nsBody := quickRemoveStreamFlag(body)
+	if aliasHit && aliasModel != "" {
+		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
+	}
+
+	respBody, headers, err := p.Call(ctx, nsBody, callInfo)
+	if err != nil {
+		flusher.Flush()
+		log.Printf("[passthrough] nonstream-as-sse error: %s=%s url=%s err=%v",
+			aliasModel, realModel, q.proxyBaseURL, err)
+		q.sendError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+
+	// 透传响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	// 回显客户端模型名
+	if aliasHit && aliasModel != "" {
+		respBody = echoAliasInResponseBody(respBody, aliasModel)
+	}
+
+	// 直接写入完整响应
+	if _, err := w.Write(respBody); err != nil {
+		log.Printf("[passthrough] nonstream-as-sse write error: %s=%s err=%v",
+			aliasModel, realModel, err)
+		return
+	}
+
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	vctx.upstreamReq = nsBody
+	q.logRequest(vctx, startTime, http.StatusOK, nil, nil)
 }
 
 // handleNonStreamResponse 非流式响应
