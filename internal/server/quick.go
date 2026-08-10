@@ -662,8 +662,16 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
+		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 400,
+			"data":    fmt.Sprintf("read body: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
-		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
 		return
 	}
 	// 命中别名映射时，同步改写请求体中的 model 字段
@@ -673,10 +681,18 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	if err != nil {
-		flusher.Flush()
+		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v",
 			aliasModel, realModel, q.proxyBaseURL, len(body), err)
-		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("stream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
 		return
 	}
 
@@ -766,10 +782,11 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	// 两个独立 context，先到者取消另一个
+	// SSE 使用客户端 context（客户端断开则取消）
 	sseCtx, sseCancel := context.WithCancel(ctx)
 	defer sseCancel()
-	nsCtx, nsCancel := context.WithCancel(ctx)
+	// 非流式使用独立 context（不受客户端断开影响）
+	nsCtx, nsCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
 	defer nsCancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
@@ -794,9 +811,11 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		lastUsage *schema.InternalUsage
 	}
 	resultCh := make(chan raceResult, 2)
+	sseDone := make(chan struct{})
 
 	// 并行发 SSE 流式
 	go func() {
+		defer close(sseDone)
 		lines, headers, err := p.CallStream(sseCtx, sseBody, callInfo)
 		if err != nil {
 			resultCh <- raceResult{stream: true, err: err}
@@ -851,18 +870,52 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		resultCh <- raceResult{stream: true, lastUsage: lastUsage}
 	}()
 
-	// 并行发非流式
+	// 并行发非流式（使用独立 HTTP Client + Transport，避免 SSE 请求取消后影响连接池）
 	go func() {
-		respBody, headers, err := p.Call(nsCtx, nsBody, callInfo)
+		nsClient := &http.Client{
+			Timeout:   time.Duration(q.timeout) * time.Second,
+			Transport: &http.Transport{}, // 独立连接池，与 SSE 请求的 DefaultTransport 隔离
+		}
+		url := p.BuildURL(callInfo, "", false)
+		httpReq, err := http.NewRequestWithContext(nsCtx, "POST", url, bytes.NewReader(nsBody))
 		if err != nil {
 			resultCh <- raceResult{stream: false, err: err}
 			return
 		}
+		reqHeaders := p.DefaultHeaders(callInfo)
+		for k, v := range reqHeaders {
+			httpReq.Header[k] = v
+		}
+		log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(nsBody), httpReq.ContentLength)
+
+		resp, err := nsClient.Do(httpReq)
+		if err != nil {
+			resultCh <- raceResult{stream: false, err: err}
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			resultCh <- raceResult{stream: false, err: err}
+			return
+		}
+
+		respHeaders := http.Header{}
+		for k, v := range resp.Header {
+			respHeaders[k] = v
+		}
+
+		if resp.StatusCode >= 400 {
+			resultCh <- raceResult{stream: false, err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))}
+			return
+		}
+
 		// 如果命中别名，回显客户端模型名
 		if aliasHit && aliasModel != "" {
 			respBody = echoAliasInResponseBody(respBody, aliasModel)
 		}
-		resultCh <- raceResult{stream: false, body: respBody, headers: headers}
+		resultCh <- raceResult{stream: false, body: respBody, headers: respHeaders}
 	}()
 
 	// 等待先到者
@@ -873,7 +926,9 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		if result2.err != nil {
 			log.Printf("[passthrough] race: both failed sse=%v ns=%v: %s=%s",
 				result.err, result2.err, aliasModel, realModel)
-			q.sendError(w, http.StatusBadGateway, "race_failed", "both SSE and non-stream failed")
+			// 不调用 sendError（SSE 头已提交），直接写 SSE 错误事件
+			w.Write([]byte("event: error\ndata: {\"error\":\"both SSE and non-stream failed\"}\n\n"))
+			flusher.Flush()
 			return
 		}
 		result = result2
@@ -896,8 +951,9 @@ func (q *QuickGateway) handlePassthroughRace(p provider.Provider, ctx context.Co
 		q.logRequest(vctx, startTime, http.StatusOK, result.lastUsage, nil)
 	} else {
 		// 非流式胜出：包装成 SSE 返回
-		// 取消 SSE goroutine
+		// 取消 SSE goroutine，等待其完全退出后再写响应（避免并发写 w）
 		sseCancel()
+		<-sseDone
 		// 透传响应头
 		for k, v := range result.headers {
 			for _, val := range v {
@@ -940,10 +996,19 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 
 	respBody, headers, err := p.Call(ctx, nsBody, callInfo)
 	if err != nil {
-		flusher.Flush()
+		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
+		// 直接写入 SSE 错误事件
 		log.Printf("[passthrough] nonstream-as-sse error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
-		q.sendError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("upstream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
 		return
 	}
 
@@ -1065,8 +1130,17 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 
 	lines, _, err := p.CallStream(callCtx, downstreamReq, q.info)
 	if err != nil {
+		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
+		log.Printf("[stream] upstream stream error: %s err=%v", q.proxyBaseURL, err)
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("stream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
-		q.sendError(w, http.StatusInternalServerError, "stream_error", err.Error())
 		return
 	}
 
