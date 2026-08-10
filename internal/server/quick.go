@@ -868,7 +868,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		}
 	}()
 
-	respBody, headers, err := p.Call(ctx, nsBody, callInfo)
+	respBody, _, err := p.Call(ctx, nsBody, callInfo)
 	close(done) // 立即停止心跳，防止与后续响应写入并发
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
@@ -887,24 +887,25 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		return
 	}
 
-	// 透传响应头
-	for k, v := range headers {
-		for _, val := range v {
-			w.Header().Add(k, val)
-		}
-	}
-
 	// 回显客户端模型名
 	if aliasHit && aliasModel != "" {
 		respBody = echoAliasInResponseBody(respBody, aliasModel)
 	}
 
-	// 直接写入完整响应
-	if _, err := w.Write(respBody); err != nil {
-		log.Printf("[passthrough] nonstream-as-sse write error: %s=%s err=%v",
+	// 包装为 SSE 格式：event: message + compact JSON + event: done
+	// 原始 JSON 带换行，需要 compact 成单行再放入 SSE data 字段，否则 SSE 协议解析失败
+	var compactBuf bytes.Buffer
+	if err := json.Compact(&compactBuf, respBody); err != nil {
+		log.Printf("[passthrough] nonstream-as-sse compact error: %s=%s err=%v",
 			aliasModel, realModel, err)
-		return
+		// compact 失败则回退到原样写入
+		compactBuf.Reset()
+		compactBuf.Write(respBody)
 	}
+	w.Write([]byte("event: message\ndata: "))
+	w.Write(compactBuf.Bytes())
+	w.Write([]byte("\n\nevent: done\ndata: {}\n\n"))
+	flusher.Flush()
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = nsBody
