@@ -143,7 +143,7 @@ func TestQuickGateway_E2E_Anthropic_Translation(t *testing.T) {
 				{"role": "user", "content": "hi"},
 			},
 			"max_tokens": 100,
-			"stream":   true,
+			"stream":     true,
 		}
 		req := buildRequest("/v1/messages", body)
 		rr := httptest.NewRecorder()
@@ -297,8 +297,8 @@ func TestQuickGateway_E2E_Responses_Translation(t *testing.T) {
 		defer qg.mockServer.Close()
 
 		body := map[string]any{
-			"model": "gpt-4o-mini",
-			"input": "hi",
+			"model":  "gpt-4o-mini",
+			"input":  "hi",
 			"stream": true,
 		}
 		req := buildRequest("/v1/responses", body)
@@ -377,7 +377,7 @@ func setupMockGateway(t *testing.T) *mockGateway {
 		[]string{"openai"},
 		nil,
 		30,
-		"", false, 0,
+		"", false, 0, "auto",
 	)
 	router := qg.Routes()
 

@@ -49,12 +49,14 @@ type QuickGateway struct {
 	// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
 	streamPreferMu sync.RWMutex
 	streamPrefer   map[string]bool // baseURL -> true=非流式更快, false=SSE 更快; key 不存在=未探测
+	// 流式模式：auto(自适应探测) / non-stream(强制非流式) / stream(强制SSE直连)
+	streamMode string
 }
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
 // modelsMap: 协议→模型列表映射，如 {"openai":["gpt-4"],"anthropic":["claude-3"]}
-func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int, streamMode string) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
@@ -80,6 +82,7 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, models
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
 		verboseLevel:       verboseLevel,
+		streamMode:         streamMode,
 	}
 }
 
@@ -373,6 +376,15 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
 		if stream {
+			// --stream-mode: non-stream 强制非流式, stream 强制 SSE, auto 自适应探测
+			switch q.streamMode {
+			case "non-stream":
+				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+				return
+			case "stream":
+				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+				return
+			}
 			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台探测 SSE
 			q.streamPreferMu.RLock()
 			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]

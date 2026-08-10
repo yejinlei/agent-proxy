@@ -159,8 +159,8 @@ func runDBAdd(args []string) {
 var validRunFlags = map[string]bool{
 	"--host": true, "--port": true, "--mode": true,
 	"--db": true, "--conf": true, "--key": true, "--nokey": true,
-	"--aliases": true,
-	"-v":        true, "-vv": true,
+	"--aliases": true, "--stream-mode": true,
+	"-v": true, "-vv": true,
 }
 
 // validRunMode 允许的 mode 值
@@ -178,6 +178,7 @@ func runServer(args []string) {
 	keyGiven := false
 	noClientKey := false
 	aliasPath := ""
+	streamMode := "auto"
 
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
@@ -185,7 +186,7 @@ func runServer(args []string) {
 			fmt.Fprintf(os.Stderr, "❌ 未知参数: %s\n", flag)
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy run [--mode <simple|complex>] [--db <id>]\n")
 			fmt.Fprintf(os.Stderr, "      [--host <h>] [--port <p>] [--conf <f>]\n")
-			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey] [--aliases <f>]\n")
+			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey] [--aliases <f>] [--stream-mode <auto|non-stream|stream>]\n")
 			os.Exit(1)
 		}
 		switch flag {
@@ -228,6 +229,11 @@ func runServer(args []string) {
 			}
 		case "--nokey":
 			noClientKey = true
+		case "--stream-mode":
+			i++
+			if i < len(args) {
+				streamMode = args[i]
+			}
 		case "-v":
 			verboseLevel = 1
 		case "-vv":
@@ -271,7 +277,7 @@ func runServer(args []string) {
 
 	var handler http.Handler
 	if quickMode {
-		quickHandler, err := startQuickMode(dbID, quickClientKey, quickClientKeyEnabled, aliasPath)
+		quickHandler, err := startQuickMode(dbID, quickClientKey, quickClientKeyEnabled, aliasPath, streamMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ 启动快速模式失败: %v\n", err)
 			os.Exit(1)
@@ -332,7 +338,7 @@ func runServer(args []string) {
 }
 
 // startQuickMode 从 DB 读取一条记录启动快速网关
-func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath string) (http.Handler, error) {
+func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath string, streamMode string) (http.Handler, error) {
 	store, err := db.New("")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -359,7 +365,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 60, clientKey, clientKeyEnabled, verboseLevel)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), 60, clientKey, clientKeyEnabled, verboseLevel, streamMode)
 	if aliasPath != "" {
 		af, err := db.LoadAliasFile(aliasPath)
 		if err != nil {
@@ -460,6 +466,8 @@ func printUsage() {
   agent-proxy run --db <id>                                              快速模式（默认，随机生成密钥）
   agent-proxy run --db <id> --key <k>                                   快速模式（指定客户端密钥）
   agent-proxy run --db <id> --nokey                                     快速模式（无需客户端密钥）
+  agent-proxy run --db <id> --stream-mode non-stream                    快速模式（强制非流式）
+  agent-proxy run --db <id> --stream-mode stream                        快速模式（强制SSE直连）
   agent-proxy run --mode complex                                         复杂模式（默认配置）
   agent-proxy run --mode complex --host <h> --port <p>                   复杂模式（指定监听地址/端口）
   agent-proxy run --mode complex --host <h> --port <p> --conf <f>        复杂模式（配置文件）
@@ -472,6 +480,7 @@ func printUsage() {
     --conf       复杂模式配置文件路径
     --key <k>    快速模式客户端密钥（默认随机生成并显示）
     --nokey      快速模式不要求客户端密钥（本地开发用）
+    --stream-mode <auto|non-stream|stream>  流式模式（默认 auto 自适应探测）
     -v           快速模式请求日志：客户端 IP / 入站协议 / 上游 / token 用量 / 耗时
     -vv          快速模式四向日志：依次显示 [Guest→代理] [代理→LLM] [LLM→代理] [代理→Guest]
 
