@@ -1,3 +1,15 @@
+## v0.2.38
+
+### 修复
+- **`--stream-mode auto` 模式下 Claude Code 仍收到 raw JSON 而非 SSE（根因修复）**：auto 模式下的 `stream=false` 分支（`else` 路径，line 439-441）此前直接调用 `handlePassthroughNonStream`（raw JSON，无 SSE 包装、无心跳），与 v0.2.35 中只修复了显式 `non-stream` 模式的逻辑一致。Claude Code 请求（不带 `stream` 字段）在 auto 模式下被错误路由 → SSE 解析器收到纯 JSON → 超时 → ECONNRESET。现改为 `handlePassthroughNonStreamAsSSE`（非流式+SSE 包装），与 `--stream-mode non-stream` 行为一致。
+- **Thinking block SSE 事件格式错误（`handlePassthroughNonStreamAsSSE`）**：上游 Anthropic Messages 响应的 `content` 数组可能含 `type:"thinking"` 的块（cogitation 内容），SSE 包装此前将其当作 text block 处理，导致三个问题：(1) `content_block_start` 含多余的 `text:""` 字段；(2) Delta 类型写死 `text_delta` 而非 `thinking_delta`；(3) 从未读取 `blockMap["thinking"]` 中的思考内容。现按 block 类型分别处理，thinking block 输出正确的 `thinking_delta` 类型并提取实际思考文本。
+
+### 根因
+- auto 模式的 else 分支：v0.2.35 修复时只覆盖了 `--stream-mode non-stream` 显式模式，遗漏了 auto 模式下 `stream=false` 的 else 路径
+- Thinking block：v0.2.32 首次实现 SSE 包装时仅按 text block 逻辑写死，未考虑 Anthropic Messages 协议中 thinking block 的独立格式
+
+---
+
 ## v0.2.37
 
 ### 修复

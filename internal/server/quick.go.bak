@@ -436,12 +436,10 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			} else {
 				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 			}
-		// Claude Code（Anthropic Messages）不带 stream 字段 → 客户端仍期望 SSE
-		// OpenAI 客户端显式发送 stream:false → 期望 raw JSON
-		} else if quickStreamFieldAbsent(body) {
-			q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+		// Claude Code（Anthropic Messages）不带 stream 字段 → stream=false，
+		// 但客户端仍期望 SSE。走非流式+SSE 包装，与 --stream-mode non-stream 一致。
 		} else {
-			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+			q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 		}
 		return
 	}
@@ -639,6 +637,7 @@ func quickInjectStreamFlag(body json.RawMessage) json.RawMessage {
 	}
 	_, exists := m["stream"]
 	if !exists {
+		// 先 unmarshal 再加字段再 marshal，保证 JSON 格式正确
 		m["stream"] = true
 		out, err := json.Marshal(m)
 		if err != nil {
@@ -647,19 +646,6 @@ func quickInjectStreamFlag(body json.RawMessage) json.RawMessage {
 		return json.RawMessage(out)
 	}
 	return body
-}
-
-// quickStreamFieldAbsent 检测请求体中是否缺失 stream 字段（非 false）
-// Claude Code 的 Anthropic Messages 请求不带 stream 字段，但客户端仍期望 SSE；
-// OpenAI 客户端显式发送 stream:false 时，期望 raw JSON 非流式响应。
-// 此函数区分两者：field 不存在返回 true，field 存在（无论 true/false）返回 false。
-func quickStreamFieldAbsent(body json.RawMessage) bool {
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
-		return false
-	}
-	_, exists := m["stream"]
-	return !exists
 }
 
 // handlePassthroughStreamWithBody 与 handlePassthroughStream 一致，但 body 已在调用方读取
@@ -1141,14 +1127,13 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 				}
 
 				// content_block_start
-				blockStartMap := map[string]interface{}{"type": blockType}
-				if blockType == "text" {
-					blockStartMap["text"] = ""
-				}
 				blockStart := map[string]interface{}{
-					"type":          "content_block_start",
-					"index":         idx,
-					"content_block": blockStartMap,
+					"type":  "content_block_start",
+					"index": idx,
+					"content_block": map[string]interface{}{
+						"type": blockType,
+						"text": "",
+					},
 				}
 				blockStartJSON, err := json.Marshal(blockStart)
 				if err != nil {
@@ -1159,14 +1144,8 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 				}
 
 				// content_block_delta
-				deltaType := "text_delta"
 				txt := ""
-				if blockType == "thinking" {
-					deltaType = "thinking_delta"
-					if t, ok := blockMap["thinking"].(string); ok {
-						txt = t
-					}
-				} else {
+				if blockType == "text" {
 					if t, ok := blockMap["text"].(string); ok {
 						txt = t
 					}
@@ -1175,7 +1154,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 					"type":  "content_block_delta",
 					"index": idx,
 					"delta": map[string]interface{}{
-						"type": deltaType,
+						"type": "text_delta",
 						"text": txt,
 					},
 				})
