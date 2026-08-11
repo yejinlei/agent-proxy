@@ -1,3 +1,20 @@
+## v0.2.37
+
+### 修复
+- **`--stream-mode non-stream` SSE 包装格式检测（`handlePassthroughNonStreamAsSSE`）**：响应格式检测覆盖 4 种协议——`content`(Anthropic Messages) → `choices`(OpenAI ChatCompletion) → `candidates`(Gemini) → `output`(OpenAI Responses) → 裸 JSON 降级，各格式输出正确的 SSE 结构（RFC 8387 unnamed event），确保 `--stream-mode non-stream` 模式下所有协议的客户端 SSE 解析器正确解析响应。
+- **Alias 点/横杠归一化（`resolveAlias()`）**：Claude Code 发送模型名含点号（`claude-haiku-4.5`），alias 文件用横杠（`claude-haiku-4-5`），查找失败时 fallback 点→横杠重试。
+- **`handlePassthroughStreamWithBody` 三合一修复**：添加 `\n\n` SSE 事件边界、alias 流内回显、token usage 提取，与 `handlePassthroughRawStream` 行为对齐。
+- **`writeSSE` 错误处理**：任何 `w.Write` 错误均返回 false，不再仅吞没连接重置错误。
+- **`handlePassthroughNonStreamAsSSE` 超时防护**：`p.Call(ctx)` 改为 `p.Call(callCtx)`（`context.WithTimeout`），防止上游卡死时连接永久挂起。
+- **`buildVerboseCtx` 补全 ingress 信息**：从 context 复制 `ingressProtocol`/`providerType`，修复 raw passthrough 路径 `-v` 日志跳过问题。
+- **`quickReplaceModelInBody` 改用 JSON 解析**：从字符串替换改为 `json.Unmarshal`/`json.Marshal`，避免边界匹配拼接错误。
+
+### 根因
+- SSE 包装格式检测：v0.2.32 首次实现时仅针对 Anthropic Messages，后续协议支持未同步更新包装逻辑
+- Alias 点/横杠：Claude Code dot 风格（`claude-haiku-4.5`）vs 用户 kebab-case（`claude-haiku-4-5`），无归一化
+
+---
+
 ## v0.2.36
 
 ### 修复
