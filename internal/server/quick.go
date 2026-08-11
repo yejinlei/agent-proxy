@@ -1158,28 +1158,46 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 					return
 				}
 
-				// content_block_delta
-				deltaType := "text_delta"
-				txt := ""
-				if blockType == "thinking" {
-					deltaType = "thinking_delta"
-					if t, ok := blockMap["thinking"].(string); ok {
-						txt = t
+				// content_block_delta — 按 block type 区分 delta 类型和字段名
+				// Anthropic 协议：text 块 → {"type":"text_delta","text":"..."}
+				//                 thinking 块 → {"type":"thinking_delta","thinking":"..."}
+				deltaJSON, err := func() ([]byte, error) {
+					switch blockType {
+					case "text":
+						var txt string
+						if t, ok := blockMap["text"].(string); ok {
+							txt = t
+						}
+						return json.Marshal(map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type": "text_delta",
+								"text": txt,
+							},
+						})
+					case "thinking":
+						var thinking string
+						if t, ok := blockMap["thinking"].(string); ok {
+							thinking = t
+						}
+						return json.Marshal(map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type":     "thinking_delta",
+								"thinking": thinking,
+							},
+						})
+					default:
+						// tool_use / image / 等非文本块不发送 delta 事件
+						return nil, nil
 					}
-				} else {
-					if t, ok := blockMap["text"].(string); ok {
-						txt = t
-					}
-				}
-				deltaJSON, err := json.Marshal(map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{
-						"type": deltaType,
-						"text": txt,
-					},
-				})
+				}()
 				if err != nil {
+					continue
+				}
+				if len(deltaJSON) == 0 {
 					continue
 				}
 				if !writeSSE(w, []byte("data: "+string(deltaJSON)+"\n\n")) {
