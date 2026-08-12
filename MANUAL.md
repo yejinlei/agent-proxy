@@ -204,6 +204,10 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 | `agent-proxy run --mode complex --host 0.0.0.0 --port 8080` | 复杂模式（默认配置） |
 | `agent-proxy run --mode complex --conf agent-proxy.yaml` | 复杂模式 + 配置文件 |
 | `agent-proxy run --db 1 -v` / `-vv` | 追加日志级别（摘要 / 四向全链路） |
+| `agent-proxy run --db 1 --stream-mode stream` | 强制上游使用流式（SSE） |
+| `agent-proxy run --db 1 --stream-mode non-stream` | 强制上游使用非流式 |
+| `agent-proxy run --db 1 --stream-mode passthrough` | 直连透传，不注入心跳/SSE 包装 |
+| `agent-proxy run --db 1 --stream-mode auto` | 自动按请求体 `stream` 字段 + 自适应偏好（默认） |
 | `agent-proxy --help` | 显示帮助 |
 
 ### db 管理
@@ -426,6 +430,133 @@ ChatCompletionRequest  ─→  InternalRequest  ─→  GeminiRequest
 - 模型名通过防御拷贝的 `ProviderInfo.Name` 注入下游 URL（如 Gemini `/v1/models/{model}:generateContent`）
 - 响应体原样回传，仅过滤内部元数据事件（`_type="headers"`）
 - 请求体在入口预读取为内存，透传时重包为可读流，避免 body 耗尽
+
+### `--stream-mode` 流式策略控制
+
+`--stream-mode` 控制代理**透传路径**下如何向上游发送请求。仅在入站协议与上游协议相同时生效（如 Anthropic→Anthropic），翻译路径不受此参数影响。
+
+**四种模式：**
+
+| 模式 | 行为 | 适用场景 |
+|------|------|---------|
+| `auto`（默认） | 按请求体 `stream` 字段路由：有 `stream` → SSE 流式，无/`stream:false` → chunked JSON（先写响应头 + Flush 防超时，再等上游，符合 Anthropic 规范） | 日常使用，标准客户端兼容 |
+| `stream` | 强制上游走 SSE 流 | 上游仅支持流式，或跳过首次探测 |
+| `non-stream` | 强制上游走非流式 | 上游流式不稳定，或调试用 |
+| `passthrough` | 直连透传，不注入心跳、不做 SSE 包装 | 上下游协议完全对齐 |
+
+**`auto` 模式自适应机制：**
+
+首次请求走非流式 (`handlePassthroughNonStream`，返回 chunked JSON)，响应后启动后台 goroutine 探测同上游的 SSE 流式速度。后续请求按探测结果选择：
+- 流式更快 → 后续请求注入 `stream:true`，走 `handlePassthroughStream`
+- 非流式更快 → 后续请求继续走 `handlePassthroughNonStream`（chunked JSON）
+
+**chunked JSON 防超时机制**：`handlePassthroughNonStream` 在调用上游之前先写 `Content-Type: application/json` + `200 OK` + `Flush()`，Go 的 `net/http` 自动使用 `Transfer-Encoding: chunked`。客户端立即收到响应头，知道 body 还在后面，在 12-16s 上游等待期间不会误判连接已死（ECONNRESET）。
+
+偏好按上游地址独立存储 (`streamPrefer map[string]bool`)，多上游互不干扰。非流式响应直接返回 chunked JSON，不再包装为 SSE，符合 Anthropic API 规范，兼容 Claude Code v2.1+ 及各主流客户端。
+
+**`stream` 模式路由逻辑：**
+
+```
+请求体有 stream 字段 → handlePassthroughStreamWithBody（透传 SSE）
+请求体无 stream 字段 → handlePassthroughNonStream（返回完整 JSON）
+```
+
+无 `stream` 字段的请求（如 Claude Code `/model` 验证）返回 `application/json`，避免 SSE 包装导致 `usage.input_tokens` 解析失败。
+
+**`non-stream` 模式：**
+
+所有请求走 `handlePassthroughNonStreamAsSSE`——调用上游非流式 API，将完整 JSON 响应**拆解并包装为 SSE 事件流**返回给客户端。
+
+**`NonStreamAsSSE` 响应格式检测：**
+
+该函数解析上游完整 JSON，按字段检测格式并生成对应的 SSE 事件：
+
+| 检测字段 | 协议 | 生成的 SSE 事件 |
+|---------|------|----------------|
+| `respMap["content"]` 为数组 | Anthropic Messages | `message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta`(含 usage) → `message_stop` |
+| `respMap["choices"]` 为数组 | OpenAI ChatCompletion | `data: {chunk}...\n\ndata: [DONE]\n\n` |
+| `respMap["candidates"]` | Gemini | `data: {chunk}...\n\n`（裸 JSON，无 [DONE]） |
+| `respMap["output"]` | OpenAI Responses | `data: {chunk}...\n\ndata: [DONE]\n\n` |
+
+**`passthrough` 模式：**
+
+`handlePassthroughRaw` / `handlePassthroughRawStream` / `handlePassthroughRawNonStream`——上游返回什么就发什么，不注入心跳（`data: \n\n`）、不添加 `event: done` 结束标记。适用于已知上下游协议完全对齐的场景。
+
+**心跳机制：**
+
+`stream` 和 `auto`（流式偏好）路径中，`handlePassthroughStream` 每 500ms 发送 `data: \n\n` 心跳，防止上游思考（cogitation）期间 Claude Code 客户端超时断开（ECONNRESET）。`auto` 模式非流式路径通过 chunked transfer 防超时（见上文），无需额外心跳。`non-stream` 路径的 `handlePassthroughNonStreamAsSSE` 在上游响应期间同样发送心跳，响应完成后立即关闭。
+
+**透传路径行为矩阵：**
+
+`--stream-mode` 仅在透传路径（入站协议 == 上游协议）生效。以下矩阵展示不同 `stream` 字段与 `--stream-mode` 组合下的具体行为：
+
+| 请求体 `stream` 字段 | `stream` | `auto` | `non-stream` | `passthrough` |
+|---------------------|----------|--------|-------------|--------------|
+| `stream: true` | `StreamWithBody` 透传 SSE | 自适应偏好 | `NonStreamAsSSE` 包装 JSON→SSE | `RawStream` 直连透传 |
+| 无 `stream` 字段 | `NonStream` 返回 JSON | `NonStream` chunked JSON（先写头防超时） | `NonStreamAsSSE` 包装 JSON→SSE | `RawNonStream` 直连透传 |
+| `stream: false` | `StreamWithBody`（注入 `stream:true`） | `NonStream` chunked JSON（先写头防超时） | `NonStreamAsSSE` 包装 JSON→SSE | `RawNonStream` 直连透传 |
+
+**翻译路径不受 `--stream-mode` 影响：**
+
+当入站协议与上游协议不同时（如 Anthropic 入站 → OpenAI 上游），请求走翻译管道，`stream` 字段由 `InternalRequest.Stream` 控制，不经过 `--stream-mode` 分支：
+
+```
+Anthropic 入站 → OpenAI 上游 (capabilities 无 "anthropic")
+  ↓
+translator 管道: TranslateRequest → InternalRequest → TranslateToProvider
+  ↓
+响应: TranslateFromProvider → InternalResponse → TranslateResponse
+  ↓
+stream 字段按 InternalRequest.Stream 走，不受 --stream-mode 影响
+```
+
+***
+
+## 消息转换流转图
+
+以下 9 张图覆盖入站/上游协议 × 流式/非流式的全部组合，展示从客户端请求到上游调用再到响应的完整消息转换路径。
+
+### 全览
+
+![全览](docs/overview_all_scenarios.svg)
+
+### 场景 1：Anthropic 流式 → OpenAI 流式（翻译路径，stream 保留）
+
+![场景1](docs/scenario_01_anthropic_stream_openai_stream.svg)
+
+### 场景 2：Anthropic 非流式 → OpenAI 非流式（翻译路径，stream 保留）
+
+![场景2](docs/scenario_02_anthropic_nonstream_openai_nonstream.svg)
+
+### 场景 3：Anthropic 流式 → OpenAI 非流式（翻译 + `--stream-mode non-stream`）
+
+![场景3](docs/scenario_03_anthropic_stream_openai_nonstream.svg)
+
+### 场景 4：Anthropic 非流式 → OpenAI 流式（翻译 + `--stream-mode stream`）
+
+![场景4](docs/scenario_04_anthropic_nonstream_openai_stream.svg)
+
+### 场景 5：Anthropic 非流式 → Anthropic 流式（透传 + `--stream-mode stream`）
+
+![场景5](docs/scenario_05_anthropic_nonstream_anthropic_stream.svg)
+
+### 场景 6：Anthropic 流式 → Anthropic 非流式（透传 + `--stream-mode non-stream`）
+
+![场景6](docs/scenario_06_anthropic_stream_anthropic_nonstream.svg)
+
+### 场景 7：OpenAI 流式 → OpenAI 非流式（透传 + `--stream-mode non-stream`）
+
+![场景7](docs/scenario_07_openai_stream_openai_nonstream.svg)
+
+### 场景 8：Responses 非流式 → OpenAI 流式（翻译 + `--stream-mode stream`）
+
+![场景8](docs/scenario_08_responses_nonstream_openai_stream.svg)
+
+### 场景 9：Responses 流式 → OpenAI 非流式（翻译 + `--stream-mode non-stream`）
+
+![场景9](docs/scenario_09_responses_stream_openai_nonstream.svg)
+
+***
 
 ### InternalMessage 结构
 

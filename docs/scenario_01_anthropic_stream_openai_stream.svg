@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 912"
+     width="1140" height="912">
+  <defs>
+    <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1140" height="912" fill="#ffffff"/>
+<text x="570.0" y="28" text-anchor="middle" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="14" font-weight="bold">Scenario 1: Anthropic 流式 → OpenAI 流式</text>
+<text x="570.0" y="48" text-anchor="middle" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">翻译路径 · stream 保留 · handleStreamRequest</text>
+<rect x="14" y="64" width="510" height="28" rx="4" fill="#0969da" opacity="0.15"/>
+<rect x="14" y="64" width="4" height="28" rx="2" fill="#0969da"/>
+<text x="26" y="83" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">REQUEST: 入站协议 → 上游协议</text>
+<rect x="14" y="100" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="116" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">model</text>
+<text x="182" y="116" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"claude-sonnet-5"</text>
+<rect x="590" y="100" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="116" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">model</text>
+<text x="758" y="116" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"deepseek-v4-flash"</text>
+<line x1="514" y1="112.0" x2="590" y2="112.0" stroke="#0969da" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="103.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#0969da" stroke-width="0.8"/>
+<text x="552.0" y="115.0" text-anchor="middle" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="8">别名替换</text>
+<rect x="14" y="134" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="150" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">max_tokens</text>
+<text x="182" y="150" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">1024</text>
+<rect x="590" y="134" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="150" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">max_tokens</text>
+<text x="758" y="150" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">1024</text>
+<line x1="514" y1="146.0" x2="590" y2="146.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="137.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="149.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">透传</text>
+<rect x="14" y="168" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="184" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">stream</text>
+<text x="182" y="184" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">true</text>
+<rect x="590" y="168" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="184" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">stream</text>
+<text x="758" y="184" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">true</text>
+<line x1="514" y1="180.0" x2="590" y2="180.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="171.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="183.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">透传</text>
+<rect x="14" y="202" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="218" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">temperature</text>
+<text x="182" y="218" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">0.7</text>
+<rect x="590" y="202" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="218" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">temperature</text>
+<text x="758" y="218" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">0.7</text>
+<line x1="514" y1="214.0" x2="590" y2="214.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="205.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="217.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">透传</text>
+<rect x="14" y="236" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="252" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">top_p</text>
+<text x="182" y="252" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">0.9</text>
+<rect x="590" y="236" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="252" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">top_p</text>
+<text x="758" y="252" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">0.9</text>
+<line x1="514" y1="248.0" x2="590" y2="248.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="239.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="251.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">透传</text>
+<rect x="14" y="270" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="286" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">stop_sequences</text>
+<text x="182" y="286" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">["\n\nHuman:"]</text>
+<rect x="590" y="270" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="286" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">stop</text>
+<text x="758" y="286" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">["\n\nHuman:"]</text>
+<line x1="514" y1="282.0" x2="590" y2="282.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="273.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="285.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">字段名变化</text>
+<rect x="14" y="304" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="320" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">system</text>
+<text x="182" y="320" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"You are helpful"</text>
+<rect x="590" y="304" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="320" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">messages[0]</text>
+<text x="758" y="320" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{role:"system",...}</text>
+<line x1="514" y1="316.0" x2="590" y2="316.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="307.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="319.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">顶层→消息数组</text>
+<rect x="14" y="338" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="354" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">messages[0].role</text>
+<text x="182" y="354" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"user"</text>
+<rect x="590" y="338" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="354" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">messages[1].role</text>
+<text x="758" y="354" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"user"</text>
+<line x1="514" y1="350.0" x2="590" y2="350.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="341.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="353.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">透传</text>
+<rect x="14" y="372" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="388" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">messages[0].content</text>
+<text x="182" y="388" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">[{type:"text",...}]</text>
+<rect x="590" y="372" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="388" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">messages[1].content</text>
+<text x="758" y="388" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"hello"</text>
+<line x1="514" y1="384.0" x2="590" y2="384.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="375.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="387.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">blocks→字符串</text>
+<rect x="14" y="406" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="422" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">tools[0].name</text>
+<text x="182" y="422" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"get_weather"</text>
+<rect x="590" y="406" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="422" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">tools[0].function.name</text>
+<text x="758" y="422" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"get_weather"</text>
+<line x1="514" y1="418.0" x2="590" y2="418.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="409.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="421.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">路径变化</text>
+<rect x="14" y="440" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="456" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">tools[0].input_schema</text>
+<text x="182" y="456" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"object",...}</text>
+<rect x="590" y="440" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="456" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">tools[0].function.parameters</text>
+<text x="758" y="456" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{...}</text>
+<line x1="514" y1="452.0" x2="590" y2="452.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="443.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="455.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">路径变化</text>
+<rect x="14" y="474" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="490" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">metadata.user_id</text>
+<text x="182" y="490" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"u-123"</text>
+<rect x="590" y="474" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="490" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">user</text>
+<text x="758" y="490" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">"u-123"</text>
+<line x1="514" y1="486.0" x2="590" y2="486.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="477.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="489.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">字段名变化</text>
+<rect x="14" y="528" width="510" height="28" rx="4" fill="#1a7f37" opacity="0.15"/>
+<rect x="14" y="528" width="4" height="28" rx="2" fill="#1a7f37"/>
+<text x="26" y="547" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">RESPONSE: 上游协议 → 入站协议</text>
+<rect x="14" y="564" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="580" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">message_start</text>
+<text x="182" y="580" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"message_start",message:{id,model,role}}</text>
+<rect x="590" y="564" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="580" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data:{id,object,choices:[{delta:</text>
+<text x="758" y="580" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{role:"assistant"}}]}</text>
+<line x1="514" y1="576.0" x2="590" y2="576.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="567.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="579.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">start→首个delta</text>
+<rect x="14" y="598" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="614" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">content_block_start</text>
+<text x="182" y="614" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"content_block_start",index,...}</text>
+<rect x="590" y="598" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="614" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">—</text>
+<text x="758" y="614" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">—</text>
+<line x1="514" y1="610.0" x2="590" y2="610.0" stroke="#656d76" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="601.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#656d76" stroke-width="0.8"/>
+<text x="552.0" y="613.0" text-anchor="middle" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">无对应</text>
+<rect x="14" y="632" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="648" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">content_block_delta</text>
+<text x="182" y="648" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"content_block_delta",delta:{type:"text_delta",text:"He"}}</text>
+<rect x="590" y="632" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="648" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data:{choices:[{delta:</text>
+<text x="758" y="648" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{content:"He"}}]}</text>
+<line x1="514" y1="644.0" x2="590" y2="644.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="635.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="647.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">delta.text→delta.content</text>
+<rect x="14" y="666" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="682" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">content_block_delta</text>
+<text x="182" y="682" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{delta:{type:"input_json_delta",partial_json:"{...}"}}</text>
+<rect x="590" y="666" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="682" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data:{choices:[{delta:</text>
+<text x="758" y="682" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{tool_calls:[{function:{arguments:"{...}"}}]}}]}</text>
+<line x1="514" y1="678.0" x2="590" y2="678.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="669.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="681.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">json→tool_calls</text>
+<rect x="14" y="700" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="716" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">content_block_stop</text>
+<text x="182" y="716" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"content_block_stop",index}</text>
+<rect x="590" y="700" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="716" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">—</text>
+<text x="758" y="716" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">—</text>
+<line x1="514" y1="712.0" x2="590" y2="712.0" stroke="#656d76" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="703.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#656d76" stroke-width="0.8"/>
+<text x="552.0" y="715.0" text-anchor="middle" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">无对应</text>
+<rect x="14" y="734" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="750" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">message_delta</text>
+<text x="182" y="750" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"message_delta",delta:{stop_reason:"end_turn"},usage:{output_tokens:512}}</text>
+<rect x="590" y="734" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="750" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data:{choices:[{</text>
+<text x="758" y="750" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">finish_reason:"stop"}]}</text>
+<line x1="514" y1="746.0" x2="590" y2="746.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="737.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="749.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">stop_reason→finish_reason</text>
+<rect x="14" y="768" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="784" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">message_stop</text>
+<text x="182" y="784" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">{type:"message_stop"}</text>
+<rect x="590" y="768" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="784" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data: [DONE]</text>
+<text x="758" y="784" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75"></text>
+<line x1="514" y1="780.0" x2="590" y2="780.0" stroke="#1a7f37" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="771.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#1a7f37" stroke-width="0.8"/>
+<text x="552.0" y="783.0" text-anchor="middle" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8">流结束</text>
+<rect x="14" y="802" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="22" y="818" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">—</text>
+<text x="182" y="818" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">—</text>
+<rect x="590" y="802" width="500" height="24" rx="2" fill="transparent" opacity="1"/>
+<text x="598" y="818" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">data:{...}</text>
+<text x="758" y="818" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">usage:{prompt_tokens,completion_tokens}</text>
+<line x1="514" y1="814.0" x2="590" y2="814.0" stroke="#bc4c00" stroke-width="1.2" opacity="0.5"/>
+<rect x="524.0" y="805.0" width="56" height="16" rx="3" fill="#ffffff" stroke="#bc4c00" stroke-width="0.8"/>
+<text x="552.0" y="817.0" text-anchor="middle" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="8">usage 字段映射</text>
+<text x="80" y="876" text-anchor="start" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">别名替换</text>
+<text x="185" y="876" text-anchor="start" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">直接透传</text>
+<text x="290" y="876" text-anchor="start" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">合并/拆分</text>
+<text x="395" y="876" text-anchor="start" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">注入</text>
+<text x="470" y="876" text-anchor="start" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">移除</text>
+<text x="545" y="876" text-anchor="start" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="normal">无对应</text>
+</svg>

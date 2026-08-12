@@ -64,8 +64,11 @@ type InternalMessage struct {
 //
 // 统一策略：InternalContentBlock 保留通用字段 + RawExtension 兜底协议特有字段
 type InternalContentBlock struct {
-	Type     string          `json:"type"` // "text" | "image" | "audio" | "file"
+	Type     string          `json:"type"` // "text" | "image" | "audio" | "file" | "thinking" | "signature"
 	Text     string          `json:"text"`
+	// thinking fields (Anthropic extended thinking / SenseNova)
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
 	// Image fields
 	Data      string `json:"data,omitempty"`     // base64 编码
 	MediaType string `json:"media_type,omitempty"`
