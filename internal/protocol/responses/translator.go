@@ -228,8 +228,8 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 					var source map[string]interface{}
 					if cb.Data != "" {
 						source = map[string]interface{}{
-							"type":      "base64",
-							"data":      cb.Data,
+							"type":       "base64",
+							"data":       cb.Data,
 							"media_type": cb.MediaType,
 						}
 					} else if cb.URL != "" {
@@ -305,6 +305,23 @@ func mapStopReasonReverse(reason string) string {
 		return "max_output_tokens"
 	case "tool_calls":
 		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+
+// mapResponsesStatus 将 Responses API 的 response.status 映射为 finish_reason
+//
+//	"completed"  → "stop"
+//	"incomplete" → "length"
+//	"cancelled"  → "stop"
+func mapResponsesStatus(status string, stopReason string) string {
+	if stopReason != "" {
+		return mapStopReason(stopReason)
+	}
+	switch status {
+	case "incomplete":
+		return "length"
 	default:
 		return "stop"
 	}
@@ -455,8 +472,8 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 				{Type: "input_text", Text: contentText},
 			})
 			items = append(items, InputItem{
-				Type: "message",
-				Role: "user",
+				Type:    "message",
+				Role:    "user",
 				Content: json.RawMessage(toolResultContent),
 				ToolCalls: []ToolCall{
 					{Type: "function", ID: msg.ToolCallID, Name: msg.Name},
@@ -548,8 +565,8 @@ func buildResponsesContentBlocks(blocks []schema.InternalContentBlock) []Content
 			var source map[string]interface{}
 			if cb.Data != "" {
 				source = map[string]interface{}{
-					"type":      "base64",
-					"data":      cb.Data,
+					"type":       "base64",
+					"data":       cb.Data,
 					"media_type": cb.MediaType,
 				}
 			} else if cb.URL != "" {
@@ -752,8 +769,10 @@ func (t *ResponsesTranslator) TranslateStreamEvent(event *StreamEvent) *schema.I
 		return &schema.InternalStreamEvent{
 			Type: "done",
 			Data: &schema.InternalStreamChunk{
-				Choices: []schema.InternalChoice{{FinishReason: "stop"}},
-				Usage:   usage,
+				Choices: []schema.InternalChoice{
+					{FinishReason: mapResponsesStatus(data.Status, data.StopReason)},
+				},
+				Usage: usage,
 			},
 		}
 

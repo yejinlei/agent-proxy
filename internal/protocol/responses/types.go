@@ -131,13 +131,15 @@ type StreamEvent struct {
 }
 
 type EventData struct {
-	Type        string     `json:"type"`
-	ID          string     `json:"id,omitempty"`
-	Event       string     `json:"event,omitempty"`
-	OutputIndex int        `json:"output_index"`
+	Type        string       `json:"type"`
+	ID          string       `json:"id,omitempty"`
+	Event       string       `json:"event,omitempty"`
+	OutputIndex int          `json:"output_index"`
 	OutputDelta *OutputDelta `json:"output_delta,omitempty"`
-	Delta       *Delta     `json:"delta,omitempty"`
-	Usage       *Usage     `json:"usage"`
+	Delta       *Delta       `json:"delta,omitempty"`
+	Usage       *Usage       `json:"usage"`
+	Status      string       `json:"status,omitempty"`      // response.completed 事件中的 status
+	StopReason  string       `json:"stop_reason,omitempty"` // response.completed 事件中的 stop_reason
 }
 
 type OutputDelta struct {

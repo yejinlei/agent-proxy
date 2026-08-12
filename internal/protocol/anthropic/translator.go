@@ -178,6 +178,10 @@ func messagesToInternal(msg Message) ([]schema.InternalMessage, error) {
 			if userMsg == nil {
 				userMsg = &schema.InternalMessage{Role: schema.RoleUser}
 			}
+		case "thinking":
+			// 透传 thinking 推理内容块（DeepSeek 等模型的推理过程，通常出现在 assistant 消息中）
+			cb := schema.InternalContentBlock{Type: "thinking", Thinking: block.Thinking, Signature: block.Signature}
+			contentBlocks = append(contentBlocks, cb)
 		case "image":
 			cb := schema.InternalContentBlock{
 				Type:      "image",
@@ -248,6 +252,11 @@ func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (
 				case "text":
 					if cb.Text != "" {
 						contentBlocks = append(contentBlocks, ContentBlock{Type: "text", Text: cb.Text})
+					}
+				case "thinking":
+					// 透传 thinking 推理内容块（DeepSeek 等模型的推理过程）
+					if cb.Thinking != "" {
+						contentBlocks = append(contentBlocks, ContentBlock{Type: "thinking", Thinking: cb.Thinking, Signature: cb.Signature})
 					}
 				case "image":
 					if cb.Data != "" {
@@ -512,7 +521,10 @@ func messagesToAnthropic(msgs []schema.InternalMessage) ([]Message, error) {
 				{
 					Type:      "tool_result",
 					ToolUseID: msg.ToolCallID,
-					Content:   func() json.RawMessage { b, _ := json.Marshal([]ContentBlock{{Type: "text", Text: contentText}}); return b }(),
+					Content: func() json.RawMessage {
+						b, _ := json.Marshal([]ContentBlock{{Type: "text", Text: contentText}})
+						return b
+					}(),
 				},
 			})
 			result = append(result, Message{
@@ -749,7 +761,17 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 	case "content_block_delta":
 		deltaText := ""
 		if event.Delta != nil {
-			deltaText = event.Delta.Text
+			switch event.Delta.Type {
+			case "text_delta":
+				deltaText = event.Delta.Text
+			case "thinking_delta":
+				deltaText = event.Delta.Thinking
+			case "signature_delta":
+				// signature_delta 是验证签名，不包含文本内容，忽略
+				return nil
+			default:
+				deltaText = event.Delta.Text
+			}
 		}
 		return &schema.InternalStreamEvent{
 			Type: "delta",
@@ -767,6 +789,14 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 		}
 
 	case "message_delta":
+		// 提取 usage（Anthropic message_delta 事件顶层包含 usage.output_tokens）
+		var usage *schema.InternalUsage
+		if event.Usage != nil {
+			usage = &schema.InternalUsage{
+				CompletionTokens: event.Usage.OutputTokens,
+				TotalTokens:      event.Usage.TotalTokens,
+			}
+		}
 		return &schema.InternalStreamEvent{
 			Type: "done",
 			Data: &schema.InternalStreamChunk{
@@ -776,19 +806,30 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 						FinishReason: mapStopReason(event.MessageDelta.StopReason),
 					},
 				},
+				Usage: usage,
 			},
 		}
 
 	case "message_start":
 		model := ""
+		role := schema.RoleAssistant
 		if event.Message != nil {
 			model = event.Message.Model
+			if event.Message.Role != "" {
+				role = schema.Role(event.Message.Role)
+			}
 		}
 		return &schema.InternalStreamEvent{
 			Type: "start",
 			Data: &schema.InternalStreamChunk{
 				ID:    event.Message.ID,
 				Model: model,
+				Choices: []schema.InternalChoice{
+					{
+						Index:   0,
+						Message: schema.InternalMessage{Role: role},
+					},
+				},
 			},
 		}
 
@@ -815,6 +856,12 @@ func (t *AnthropicTranslator) TranslateStreamToCCSSE(ctx context.Context, events
 			}
 
 			if event.Type == "done" {
+				// 发送 usage chunk（如果有）再发送 [DONE]
+				if event.Data != nil && event.Data.Usage != nil {
+					chunk := ToCCStreamChunk(event.Data)
+					fn(append([]byte("data: "), chunk...), false)
+					fn([]byte("\n\n"), false)
+				}
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
@@ -872,6 +919,7 @@ func ToCCStreamChunk(chunk *schema.InternalStreamChunk) json.RawMessage {
 		"object":  "chat.completion.chunk",
 		"model":   chunk.Model,
 		"choices": choices,
+		"usage":   chunk.Usage,
 	})
 	return raw
 }

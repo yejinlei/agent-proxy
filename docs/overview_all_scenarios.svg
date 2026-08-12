@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800"
+     width="1200" height="800">
+  <defs>
+    <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="800" fill="#ffffff"/>
+<text x="600.0" y="32" text-anchor="middle" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="18" font-weight="bold">Agent-Proxy 消息转换全览</text>
+<text x="600.0" y="54" text-anchor="middle" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">9 种入站/上游协议 × 流式组合 → 透传/翻译路径 → 函数路由</text>
+<rect x="30" y="80" width="560" height="28" rx="4" fill="#1a7f37" opacity="0.15"/>
+<rect x="30" y="80" width="4" height="28" rx="2" fill="#1a7f37"/>
+<text x="42" y="99" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">透传路径 (协议相同, --stream-mode 控制)</text>
+<rect x="30" y="118" width="560" height="24" rx="2" fill="#9a6700" opacity="0.08"/>
+<text x="38" y="134" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#5  Anthropic非流 → Anthropic流</text>
+<text x="198" y="134" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode stream  →  handlePassthroughStreamWithBody  (注入 stream:true)</text>
+<rect x="30" y="144" width="560" height="24" rx="2" fill="#cf222e" opacity="0.08"/>
+<text x="38" y="160" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#6  Anthropic流 → Anthropic非流</text>
+<text x="198" y="160" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode non-stream  →  handlePassthroughNonStreamAsSSE  (写 NonStream→SSE)</text>
+<rect x="30" y="170" width="560" height="24" rx="2" fill="#cf222e" opacity="0.08"/>
+<text x="38" y="186" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#7  OpenAI流 → OpenAI非流</text>
+<text x="198" y="186" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode non-stream  →  handlePassthroughNonStreamAsSSE  (写 NonStream→SSE)</text>
+<rect x="30" y="196" width="560" height="24" rx="2" fill="#24292f" opacity="0.08"/>
+<text x="38" y="212" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">auto  auto 默认: 无 stream → handlePassthroughNonStream(chunked JSON)</text>
+<text x="198" y="212" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode auto  →  handlePassthroughNonStream  (先写头+Flush 防超时)</text>
+<rect x="620" y="80" width="550" height="28" rx="4" fill="#0969da" opacity="0.15"/>
+<rect x="620" y="80" width="4" height="28" rx="2" fill="#0969da"/>
+<text x="632" y="99" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">翻译路径 (协议不同, --stream-mode 新增支持)</text>
+<rect x="620" y="118" width="550" height="24" rx="2" fill="#1a7f37" opacity="0.08"/>
+<text x="628" y="134" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#1  Anthropic流 → OpenAI流</text>
+<text x="788" y="134" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode auto  →  handleStreamRequest  (stream 保留)</text>
+<rect x="620" y="144" width="550" height="24" rx="2" fill="#1a7f37" opacity="0.08"/>
+<text x="628" y="160" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#2  Anthropic非流 → OpenAI非流</text>
+<text x="788" y="160" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode auto  →  handleNonStreamResponse  (stream 保留)</text>
+<rect x="620" y="170" width="550" height="24" rx="2" fill="#cf222e" opacity="0.08"/>
+<text x="628" y="186" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#3  Anthropic流 → OpenAI非流</text>
+<text x="788" y="186" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode non-stream (NEW)  →  handleNonStreamResponseAsSSE  (翻译 → SSE包装)</text>
+<rect x="620" y="196" width="550" height="24" rx="2" fill="#9a6700" opacity="0.08"/>
+<text x="628" y="212" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#4  Anthropic非流 → OpenAI流</text>
+<text x="788" y="212" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode stream (NEW)  →  handleStreamRequestAsNonStream  (SSE收集 → JSON)</text>
+<rect x="620" y="222" width="550" height="24" rx="2" fill="#9a6700" opacity="0.08"/>
+<text x="628" y="238" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#8  Responses非流 → OpenAI流</text>
+<text x="788" y="238" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode stream (NEW)  →  handleStreamRequestAsNonStream  (SSE收集 → JSON)</text>
+<rect x="620" y="248" width="550" height="24" rx="2" fill="#cf222e" opacity="0.08"/>
+<text x="628" y="264" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">#9  Responses流 → OpenAI非流</text>
+<text x="788" y="264" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" opacity="0.75">--stream-mode non-stream (NEW)  →  handleNonStreamResponseAsSSE  (翻译 → SSE包装)</text>
+<rect x="30" y="290" width="1140" height="28" rx="4" fill="#bc4c00" opacity="0.15"/>
+<rect x="30" y="290" width="4" height="28" rx="2" fill="#bc4c00"/>
+<text x="42" y="309" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">架构管道</text>
+<text x="40" y="328" text-anchor="start" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">翻译管道:  IngressRequest → TranslateRequest → InternalRequest → TranslateToProvider → ProviderRequest → Provider.Call</text>
+<text x="40" y="348" text-anchor="start" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">          ProviderResponse → TranslateFromProvider → InternalResponse → TranslateResponse → IngressResponse</text>
+<text x="40" y="368" text-anchor="start" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">透传管道:  IngressRequest → (model alias replace) → Provider.Call → (model echo) → IngressResponse</text>
+<text x="40" y="388" text-anchor="start" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="normal">--stream-mode:  auto(自适应) | stream(强制流式) | non-stream(强制非流式) | passthrough(直连)</text>
+</svg>

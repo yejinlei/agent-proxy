@@ -10,6 +10,7 @@ type ChatCompletionRequest struct {
 	Messages       []Message       `json:"messages"`
 	Tools          []Tool          `json:"tools,omitempty"`
 	Stream         bool            `json:"stream,omitempty"`
+	StreamOptions  *StreamOptions  `json:"stream_options,omitempty"`
 	Temperature    *float64        `json:"temperature,omitempty"`
 	TopP           *float64        `json:"top_p,omitempty"`
 	MaxTokens      int             `json:"max_tokens,omitempty"`
@@ -18,6 +19,11 @@ type ChatCompletionRequest struct {
 	User           string          `json:"user,omitempty"`
 	Seed           *int            `json:"seed,omitempty"`
 	ToolsChoice    json.RawMessage `json:"tool_choice,omitempty"`
+}
+
+// StreamOptions OpenAI stream_options 参数
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type Message struct {

@@ -757,6 +757,7 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 		Messages:       messages,
 		Tools:          tools,
 		Stream:         req.Stream,
+		StreamOptions:  &chatcompletion.StreamOptions{IncludeUsage: true},
 		Temperature:    req.Temperature,
 		TopP:           req.TopP,
 		MaxTokens:      req.MaxTokens,

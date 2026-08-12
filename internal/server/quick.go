@@ -102,6 +102,7 @@ func (q *QuickGateway) SetAliasFile(af *db.AliasFile) {
 //   - 若 aliasFile 为 nil，透传原始模型名
 //   - 若命中映射，处理 @default / @db:<id>,<model> / 纯字符串三种语法
 //   - 返回 (真实模型名, 原始模型名, 是否命中映射)
+//
 // resolveAlias 解析客户端模型名：
 // 支持点号分隔符与连字符之间的归一化（如 claude-haiku-4.5 → claude-haiku-4-5），
 // 因为 Claude Code 使用点号作为版本分隔符，而别名文件使用连字符。
@@ -402,12 +403,17 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 				return
 			case "stream":
-				// 上游无 stream 标记时注入，确保 Claude Code 等客户端的上游也收到 stream=true
-				bodyStream := body
-				if !stream {
-					bodyStream = quickInjectStreamFlag(body)
+				// 无 stream 字段的请求（如 /model 验证）期望 raw JSON，走 handlePassthroughNonStream
+				// 有 stream 字段的正常对话请求仍走 SSE 流
+				if quickStreamFieldAbsent(body) {
+					q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+				} else {
+					bodyStream := body
+					if !stream {
+						bodyStream = quickInjectStreamFlag(body)
+					}
+					q.handlePassthroughStreamWithBody(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, bodyStream)
 				}
-				q.handlePassthroughStreamWithBody(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, bodyStream)
 				return
 			case "passthrough":
 				// HTTP 直连透传：上游返回什么就发什么，不注入心跳、不做 SSE 包装
@@ -436,10 +442,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			} else {
 				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 			}
-		// Claude Code（Anthropic Messages）不带 stream 字段 → 客户端仍期望 SSE
-		// OpenAI 客户端显式发送 stream:false → 期望 raw JSON
-		} else if quickStreamFieldAbsent(body) {
-			q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+			// 无 stream 字段或 stream:false → 返回 raw JSON
 		} else {
 			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 		}
@@ -468,6 +471,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 
 	// ── 执行 Provider 调用 ──
 	stream := internalReq.Stream
+	// --stream-mode 在翻译路径也生效：允许翻转流式行为
+	// 仅当入站流式标记与模式要求不一致时才翻转，一致时直接走原路径
+	originalStream := stream
+	if q.streamMode == "non-stream" {
+		stream = false
+	} else if q.streamMode == "stream" {
+		stream = true
+	}
 	ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 	// 把构建后的下游请求体记录到日志上下文（代理→LLM）
 	if downstreamReq != nil {
@@ -475,9 +486,19 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	}
 	ctx = context.WithValue(ctx, verboseCtxKey{}, vctx)
 	if stream {
-		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		if originalStream {
+			q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		} else {
+			// --stream-mode stream 翻转：入站非流式 → 上游流式 → 收集 SSE 组装为 JSON
+			q.handleStreamRequestAsNonStream(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		}
 	} else {
-		q.handleNonStreamResponse(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		if !originalStream {
+			q.handleNonStreamResponse(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		} else {
+			// --stream-mode non-stream 翻转：入站流式 → 上游非流式 → 包装为 SSE
+			q.handleNonStreamResponseAsSSE(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		}
 	}
 }
 
@@ -599,6 +620,55 @@ func echoAliasInResponseBody(resp json.RawMessage, aliasModel string) json.RawMe
 	return resp
 }
 
+// stripThinkingContentBlocks 从响应 JSON 中移除 thinking 类型内容块。
+// SenseNova 的 DeepSeek 模型在 high effort 模式下返回非标准 thinking 类型内容块，
+// Claude Code 的 Anthropic 客户端无法解析，导致 "empty or malformed response" 错误。
+func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
+	if len(resp) == 0 {
+		return resp
+	}
+	// 快速检测：如果 content 数组中没有 thinking 类型，直接返回
+	if !bytes.Contains(resp, []byte(`"type":"thinking"`)) &&
+		!bytes.Contains(resp, []byte(`"type": "thinking"`)) {
+		return resp
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return resp // 解析失败则原样返回
+	}
+
+	contentRaw, ok := raw["content"]
+	if !ok {
+		return resp
+	}
+	contentArr, ok := contentRaw.([]interface{})
+	if !ok {
+		return resp
+	}
+
+	// 过滤掉 thinking 类型的内容块，保留其他类型
+	filtered := make([]interface{}, 0, len(contentArr))
+	for _, item := range contentArr {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		if t, _ := itemMap["type"].(string); t == "thinking" {
+			continue // 跳过 thinking 块
+		}
+		filtered = append(filtered, item)
+	}
+
+	raw["content"] = filtered
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return resp
+	}
+	return json.RawMessage(out)
+}
+
 // echoAliasInStreamLine 将流式 SSE 行中的 model 字段回显为客户端原始模型名
 // 使用字符串替换，保持原始 JSON 结构不变。
 func echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
@@ -707,6 +777,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	}
 
 	var lastUsage *schema.InternalUsage
+	inThinkingBlock := false // 跟踪当前是否在 thinking 内容块中
 	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
 	if !writeSSE(w, heartbeatEvent) {
@@ -731,8 +802,30 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 					flusher.Flush()
 					return
 				} else {
-					usage := q.extractUsage(line)
-					if usage != nil { lastUsage = usage }
+					// 过滤 thinking 内容块：Claude Code 客户端不支持 thinking 类型
+					eventType, _ := meta["type"].(string)
+					switch eventType {
+					case "content_block_start":
+						if cb, ok := meta["content_block"].(map[string]any); ok {
+							if ct, _ := cb["type"].(string); ct == "thinking" {
+								inThinkingBlock = true
+								continue
+							}
+						}
+					case "content_block_delta":
+						if inThinkingBlock {
+							continue
+						}
+					case "content_block_stop":
+						if inThinkingBlock {
+							inThinkingBlock = false
+							continue
+						}
+					}
+					usage := q.extractUsage(trimSSEDataPrefix(line))
+					if usage != nil {
+						lastUsage = usage
+					}
 					writeLine := line
 					if aliasHit && aliasModel != "" {
 						writeLine = echoAliasInStreamLine(line, aliasModel)
@@ -800,17 +893,20 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		}
 	}
 
+	// 先写响应头并 flush，防止客户端在等待上游响应时超时断开 (ECONNRESET)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
 	resp, headers, err := p.Call(callCtx, body, callInfo)
 	if err != nil {
 		log.Printf("[passthrough] upstream error: %s=%s url=%s body_len=%d err=%v",
 			aliasModel, realModel, q.proxyBaseURL, len(body), err)
-		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(httpStatus)
-			w.Write([]byte(bodyData))
-			return
-		}
-		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
+		// 状态码已写，写错误 body 并关闭连接
+		errBody := fmt.Sprintf(`{"error":{"message":"upstream error: %s","type":"provider_error"}}`, err.Error())
+		w.Write([]byte(errBody))
 		return
 	}
 
@@ -829,8 +925,11 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		outResp = resp
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	// 过滤 thinking 内容块：SenseNova 的 DeepSeek 模型在 high effort 模式下
+	// 返回非标准 thinking 类型内容块，Claude Code 客户端无法解析，导致
+	// "API returned an empty or malformed response (HTTP 200)" 错误
+	outResp = stripThinkingContentBlocks(outResp)
+
 	if _, err := w.Write(outResp); err != nil {
 		log.Printf("[passthrough] write error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
@@ -943,7 +1042,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 				}
 			}
 			// 累积 usage（用于 -v 日志）
-			usage := q.extractUsage(line)
+			usage := q.extractUsage(trimSSEDataPrefix(line))
 			if usage != nil {
 				lastUsage = usage
 			}
@@ -1013,6 +1112,255 @@ func (q *QuickGateway) probeStreamPrefer(p provider.Provider, callInfo *schema.P
 	}
 	q.streamPrefer[q.proxyBaseURL] = preferNonStream
 	q.streamPreferMu.Unlock()
+}
+
+// writeNonStreamAsSSE 将非流式完整响应 JSON 拆解为对应协议的 SSE 多事件流写入 w。
+// 自动检测响应格式（Anthropic / OpenAI ChatCompletion / Gemini / OpenAI Responses），
+// 返回从响应中提取的 usage（用于日志）。
+func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody []byte, effectiveModel string) *schema.InternalUsage {
+	usage := q.extractUsage(respBody)
+
+	var respMap map[string]interface{}
+	if err := json.Unmarshal(respBody, &respMap); err != nil {
+		var compactBuf bytes.Buffer
+		if err := json.Compact(&compactBuf, respBody); err != nil {
+			compactBuf.Reset()
+			compactBuf.Write(respBody)
+		}
+		w.Write([]byte("data: "))
+		w.Write(compactBuf.Bytes())
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+		return usage
+	}
+
+	// 检测响应格式：优先 Anthropic Messages，其次 OpenAI ChatCompletion，再 Gemini，再 OpenAI Responses
+	if contentRaw, ok := respMap["content"]; ok {
+		if contentArr, ok := contentRaw.([]interface{}); ok {
+			// ── Anthropic Messages 格式 ──
+			msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+			stopReason := "end_turn"
+			if sr, ok := respMap["stop_reason"].(string); ok && sr != "" {
+				stopReason = sr
+			}
+			messageStart := fmt.Sprintf(
+				`{"type":"message_start","message":{"id":"%s","role":"assistant","content":[],"model":"%s","stop_reason":"%s","stop_sequence":null,"usage":null}}`,
+				msgID, effectiveModel, stopReason)
+			if !writeSSE(w, []byte("data: "+messageStart+"\n\n")) {
+				return usage
+			}
+
+			for idx, blockAny := range contentArr {
+				blockMap, ok := blockAny.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				blockType := "text"
+				if bt, ok := blockMap["type"].(string); ok && bt != "" {
+					blockType = bt
+				}
+
+				// content_block_start
+				blockStartMap := map[string]interface{}{"type": blockType}
+				if blockType == "text" {
+					blockStartMap["text"] = ""
+				}
+				blockStart := map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         idx,
+					"content_block": blockStartMap,
+				}
+				blockStartJSON, err := json.Marshal(blockStart)
+				if err != nil {
+					continue
+				}
+				if !writeSSE(w, []byte("data: "+string(blockStartJSON)+"\n\n")) {
+					return usage
+				}
+
+				// content_block_delta — 按 block type 区分 delta 类型和字段名
+				deltaJSON, err := func() ([]byte, error) {
+					switch blockType {
+					case "text":
+						var txt string
+						if t, ok := blockMap["text"].(string); ok {
+							txt = t
+						}
+						return json.Marshal(map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type": "text_delta",
+								"text": txt,
+							},
+						})
+					case "thinking":
+						var thinking string
+						if t, ok := blockMap["thinking"].(string); ok {
+							thinking = t
+						}
+						return json.Marshal(map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type":     "thinking_delta",
+								"thinking": thinking,
+							},
+						})
+					default:
+						return nil, nil
+					}
+				}()
+				if err != nil || len(deltaJSON) == 0 {
+					continue
+				}
+				if !writeSSE(w, []byte("data: "+string(deltaJSON)+"\n\n")) {
+					return usage
+				}
+
+				// content_block_stop
+				blockStopJSON, err := json.Marshal(map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": idx,
+				})
+				if err != nil {
+					continue
+				}
+				if !writeSSE(w, []byte("data: "+string(blockStopJSON)+"\n\n")) {
+					return usage
+				}
+			}
+
+			// message_delta with stop_reason and usage
+			if usage != nil {
+				messageDelta := fmt.Sprintf(
+					`{"type":"message_delta","delta":{"stop_reason":"%s"},"usage":{"input_tokens":%d,"output_tokens":%d}}`,
+					stopReason, usage.PromptTokens, usage.CompletionTokens)
+				if !writeSSE(w, []byte("data: "+messageDelta+"\n\n")) {
+					return usage
+				}
+			}
+			// message_stop
+			if !writeSSE(w, []byte("data: {\"type\":\"message_stop\"}\n\n")) {
+				return usage
+			}
+			flusher.Flush()
+		} else {
+			// content 字段存在但不是数组 → 降级为裸 JSON 单事件
+			w.Write([]byte("data: "))
+			w.Write(respBody)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+		}
+	} else if choices, ok := respMap["choices"]; ok {
+		// ── OpenAI ChatCompletion 格式 ──
+		choicesArr, ok := choices.([]interface{})
+		if !ok {
+			choicesArr = []interface{}{}
+		}
+		for _, choiceAny := range choicesArr {
+			choiceMap, ok := choiceAny.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			msgMap, ok := choiceMap["message"].(map[string]interface{})
+			if !ok {
+				msgMap = map[string]interface{}{"role": "assistant", "content": ""}
+			}
+			if _, hasModel := msgMap["model"]; !hasModel {
+				msgMap["model"] = effectiveModel
+			}
+			chunk := map[string]interface{}{
+				"id":      fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   effectiveModel,
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"role":    "assistant",
+							"content": msgMap["content"],
+						},
+						"finish_reason": choiceMap["finish_reason"],
+					},
+				},
+			}
+			chunkJSON, err := json.Marshal(chunk)
+			if err != nil {
+				continue
+			}
+			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
+				return usage
+			}
+		}
+		if !writeSSE(w, []byte("data: [DONE]\n\n")) {
+			return usage
+		}
+		flusher.Flush()
+	} else if candidates, ok := respMap["candidates"]; ok {
+		// ── Gemini 格式 ──
+		candArr, ok := candidates.([]interface{})
+		if !ok {
+			candArr = []interface{}{}
+		}
+		for _, candAny := range candArr {
+			candMap, ok := candAny.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			chunk := map[string]interface{}{
+				"candidates":    []interface{}{candMap},
+				"usageMetadata": candMap["usageMetadata"],
+			}
+			chunkJSON, err := json.Marshal(chunk)
+			if err != nil {
+				continue
+			}
+			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
+				return usage
+			}
+		}
+		flusher.Flush()
+	} else if output, ok := respMap["output"]; ok {
+		// ── OpenAI Responses 格式 ──
+		outputArr, ok := output.([]interface{})
+		if !ok {
+			outputArr = []interface{}{}
+		}
+		for _, itemAny := range outputArr {
+			itemMap, ok := itemAny.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			chunk := map[string]interface{}{
+				"id":       fmt.Sprintf("resp_%d", time.Now().UnixNano()),
+				"object":   "response.text_delta",
+				"response": map[string]interface{}{"id": itemMap["id"], "model": effectiveModel},
+				"output":   []interface{}{itemMap},
+				"usage":    itemMap["usage"],
+			}
+			chunkJSON, err := json.Marshal(chunk)
+			if err != nil {
+				continue
+			}
+			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
+				return usage
+			}
+		}
+		if !writeSSE(w, []byte("data: [DONE]\n\n")) {
+			return usage
+		}
+		flusher.Flush()
+	} else {
+		// 未知格式 → 降级为裸 JSON 单事件
+		w.Write([]byte("data: "))
+		w.Write(respBody)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+	}
+
+	return usage
 }
 
 // handlePassthroughNonStreamAsSSE 非流式调上游，包装成 SSE 返回
@@ -1090,255 +1438,10 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		effectiveModel = aliasModel
 	}
 
-	// 解析上游完整响应 JSON，检测响应格式并组装对应协议的 SSE 多事件流。
-	// 不同客户端期望不同的 SSE 格式：
-	//   - Anthropic Messages: message_start → content_block_* → message_stop
-	//   - OpenAI ChatCompletion: data: {chunk}...\n\ndata: [DONE]\n\n
-	//   - Gemini: data: {chunk}...\n\n（裸 JSON，无 [DONE]）
-	//   - OpenAI Responses: data: {chunk}...\n\ndata: [DONE]\n\n
-	usage := q.extractUsage(respBody)
+	// 过滤 thinking 内容块（同 handlePassthroughNonStream）
+	respBody = stripThinkingContentBlocks(respBody)
 
-	var respMap map[string]interface{}
-	if err := json.Unmarshal(respBody, &respMap); err != nil {
-		log.Printf("[passthrough] nonstream-as-sse unmarshal error: %s=%s err=%v",
-			aliasModel, realModel, err)
-		var compactBuf bytes.Buffer
-		if err := json.Compact(&compactBuf, respBody); err != nil {
-			compactBuf.Reset()
-			compactBuf.Write(respBody)
-		}
-		w.Write([]byte("data: "))
-		w.Write(compactBuf.Bytes())
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
-		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
-		vctx.upstreamReq = nsBody
-		vctx.upstreamResp = respBody
-		q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
-		return
-	}
-
-	// 检测响应格式：优先 Anthropic Messages，其次 OpenAI ChatCompletion，再 Gemini，再 OpenAI Responses
-	if contentRaw, ok := respMap["content"]; ok {
-		if contentArr, ok := contentRaw.([]interface{}); ok {
-			// ── Anthropic Messages 格式 ──
-			msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-			messageStart := fmt.Sprintf(
-				`{"type":"message_start","message":{"id":"%s","role":"assistant","content":[],"model":"%s","stop_reason":"end_turn","stop_sequence":null,"usage":null}}`,
-				msgID, effectiveModel)
-			if !writeSSE(w, []byte("data: "+messageStart+"\n\n")) {
-				return
-			}
-
-			for idx, blockAny := range contentArr {
-				blockMap, ok := blockAny.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				blockType := "text"
-				if bt, ok := blockMap["type"].(string); ok && bt != "" {
-					blockType = bt
-				}
-
-				// content_block_start
-				blockStartMap := map[string]interface{}{"type": blockType}
-				if blockType == "text" {
-					blockStartMap["text"] = ""
-				}
-				blockStart := map[string]interface{}{
-					"type":          "content_block_start",
-					"index":         idx,
-					"content_block": blockStartMap,
-				}
-				blockStartJSON, err := json.Marshal(blockStart)
-				if err != nil {
-					continue
-				}
-				if !writeSSE(w, []byte("data: "+string(blockStartJSON)+"\n\n")) {
-					return
-				}
-
-				// content_block_delta — 按 block type 区分 delta 类型和字段名
-				// Anthropic 协议：text 块 → {"type":"text_delta","text":"..."}
-				//                 thinking 块 → {"type":"thinking_delta","thinking":"..."}
-				deltaJSON, err := func() ([]byte, error) {
-					switch blockType {
-					case "text":
-						var txt string
-						if t, ok := blockMap["text"].(string); ok {
-							txt = t
-						}
-						return json.Marshal(map[string]interface{}{
-							"type":  "content_block_delta",
-							"index": idx,
-							"delta": map[string]interface{}{
-								"type": "text_delta",
-								"text": txt,
-							},
-						})
-					case "thinking":
-						var thinking string
-						if t, ok := blockMap["thinking"].(string); ok {
-							thinking = t
-						}
-						return json.Marshal(map[string]interface{}{
-							"type":  "content_block_delta",
-							"index": idx,
-							"delta": map[string]interface{}{
-								"type":     "thinking_delta",
-								"thinking": thinking,
-							},
-						})
-					default:
-						// tool_use / image / 等非文本块不发送 delta 事件
-						return nil, nil
-					}
-				}()
-				if err != nil {
-					continue
-				}
-				if len(deltaJSON) == 0 {
-					continue
-				}
-				if !writeSSE(w, []byte("data: "+string(deltaJSON)+"\n\n")) {
-					return
-				}
-
-				// content_block_stop
-				blockStopJSON, err := json.Marshal(map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
-				if err != nil {
-					continue
-				}
-				if !writeSSE(w, []byte("data: "+string(blockStopJSON)+"\n\n")) {
-					return
-				}
-			}
-
-			// message_stop
-			if !writeSSE(w, []byte("data: {\"type\":\"message_stop\"}\n\n")) {
-				return
-			}
-			flusher.Flush()
-		} else {
-			// content 字段存在但不是数组 → 降级为裸 JSON 单事件
-			w.Write([]byte("data: "))
-			w.Write(respBody)
-			w.Write([]byte("\n\n"))
-			flusher.Flush()
-		}
-	} else if choices, ok := respMap["choices"]; ok {
-		// ── OpenAI ChatCompletion 格式 ──
-		choicesArr, ok := choices.([]interface{})
-		if !ok {
-			choicesArr = []interface{}{}
-		}
-		for _, choiceAny := range choicesArr {
-			choiceMap, ok := choiceAny.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			msgMap, ok := choiceMap["message"].(map[string]interface{})
-			if !ok {
-				msgMap = map[string]interface{}{"role": "assistant", "content": ""}
-			}
-			// 回显模型名
-			if _, hasModel := msgMap["model"]; !hasModel {
-				msgMap["model"] = effectiveModel
-			}
-			chunk := map[string]interface{}{
-				"id":      fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   effectiveModel,
-				"choices": []interface{}{
-					map[string]interface{}{
-						"index": 0,
-						"delta": map[string]interface{}{
-							"role":    "assistant",
-							"content": msgMap["content"],
-						},
-						"finish_reason": choiceMap["finish_reason"],
-					},
-				},
-			}
-			chunkJSON, err := json.Marshal(chunk)
-			if err != nil {
-				continue
-			}
-			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
-				return
-			}
-		}
-		// done
-		if !writeSSE(w, []byte("data: [DONE]\n\n")) {
-			return
-		}
-		flusher.Flush()
-	} else if candidates, ok := respMap["candidates"]; ok {
-		// ── Gemini 格式 ──
-		candArr, ok := candidates.([]interface{})
-		if !ok {
-			candArr = []interface{}{}
-		}
-		for _, candAny := range candArr {
-			candMap, ok := candAny.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			// 输出 Gemini SSE 格式：data: {candidates:[...], usageMetadata:{...}}
-			chunk := map[string]interface{}{
-				"candidates":    []interface{}{candMap},
-				"usageMetadata": candMap["usageMetadata"],
-			}
-			chunkJSON, err := json.Marshal(chunk)
-			if err != nil {
-				continue
-			}
-			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
-				return
-			}
-		}
-		flusher.Flush()
-	} else if output, ok := respMap["output"]; ok {
-		// ── OpenAI Responses 格式 ──
-		outputArr, ok := output.([]interface{})
-		if !ok {
-			outputArr = []interface{}{}
-		}
-		for _, itemAny := range outputArr {
-			itemMap, ok := itemAny.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			chunk := map[string]interface{}{
-				"id":        fmt.Sprintf("resp_%d", time.Now().UnixNano()),
-				"object":    "response.text_delta",
-				"response":  map[string]interface{}{"id": itemMap["id"], "model": effectiveModel},
-				"output":    []interface{}{itemMap},
-				"usage":     itemMap["usage"],
-			}
-			chunkJSON, err := json.Marshal(chunk)
-			if err != nil {
-				continue
-			}
-			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
-				return
-			}
-		}
-		if !writeSSE(w, []byte("data: [DONE]\n\n")) {
-			return
-		}
-		flusher.Flush()
-	} else {
-		// 未知格式 → 降级为裸 JSON 单事件
-		w.Write([]byte("data: "))
-		w.Write(respBody)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
-	}
+	usage := q.writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = nsBody
@@ -1412,6 +1515,129 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	w.Write(outgoingResp)
 
 	usage := internalResp.Usage
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	vctx.upstreamResp = resp
+	vctx.outgoingBody = outgoingResp
+	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
+}
+
+// handleNonStreamResponseAsSSE 翻译路径 + --stream-mode non-stream：
+// 调用上游非流式 API，经翻译管道得到入站协议格式的响应，
+// 然后拆解为 SSE 事件流返回给客户端（客户端建立了 SSE 连接）。
+func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	downstreamReq json.RawMessage, providerTranslator any,
+	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
+	startTime time.Time) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// 心跳 goroutine：上游非流式可能耗时较长，发送心跳防止客户端超时
+	var writeMu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				if !writeSSE(w, heartbeatEvent) {
+					writeMu.Unlock()
+					return
+				}
+				flusher.Flush()
+				writeMu.Unlock()
+			}
+		}
+	}()
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
+	close(done) // 立即停止心跳
+	cancel()
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type": "error", "_status": 502, "data": fmt.Sprintf("upstream error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+		return
+	}
+
+	// ── 出 Provider 翻译：Provider 响应 → InternalResponse ──
+	var internalResp *schema.InternalResponse
+	if providerTranslator != nil {
+		pt := providerTranslator.(interface {
+			TranslateFromProvider(json.RawMessage) (*schema.InternalResponse, error)
+		})
+		internalResp, err = pt.TranslateFromProvider(resp)
+		if err != nil {
+			errJSON, _ := json.Marshal(map[string]interface{}{
+				"_type": "error", "_status": 500, "data": fmt.Sprintf("translate error: %v", err),
+			})
+			w.Write([]byte("event: error\ndata: "))
+			w.Write(errJSON)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+			return
+		}
+	} else {
+		var ccResp chatcompletion.ChatCompletionResponse
+		if err := json.Unmarshal(resp, &ccResp); err != nil {
+			errJSON, _ := json.Marshal(map[string]interface{}{
+				"_type": "error", "_status": 500, "data": fmt.Sprintf("parse error: %v", err),
+			})
+			w.Write([]byte("event: error\ndata: "))
+			w.Write(errJSON)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+			return
+		}
+		internalResp = chatCompletionToInternal(&ccResp)
+	}
+
+	// 回显客户端模型名
+	if internalReq != nil && internalReq.AliasModel != "" {
+		internalResp.Model = internalReq.AliasModel
+	}
+
+	// ── 出站翻译：InternalResponse → 入站协议格式 ──
+	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]interface{}{
+			"_type": "error", "_status": 500, "data": fmt.Sprintf("encode error: %v", err),
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errJSON)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
+		return
+	}
+
+	// 透传下游响应头
+	for k, v := range headers {
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
+
+	// 将翻译后的入站协议响应拆解为 SSE 事件流
+	effectiveModel := internalResp.Model
+	usage := q.writeNonStreamAsSSE(w, flusher, outgoingResp, effectiveModel)
+
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamResp = resp
 	vctx.outgoingBody = outgoingResp
@@ -1584,6 +1810,148 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	q.logRequest(vctx, startTime, http.StatusOK, accumulatedUsage, nil)
+}
+
+// handleStreamRequestAsNonStream 翻译路径 + --stream-mode stream：
+// 调用上游流式 API，收集所有 SSE 事件经翻译管道组装为完整 InternalResponse，
+// 再翻译为入站协议格式的 JSON 返回（客户端发的是非流式请求）。
+func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
+	downstreamReq json.RawMessage, providerTranslator any,
+	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
+	startTime time.Time) {
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	defer cancel()
+
+	lines, _, err := p.CallStream(callCtx, downstreamReq, q.info)
+	if err != nil {
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			return
+		}
+		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
+		return
+	}
+
+	// 收集所有流式事件，累积文本内容
+	var accumulatedContent strings.Builder
+	var accumulatedReasoning strings.Builder
+	var lastModel string
+	var lastFinishReason string
+	var lastUsage *schema.InternalUsage
+
+	aliasModel := ""
+	if internalReq != nil {
+		aliasModel = internalReq.AliasModel
+	}
+
+	for line := range lines {
+		var meta map[string]any
+		if json.Unmarshal(line, &meta) == nil {
+			if meta["_type"] == "headers" {
+				continue
+			}
+			if meta["_type"] == "error" {
+				status, _ := meta["_status"].(float64)
+				if status == 0 {
+					status = 502
+				}
+				data, _ := meta["data"].(string)
+				if data == "" {
+					data = fmt.Sprintf("upstream error: HTTP %.0f", status)
+				}
+				q.sendError(w, int(status), "upstream_error", data)
+				return
+			}
+		}
+
+		payload := strings.TrimPrefix(string(line), "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+
+		if providerTranslator != nil {
+			pte := providerTranslator.(interface {
+				TranslateStreamEvent(json.RawMessage) *schema.InternalStreamEvent
+			})
+			event := pte.TranslateStreamEvent(json.RawMessage(payload))
+			if event != nil && event.Data != nil {
+				if event.Data.Usage != nil {
+					lastUsage = event.Data.Usage
+				}
+				lastModel = event.Data.Model
+				for _, choice := range event.Data.Choices {
+					if choice.FinishReason != "" {
+						lastFinishReason = choice.FinishReason
+					}
+					if choice.Message.Content != nil {
+						var contentStr string
+						json.Unmarshal(choice.Message.Content, &contentStr)
+						accumulatedContent.WriteString(contentStr)
+					}
+				}
+			}
+		} else {
+			// OpenAI 兼容：直接解析 SSE delta 行
+			var ccChunk chatcompletion.ChatCompletionStreamChunk
+			if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+				continue
+			}
+			choice := ccChunk.Choices[0]
+			if choice.Delta.Content != "" {
+				accumulatedContent.WriteString(choice.Delta.Content)
+			}
+			if choice.Delta.Reasoning != "" {
+				accumulatedReasoning.WriteString(choice.Delta.Reasoning)
+			}
+			if choice.FinishReason != "" {
+				lastFinishReason = choice.FinishReason
+			}
+			lastModel = ccChunk.Model
+			if ccChunk.Usage != nil {
+				lastUsage = mapInternalUsage(ccChunk.Usage)
+			}
+		}
+	}
+
+	// 组装完整 InternalResponse
+	modelName := lastModel
+	if aliasModel != "" {
+		modelName = aliasModel
+	}
+
+	contentJSON, _ := json.Marshal(accumulatedContent.String())
+	internalResp := &schema.InternalResponse{
+		ID:    fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
+		Model: modelName,
+		Choices: []schema.InternalChoice{{
+			Index: 0,
+			Message: schema.InternalMessage{
+				Role:    schema.RoleAssistant,
+				Content: contentJSON,
+			},
+			FinishReason: lastFinishReason,
+		}},
+		Usage:  lastUsage,
+		Object: "chat.completion",
+	}
+
+	// 翻译为入站协议格式
+	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
+	if err != nil {
+		q.sendError(w, http.StatusInternalServerError, "encode_response", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(outgoingResp)
+
+	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+	vctx.outgoingBody = outgoingResp
+	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
 // translateToProvider 根据目标 Provider 类型选择翻译器并构建下游请求体
@@ -1846,9 +2214,18 @@ func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status i
 	}
 }
 
-// extractUsage 从原始 JSON 响应中提取 token 用量。
-// 支持多种格式:
-//   - OpenAI: usage.prompt_tokens / completion_tokens / total_tokens
+// trimSSEDataPrefix 去掉 SSE 行开头的 "data: " 前缀（如有），返回纯 JSON 内容
+func trimSSEDataPrefix(line []byte) []byte {
+	s := string(line)
+	if rest, ok := strings.CutPrefix(s, "data: "); ok {
+		return []byte(rest)
+	}
+	return line
+}
+
+// extractUsage 从响应 JSON 中提取 usage 信息。
+// 兼容多种字段名：
+//   - OpenAI/ChatCompletion: usage.prompt_tokens / completion_tokens
 //   - Anthropic: usage.input_tokens / output_tokens
 //   - Responses API: usage.input_tokens / output_tokens
 func (q *QuickGateway) extractUsage(resp []byte) *schema.InternalUsage {
@@ -1931,7 +2308,6 @@ func writeSSE(w http.ResponseWriter, data []byte) bool {
 	}
 	return true
 }
-
 
 // handlePassthroughRaw HTTP 直连透传：客户端要什么协议就发什么协议，上游返回什么客户端收到什么
 // 不注入心跳、不做 SSE 包装，仅替换 model 名
@@ -2043,7 +2419,7 @@ streamLoop:
 				}
 			}
 
-			usage := q.extractUsage(line)
+			usage := q.extractUsage(trimSSEDataPrefix(line))
 			if usage != nil {
 				lastUsage = usage
 			}
