@@ -391,10 +391,10 @@ func sniffAll(url, key string) *SniffResult {
 		if len(result.Capabilities) > 0 {
 			responsesURL := base + "/v1/responses"
 			respBody := map[string]any{
-				"model":          "gpt-4o",
-				"input":          "probe",
+				"model":             "gpt-4o",
+				"input":             "probe",
 				"max_output_tokens": 1,
-				"stream":         false,
+				"stream":            false,
 			}
 			respBodyJSON, _ := json.Marshal(respBody)
 			req, err := http.NewRequest("POST", responsesURL, strings.NewReader(string(respBodyJSON)))
@@ -406,7 +406,7 @@ func sniffAll(url, key string) *SniffResult {
 				resp, err := shortClient.Do(req)
 				if err == nil {
 					defer resp.Body.Close()
-					if resp.StatusCode < 500 {
+					if resp.StatusCode < 300 || resp.StatusCode == 401 {
 						result.Capabilities = append(result.Capabilities, "responses")
 						result.ModelsMap["responses"] = result.ModelsMap["openai"]
 					}
@@ -436,7 +436,7 @@ func sniffAll(url, key string) *SniffResult {
 		resp, err := shortClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
-			if resp.StatusCode < 500 {
+			if resp.StatusCode < 300 || resp.StatusCode == 401 {
 				var bodyMap map[string]any
 				if json.NewDecoder(resp.Body).Decode(&bodyMap) == nil {
 					if m, ok := bodyMap["model"].(string); ok {
@@ -474,7 +474,7 @@ func sniffAll(url, key string) *SniffResult {
 		resp, err := shortClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
-			if resp.StatusCode < 500 {
+			if resp.StatusCode < 300 || resp.StatusCode == 401 {
 				result.ModelsMap["gemini"] = nil
 				result.Capabilities = append(result.Capabilities, "gemini")
 			}
