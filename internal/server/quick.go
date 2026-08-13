@@ -418,7 +418,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			case "passthrough":
 				// HTTP 直连透传：上游返回什么就发什么，不注入心跳、不做 SSE 包装
 				// 适用于已知上下游协议完全对齐的场景（零损耗）
-				q.handlePassthroughRaw(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+				q.handlePassthroughRaw(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, ingressProtocol)
 				return
 			}
 		}
@@ -623,9 +623,10 @@ func echoAliasInResponseBody(resp json.RawMessage, aliasModel string) json.RawMe
 	return resp
 }
 
-// stripThinkingContentBlocks 从响应 JSON 中移除 thinking 类型内容块。
-// SenseNova 的 DeepSeek 模型在 high effort 模式下返回非标准 thinking 类型内容块，
-// Claude Code 的 Anthropic 客户端无法解析，导致 "empty or malformed response" 错误。
+// stripThinkingContentBlocks 从响应 JSON 中移除非标准 thinking 类型内容块。
+// SenseNova 的 DeepSeek 模型在 high effort 模式下返回非标准 thinking 类型内容块
+// （缺少 Anthropic 标准要求的 signature 字段），Claude Code 等客户端无法解析。
+// 标准 Anthropic thinking 块（含 signature 字段）会被保留，确保 Kimi 等客户端能正常接收推理过程。
 func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 	if len(resp) == 0 {
 		return resp
@@ -638,7 +639,7 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 
 	var raw map[string]interface{}
 	if err := json.Unmarshal(resp, &raw); err != nil {
-		return resp // 解析失败则原样返回
+		return resp
 	}
 
 	contentRaw, ok := raw["content"]
@@ -650,7 +651,7 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 		return resp
 	}
 
-	// 过滤掉 thinking 类型的内容块，保留其他类型
+	// 过滤掉非标准 thinking 块（无 signature 字段），保留标准 thinking 块
 	filtered := make([]interface{}, 0, len(contentArr))
 	for _, item := range contentArr {
 		itemMap, ok := item.(map[string]interface{})
@@ -659,7 +660,13 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 			continue
 		}
 		if t, _ := itemMap["type"].(string); t == "thinking" {
-			continue // 跳过 thinking 块
+			// 标准 Anthropic thinking 块包含 signature 字段，保留
+			if _, hasSig := itemMap["signature"]; hasSig {
+				filtered = append(filtered, item)
+				continue
+			}
+			// 非标准 thinking 块（无 signature），跳过
+			continue
 		}
 		filtered = append(filtered, item)
 	}
@@ -2380,7 +2387,7 @@ func writeSSE(w http.ResponseWriter, data []byte) bool {
 // 不注入心跳、不做 SSE 包装，仅替换 model 名
 // streamMode=="passthrough" 时调用，适用于已知上下游协议完全对齐的场景（零损耗）
 func (q *QuickGateway) handlePassthroughRaw(p provider.Provider, ctx context.Context, w http.ResponseWriter,
-	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time) {
+	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, ingressProtocol string) {
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -2394,7 +2401,9 @@ func (q *QuickGateway) handlePassthroughRaw(p provider.Provider, ctx context.Con
 	}
 
 	stream := quickDetectStream(body)
-	if stream {
+	// Claude Code（Anthropic Messages）不带 stream 字段，仍期望 SSE
+	// 只有显式 stream:false 才走非流式
+	if stream || (ingressProtocol == "anthropic" && !quickStreamExplicitFalse(body)) {
 		q.handlePassthroughRawStream(p, ctx, w, r, body, aliasHit, aliasModel, startTime, realModel)
 	} else {
 		q.handlePassthroughRawNonStream(p, ctx, w, r, body, aliasHit, aliasModel, startTime, realModel)
@@ -2466,6 +2475,7 @@ streamLoop:
 			if !ok {
 				break streamLoop
 			}
+			heartbeat.Reset(500 * time.Millisecond)
 			var meta map[string]any
 			if json.Unmarshal(line, &meta) == nil {
 				if meta["_type"] == "headers" {

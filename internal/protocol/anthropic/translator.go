@@ -332,7 +332,7 @@ func mapStopReasonReverse(reason string) string {
 	case "tool_calls":
 		return "tool_use"
 	default:
-		return "end_turn"
+		return reason // 透传未知值（如 "cancelled"、"incomplete" 等）
 	}
 }
 
@@ -347,16 +347,27 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 		select {
 		case <-ctx.Done():
 			if blockStarted {
-				// 发送 content_block_stop 后再结束
 				raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
 				fn(append([]byte("data: "), raw...), false)
 				fn([]byte("\n\n"), false)
 			}
-			fn([]byte("data: [DONE]\n\n"), true)
+			// 补全 message_delta + message_stop，符合 Anthropic 协议事件序列
+			raw, _ := json.Marshal(StreamEvent{
+				Type:         "message_delta",
+				MessageDelta: &MessageDelta{StopReason: "end_turn"},
+			})
+			fn(append([]byte("data: "), raw...), false)
+			fn([]byte("\n\n"), false)
+			raw, _ = json.Marshal(map[string]string{"type": "message_stop"})
+			fn(append([]byte("data: "), raw...), false)
+			fn([]byte("\n\n"), true)
 			return
 		case event, ok := <-events:
 			if !ok {
-				fn([]byte("data: [DONE]\n\n"), true)
+				// channel 关闭 → 发送 message_stop 结束
+				raw, _ := json.Marshal(map[string]string{"type": "message_stop"})
+				fn(append([]byte("data: "), raw...), false)
+				fn([]byte("\n\n"), true)
 				return
 			}
 
@@ -459,8 +470,8 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 					fn(append([]byte("data: "), usageRaw...), false)
 					fn([]byte("\n\n"), false)
 				}
-
-				fn([]byte("data: [DONE]\n\n"), true)
+				// Anthropic 协议以 message_stop 结束，不发送 [DONE]
+				fn(nil, true)
 				return
 			}
 		}
