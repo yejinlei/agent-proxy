@@ -58,6 +58,7 @@ type ContentBlock struct {
 	ToolUseID    string          `json:"tool_use_id,omitempty"`
 	Content      json.RawMessage `json:"content,omitempty"` // tool_result content
 	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	Citations    []interface{}   `json:"citations"` // 空数组，符合 Anthropic 规范
 }
 
 type ImageSource struct {
@@ -118,13 +119,14 @@ type StreamEvent struct {
 }
 
 type EventMessage struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	Role       string         `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	Model      string         `json:"model"`
-	StopReason string         `json:"stop_reason"`
-	Usage      *Usage         `json:"usage"`
+	ID           string         `json:"id"`
+	Type         string         `json:"type"`
+	Role         string         `json:"role"`
+	Content      []ContentBlock `json:"content"`
+	Model        string         `json:"model"`
+	StopReason   string         `json:"stop_reason"`
+	StopSequence *string        `json:"stop_sequence"`
+	Usage        *Usage         `json:"usage"`
 }
 
 type Delta struct {

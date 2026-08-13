@@ -342,9 +342,16 @@ func mapStopReasonReverse(reason string) string {
 
 // TranslateStream 将内部流式事件翻译为 Anthropic 格式 SSE
 func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	blockStarted := false // 当前内容块是否已发送 content_block_start
 	for {
 		select {
 		case <-ctx.Done():
+			if blockStarted {
+				// 发送 content_block_stop 后再结束
+				raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
+				fn(append([]byte("data: "), raw...), false)
+				fn([]byte("\n\n"), false)
+			}
 			fn([]byte("data: [DONE]\n\n"), true)
 			return
 		case event, ok := <-events:
@@ -361,8 +368,16 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 				continue
 
 			case "start":
+				blockStarted = false
 				if event.Data != nil {
-					msg := EventMessage{ID: event.Data.ID, Type: "message", Role: "assistant"}
+					msg := EventMessage{
+						ID:           event.Data.ID,
+						Type:         "message",
+						Role:         "assistant",
+						Content:      []ContentBlock{},
+						StopSequence: nil,
+						Usage:        &Usage{InputTokens: 0, OutputTokens: 0},
+					}
 					if event.Data.Model != "" {
 						msg.Model = event.Data.Model
 					}
@@ -386,6 +401,17 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 						delta = &Delta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}
 					}
 					if delta != nil {
+						// 第一个 delta 之前发送 content_block_start
+						if !blockStarted {
+							blockStarted = true
+							raw, _ := json.Marshal(StreamEvent{
+								Type:         "content_block_start",
+								Index:        choice.Index,
+								ContentBlock: &ContentBlock{Type: "text", Text: "", Citations: []interface{}{}},
+							})
+							fn(append([]byte("data: "), raw...), false)
+							fn([]byte("\n\n"), false)
+						}
 						raw, _ := json.Marshal(StreamEvent{
 							Type:  "content_block_delta",
 							Index: choice.Index,
@@ -398,6 +424,13 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 				continue
 
 			case "done":
+				// 发送 content_block_stop 后 再发送 message_delta
+				if blockStarted {
+					blockStarted = false
+					raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
+					fn(append([]byte("data: "), raw...), false)
+					fn([]byte("\n\n"), false)
+				}
 				stopReason := "end_turn"
 				if event.Data != nil && len(event.Data.Choices) > 0 {
 					stopReason = mapStopReasonReverse(event.Data.Choices[0].FinishReason)
@@ -914,12 +947,15 @@ func ToCCStreamChunk(chunk *schema.InternalStreamChunk) json.RawMessage {
 		}
 	}
 
-	raw, _ := json.Marshal(map[string]interface{}{
+	ch := map[string]interface{}{
 		"id":      chunk.ID,
 		"object":  "chat.completion.chunk",
 		"model":   chunk.Model,
 		"choices": choices,
-		"usage":   chunk.Usage,
-	})
+	}
+	if chunk.Usage != nil {
+		ch["usage"] = chunk.Usage
+	}
+	raw, _ := json.Marshal(ch)
 	return raw
 }

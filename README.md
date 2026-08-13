@@ -202,6 +202,11 @@ agent-proxy/
 |------|------|
 | [README.md](README.md) | 快速概览、上手、命令总览 |
 | [MANUAL.md](MANUAL.md) | 完整用户手册（协议兼容性、Web UI、扩展开发、故障排查） |
+| [docs/DESIGN.md](docs/DESIGN.md) | 设计文档（底层机制、协议处理流、消息转换详解） |
+| [AGENTS.md](AGENTS.md) | AI 开发上下文（Cursor、Copilot 等自动读取） |
+| [CLAUDE.md](CLAUDE.md) | AI 开发上下文（Claude Code 自动读取，与 AGENTS.md 同步） |
+
+> **注意：** [AGENTS.md](AGENTS.md) 和 [CLAUDE.md](CLAUDE.md) 内容一致，修改任一份时需同步更新另一份。AGENTS.md 供 Cursor、Copilot、Trae 等工具读取，CLAUDE.md 供 Claude Code 读取。
 
 ## License
 

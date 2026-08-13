@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1280"
+     width="1240" height="1280">
+  <defs>
+    <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#656d76"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#bc4c00"/>
+    </marker>
+  </defs>
+  <rect width="1240" height="1280" fill="#ffffff"/>
+
+  <text x="620" y="34" text-anchor="middle" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="20" font-weight="bold">Claude Code → agent-proxy 请求流程（auto 模式）</text>
+  <text x="620" y="56" text-anchor="middle" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="11">fable 原生模型 · 透传路径 · 心跳防超时 · 自适应流式探测</text>
+
+  <g font-family="JetBrains Mono, Consolas, monospace" font-size="9">
+    <rect x="40" y="74" width="14" height="14" rx="2" fill="#0969da" opacity="0.15"/>
+    <rect x="40" y="74" width="3" height="14" fill="#0969da"/>
+    <text x="60" y="85" fill="#24292f">客户端请求</text>
+    <rect x="160" y="74" width="14" height="14" rx="2" fill="#bc4c00" opacity="0.15"/>
+    <rect x="160" y="74" width="3" height="14" fill="#bc4c00"/>
+    <text x="180" y="85" fill="#24292f">路由决策</text>
+    <rect x="280" y="74" width="14" height="14" rx="2" fill="#1a7f37" opacity="0.15"/>
+    <rect x="280" y="74" width="3" height="14" fill="#1a7f37"/>
+    <text x="300" y="85" fill="#24292f">上游调用</text>
+    <rect x="400" y="74" width="14" height="14" rx="2" fill="#9a6700" opacity="0.15"/>
+    <rect x="400" y="74" width="3" height="14" fill="#9a6700"/>
+    <text x="420" y="85" fill="#24292f">心跳/等待</text>
+    <rect x="520" y="74" width="14" height="14" rx="2" fill="#8250df" opacity="0.15"/>
+    <rect x="520" y="74" width="3" height="14" fill="#8250df"/>
+    <text x="540" y="85" fill="#24292f">SSE 响应</text>
+    <rect x="640" y="74" width="14" height="14" rx="2" fill="#cf222e" opacity="0.15"/>
+    <rect x="640" y="74" width="3" height="14" fill="#cf222e"/>
+    <text x="660" y="85" fill="#24292f">后台探测</text>
+    <line x1="760" y1="81" x2="790" y2="81" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="798" y="85" fill="#24292f">请求/数据流</text>
+    <line x1="900" y1="81" x2="930" y2="81" stroke="#0969da" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arrow-blue)"/>
+    <text x="938" y="85" fill="#24292f">响应/回写</text>
+  </g>
+
+  <line x1="40" y1="100" x2="1200" y2="100" stroke="#d0d7de" stroke-width="1"/>
+
+  <!-- 阶段 1 -->
+  <rect x="40" y="115" width="1160" height="330" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="40" y="115" width="1160" height="30" rx="6" fill="#0969da" opacity="0.12"/>
+  <rect x="40" y="115" width="4" height="30" fill="#0969da"/>
+  <text x="56" y="135" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="12" font-weight="bold">阶段 1 · 验证请求（启动 / /model 切换时）</text>
+  <text x="1180" y="135" text-anchor="end" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">请求体不带 stream 字段</text>
+
+  <text x="200" y="165" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Claude Code</text>
+  <text x="620" y="165" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">agent-proxy (quick.go)</text>
+  <text x="1040" y="165" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Upstream</text>
+  <line x1="40" y1="172" x2="1200" y2="172" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="400" y1="145" x2="400" y2="440" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="840" y1="145" x2="840" y2="440" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+
+  <rect x="90" y="195" width="220" height="80" rx="4" fill="#0969da" opacity="0.08" stroke="#0969da" stroke-width="1"/>
+  <rect x="90" y="195" width="3" height="80" fill="#0969da"/>
+  <text x="100" y="213" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">POST /v1/messages</text>
+  <text x="100" y="229" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">{</text>
+  <text x="108" y="243" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">"model": "claude-fable-5",</text>
+  <text x="108" y="257" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9">"messages": [...]</text>
+  <text x="108" y="271" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-style="italic">// 无 stream 字段</text>
+  <text x="100" y="285" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">}</text>
+
+  <rect x="470" y="195" width="300" height="100" rx="4" fill="#bc4c00" opacity="0.08" stroke="#bc4c00" stroke-width="1"/>
+  <rect x="470" y="195" width="3" height="100" fill="#bc4c00"/>
+  <text x="480" y="213" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">路由判断 (quickDetectStream)</text>
+  <text x="480" y="229" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">stream = false (无 stream 字段)</text>
+  <text x="480" y="243" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">explicitFalse = false (字段不存在)</text>
+  <text x="480" y="257" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">// 模糊态：既非 true 也非显式 false</text>
+  <text x="480" y="271" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">// 按协议规范，默认期望非流式 JSON</text>
+  <text x="480" y="287" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">→ handlePassthroughNonStreamAsSSE</text>
+
+  <rect x="470" y="320" width="300" height="70" rx="4" fill="#9a6700" opacity="0.08" stroke="#9a6700" stroke-width="1"/>
+  <rect x="470" y="320" width="3" height="70" fill="#9a6700"/>
+  <text x="480" y="338" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">心跳 goroutine</text>
+  <text x="480" y="354" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">ticker := 500ms</text>
+  <text x="480" y="368" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">writeSSE(w, "data: {}")</text>
+  <text x="480" y="382" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-style="italic">// 防 Claude 18-20s 超时</text>
+
+  <rect x="470" y="410" width="300" height="22" rx="4" fill="#8250df" opacity="0.12"/>
+  <rect x="470" y="410" width="3" height="22" fill="#8250df"/>
+  <text x="480" y="425" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">close(done) → 停心跳 → SSE 包装响应返回</text>
+
+  <rect x="930" y="195" width="220" height="80" rx="4" fill="#1a7f37" opacity="0.08" stroke="#1a7f37" stroke-width="1"/>
+  <rect x="930" y="195" width="3" height="80" fill="#1a7f37"/>
+  <text x="940" y="213" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">p.Call(callCtx, nsBody)</text>
+  <text x="940" y="229" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">非流式 HTTP 请求</text>
+  <text x="940" y="243" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">stream:false 已注入</text>
+  <text x="940" y="257" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">model 已替换为上游名</text>
+  <text x="940" y="271" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">⏳ 等待响应</text>
+
+  <line x1="310" y1="235" x2="468" y2="235" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="770" y1="235" x2="928" y2="235" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="620" y1="295" x2="620" y2="318" stroke="#9a6700" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arrow-orange)"/>
+  <line x1="940" y1="275" x2="772" y2="320" stroke="#0969da" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arrow-blue)"/>
+  <line x1="620" y1="390" x2="620" y2="408" stroke="#8250df" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- 阶段 2 -->
+  <rect x="40" y="460" width="1160" height="350" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="40" y="460" width="1160" height="30" rx="6" fill="#cf222e" opacity="0.12"/>
+  <rect x="40" y="460" width="4" height="30" fill="#cf222e"/>
+  <text x="56" y="480" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="12" font-weight="bold">阶段 2 · 首次对话请求（stream:true，未探测）</text>
+  <text x="1180" y="480" text-anchor="end" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">首次流式 · 后台探测启动</text>
+
+  <text x="200" y="510" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Claude Code</text>
+  <text x="620" y="510" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">agent-proxy (quick.go)</text>
+  <text x="1040" y="510" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Upstream + 后台探测</text>
+  <line x1="40" y1="517" x2="1200" y2="517" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="400" y1="490" x2="400" y2="805" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="840" y1="490" x2="840" y2="805" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+
+  <rect x="90" y="540" width="220" height="70" rx="4" fill="#0969da" opacity="0.08" stroke="#0969da" stroke-width="1"/>
+  <rect x="90" y="540" width="3" height="70" fill="#0969da"/>
+  <text x="100" y="558" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">POST /v1/messages</text>
+  <text x="100" y="574" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">{</text>
+  <text x="108" y="588" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">"model": "claude-fable-5",</text>
+  <text x="108" y="602" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">"stream": true,</text>
+  <text x="100" y="616" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">...</text>
+
+  <rect x="470" y="540" width="300" height="100" rx="4" fill="#bc4c00" opacity="0.08" stroke="#bc4c00" stroke-width="1"/>
+  <rect x="470" y="540" width="3" height="100" fill="#bc4c00"/>
+  <text x="480" y="558" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">路由判断</text>
+  <text x="480" y="574" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">stream = true</text>
+  <text x="480" y="588" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">preferNonStream, tested =</text>
+  <text x="488" y="602" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">streamPrefer[baseURL]</text>
+  <text x="480" y="616" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">→ tested == false (未探测)</text>
+  <text x="480" y="632" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">→ handlePassthroughNonStreamAsSSE</text>
+
+  <rect x="470" y="665" width="300" height="45" rx="4" fill="#9a6700" opacity="0.08" stroke="#9a6700" stroke-width="1"/>
+  <rect x="470" y="665" width="3" height="45" fill="#9a6700"/>
+  <text x="480" y="683" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">心跳（同阶段1）</text>
+  <text x="480" y="699" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-style="italic">// 等待期间 500ms 发 "data: {}"</text>
+
+  <rect x="470" y="775" width="300" height="22" rx="4" fill="#8250df" opacity="0.12"/>
+  <rect x="470" y="775" width="3" height="22" fill="#8250df"/>
+  <text x="480" y="790" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">close(done) → 停心跳 → SSE 包装响应返回</text>
+
+  <rect x="930" y="540" width="220" height="70" rx="4" fill="#1a7f37" opacity="0.08" stroke="#1a7f37" stroke-width="1"/>
+  <rect x="930" y="540" width="3" height="70" fill="#1a7f37"/>
+  <text x="940" y="558" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">p.Call() 非流式</text>
+  <text x="940" y="574" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">同步等待响应</text>
+  <text x="940" y="588" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">⏳ 主请求</text>
+
+  <rect x="930" y="625" width="220" height="85" rx="4" fill="#cf222e" opacity="0.08" stroke="#cf222e" stroke-width="1"/>
+  <rect x="930" y="625" width="3" height="85" fill="#cf222e"/>
+  <text x="940" y="643" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">go probeStreamPrefer()</text>
+  <text x="940" y="659" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">后台异步探测 SSE 速度</text>
+  <text x="940" y="673" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">用相同 body 调 CallStream</text>
+  <text x="940" y="687" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">对比耗时 → 写入</text>
+  <text x="940" y="701" fill="#cf222e" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">streamPrefer[baseURL]</text>
+
+  <line x1="310" y1="575" x2="468" y2="575" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="770" y1="575" x2="928" y2="575" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1040" y1="610" x2="1040" y2="623" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arrow-green)"/>
+  <line x1="620" y1="640" x2="620" y2="663" stroke="#9a6700" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arrow-orange)"/>
+  <line x1="928" y1="667" x2="772" y2="687" stroke="#0969da" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arrow-blue)"/>
+  <line x1="620" y1="710" x2="620" y2="773" stroke="#8250df" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- 阶段 3 -->
+  <rect x="40" y="825" width="1160" height="440" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="40" y="825" width="1160" height="30" rx="6" fill="#1a7f37" opacity="0.12"/>
+  <rect x="40" y="825" width="4" height="30" fill="#1a7f37"/>
+  <text x="56" y="845" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="12" font-weight="bold">阶段 3 · 后续对话请求（stream:true，已探测）</text>
+  <text x="1180" y="845" text-anchor="end" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">按 streamPrefer[baseURL] 分流</text>
+
+  <text x="200" y="875" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Claude Code</text>
+  <text x="620" y="875" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">agent-proxy (quick.go)</text>
+  <text x="1040" y="875" text-anchor="middle" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="10" font-weight="bold">Upstream</text>
+  <line x1="40" y1="882" x2="1200" y2="882" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="400" y1="855" x2="400" y2="1260" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="840" y1="855" x2="840" y2="1260" stroke="#d0d7de" stroke-width="1" stroke-dasharray="2,3"/>
+
+  <rect x="90" y="900" width="220" height="50" rx="4" fill="#0969da" opacity="0.08" stroke="#0969da" stroke-width="1"/>
+  <rect x="90" y="900" width="3" height="50" fill="#0969da"/>
+  <text x="100" y="918" fill="#0969da" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">POST /v1/messages</text>
+  <text x="100" y="934" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">"stream": true</text>
+  <text x="100" y="948" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">后续对话请求</text>
+
+  <rect x="470" y="900" width="300" height="80" rx="4" fill="#bc4c00" opacity="0.08" stroke="#bc4c00" stroke-width="1"/>
+  <rect x="470" y="900" width="3" height="80" fill="#bc4c00"/>
+  <text x="480" y="918" fill="#bc4c00" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">路由判断</text>
+  <text x="480" y="934" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">tested == true</text>
+  <text x="480" y="948" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">preferNonStream ?</text>
+  <text x="480" y="962" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-style="italic">// 分两路：</text>
+  <text x="480" y="976" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-style="italic">//  true=非流式更快 / false=SSE更快</text>
+
+  <rect x="470" y="1000" width="145" height="95" rx="4" fill="#9a6700" opacity="0.08" stroke="#9a6700" stroke-width="1"/>
+  <rect x="470" y="1000" width="3" height="95" fill="#9a6700"/>
+  <text x="480" y="1018" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">分支 A: preferNonStream</text>
+  <text x="480" y="1032" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">= true</text>
+  <text x="480" y="1048" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8" font-weight="bold">handlePassthrough</text>
+  <text x="480" y="1060" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8" font-weight="bold">NonStreamAsSSE</text>
+  <text x="480" y="1076" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="8">同阶段1/2</text>
+  <text x="480" y="1088" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">上游非流式 + 心跳</text>
+
+  <rect x="625" y="1000" width="145" height="95" rx="4" fill="#8250df" opacity="0.08" stroke="#8250df" stroke-width="1"/>
+  <rect x="625" y="1000" width="3" height="95" fill="#8250df"/>
+  <text x="635" y="1018" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">分支 B: preferNonStream</text>
+  <text x="635" y="1032" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">= false</text>
+  <text x="635" y="1048" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8" font-weight="bold">handlePassthrough</text>
+  <text x="635" y="1060" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="8" font-weight="bold">Stream</text>
+  <text x="635" y="1076" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="8">上游 SSE 流式</text>
+  <text x="635" y="1088" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="8">有数据重置心跳</text>
+
+  <rect x="625" y="1110" width="145" height="60" rx="4" fill="#9a6700" opacity="0.06" stroke="#9a6700" stroke-width="1" stroke-dasharray="2,2"/>
+  <text x="635" y="1128" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="8" font-weight="bold">心跳逻辑差异</text>
+  <text x="635" y="1144" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="8">有数据: 重置 ticker</text>
+  <text x="635" y="1158" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="8">无数据: 发 "data: {}"</text>
+
+  <rect x="930" y="1000" width="220" height="95" rx="4" fill="#1a7f37" opacity="0.08" stroke="#1a7f37" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="930" y="1000" width="3" height="95" fill="#1a7f37"/>
+  <text x="940" y="1018" fill="#1a7f37" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">p.Call() 非流式</text>
+  <text x="940" y="1034" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">等待完整响应</text>
+  <text x="940" y="1050" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">⏳ 心跳 500ms</text>
+  <text x="940" y="1066" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">"data: {}"</text>
+  <text x="940" y="1082" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">→ SSE 包装返回</text>
+
+  <rect x="930" y="1110" width="220" height="95" rx="4" fill="#8250df" opacity="0.08" stroke="#8250df" stroke-width="1" stroke-dasharray="3,2"/>
+  <rect x="930" y="1110" width="3" height="95" fill="#8250df"/>
+  <text x="940" y="1128" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">p.CallStream() SSE</text>
+  <text x="940" y="1144" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9">逐行读取 SSE 事件</text>
+  <text x="940" y="1160" fill="#9a6700" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">⏳ 空闲时心跳 500ms</text>
+  <text x="940" y="1176" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">有数据 → 重置计时器</text>
+  <text x="940" y="1192" fill="#8250df" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">→ 直接透传 SSE</text>
+
+  <line x1="310" y1="925" x2="468" y2="925" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="540" y1="980" x2="540" y2="998" stroke="#9a6700" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+  <line x1="700" y1="980" x2="700" y2="998" stroke="#8250df" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="615" y1="1048" x2="928" y2="1048" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="770" y1="1048" x2="928" y2="1158" stroke="#656d76" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="1220" width="1160" height="40" rx="4" fill="#24292f" opacity="0.05"/>
+  <text x="50" y="1238" fill="#24292f" font-family="JetBrains Mono, Consolas, monospace" font-size="9" font-weight="bold">关键校准点：</text>
+  <text x="50" y="1252" fill="#656d76" font-family="JetBrains Mono, Consolas, monospace" font-size="9">① 心跳只在"等待上游响应期间"发送，响应到达立即 close(done) 停止 ② 首次流式请求仍走非流式上游（用于探测），并非直接 SSE ③ 验证请求"不带 stream 字段"≠"显式 stream:false" ④ 心跳格式为 data: {}（空JSON），兼容 Claude 的 data: 行超时重置和 Kimi 的合法 JSON 解析</text>
+
+</svg>

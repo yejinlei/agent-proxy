@@ -1,0 +1,640 @@
+# Agent-Proxy 设计文档
+
+> 底层机制、协议处理流程、消息转换详解。面向开发者与 AI 辅助开发。
+>
+> 用户操作指南见 [MANUAL.md](../MANUAL.md)。
+
+***
+
+## 架构概览
+
+### Central Schema（翻译中枢）
+
+所有外部协议先转为 `schema.InternalRequest`（统一中枢结构），再转为下游格式。这保证 N 个协议只需 N 个翻译器，而非 N×N。
+
+```mermaid
+flowchart LR
+    CC[ChatCompletionRequest] --> IR[InternalRequest<br/>中枢]
+    IR --> A[AnthropicRequest]
+    IR --> G[GeminiRequest]
+```
+
+**架构原则：禁止协议 A 直接翻译到协议 B；必须协议 A → Schema → 协议 B。**
+
+### 处理流水线：消息格式 vs 流/非流
+
+翻译路径的完整处理顺序：**消息格式转换先行，流/非流决策后置**。
+
+```mermaid
+flowchart TD
+    subgraph L1["🔵 第 1 层：协议识别"]
+        direction LR
+        A1["POST /v1/chat/completions"] --> A2["→ ChatCompletion"]
+        A3["POST /v1/messages"] --> A4["→ Anthropic"]
+        A5["POST /v1/models/*:generateContent"] --> A6["→ Gemini"]
+        A7["POST /v1/responses"] --> A8["→ Responses"]
+    end
+
+    L1 --> L2
+
+    subgraph L2["🟢 第 2 层：路径决策"]
+        direction LR
+        B1{"入站协议 ==<br/>上游协议?"}
+        B1 -->|YES| B2["透传路径<br/>跳过格式转换"]
+        B1 -->|NO| B3["翻译路径<br/>进入 Schema"]
+    end
+
+    B2 --> L2B
+
+    subgraph L2B["🟡 透传：流/非流决策"]
+        direction LR
+        C1["--stream-mode<br/>控制路由"] --> C2["stream / non-stream<br/>auto / passthrough"]
+    end
+
+    B3 --> L3
+
+    subgraph L3["🟠 第 3 层：消息格式转换（先于流决策）"]
+        direction LR
+        D1["① TranslateRequest<br/>入站协议 → InternalRequest"] --> D2["② TranslateToProvider<br/>InternalRequest → 上游协议"]
+        D2 --> D3["InternalRequest.Stream<br/>保留原始 stream 标记"]
+    end
+
+    L3 --> L4
+
+    subgraph L4["🔴 第 4 层：流/非流决策（后于格式转换）"]
+        direction LR
+        E1["--stream-mode 覆写<br/>internalReq.Stream"]
+        E1 --> E2{"stream?"}
+        E2 -->|true| E3["handleStreamRequest<br/>或 handleStreamRequestAsNonStream"]
+        E2 -->|false| E4["handleNonStreamResponse<br/>或 handleNonStreamResponseAsSSE"]
+    end
+
+    style L1 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style L2 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style L2B fill:#fff9c4,stroke:#f9a825,stroke-width:2px
+    style L3 fill:#fff3e0,stroke:#f57c00,stroke-width:3px,stroke-dasharray:5 5
+    style L4 fill:#fce4ec,stroke:#d32f2f,stroke-width:2px
+```
+
+> **关键结论：消息格式转换（第 3 层）在流/非流决策（第 4 层）之前。**
+> `InternalRequest.Stream` 字段担任"信使"——在 TranslateRequest 阶段从入站协议提取并保留，传递到第 4 层供 `--stream-mode` 覆写。
+
+### 两大路径：透传 vs 翻译
+
+```mermaid
+flowchart TD
+    A[入站请求] --> B{入站协议 ∈ Provider capabilities?}
+    B -->|YES| C[透传路径<br/>零开销，直接转发]
+    B -->|NO| D[翻译路径<br/>Central Schema]
+```
+
+| 路径 | 触发条件         | 请求处理                                                     | 响应处理                                                         | 损耗             |
+| -- | ------------ | -------------------------------------------------------- | ------------------------------------------------------------ | -------------- |
+| 透传 | 入站协议 == 上游协议 | 原样转发，仅替换 model 名                                         | 原样回传（或 SSE 包装）                                               | 零              |
+| 翻译 | 入站协议 != 上游协议 | TranslateRequest → InternalRequest → TranslateToProvider | TranslateFromProvider → InternalResponse → TranslateResponse | 两次 JSON 解析/序列化 |
+
+***
+
+## 入站/出站协议处理全流程
+
+### 路由决策树
+
+```mermaid
+flowchart TD
+    A[入站请求到达] --> B[selectProtocol<br/>根据 URL 路径识别入站协议]
+    B --> C{入站协议 ∈<br/>Provider capabilities?}
+    C -->|YES| D[透传路径<br/>--stream-mode 控制路由]
+    C -->|NO| E[翻译路径<br/>ingressTranslator.TranslateRequest]
+    D --> F[stream / non-stream / auto / passthrough<br/>按模式选择 handler]
+    E --> G[覆写 internalReq.Stream<br/>按 --stream-mode]
+    G --> H{stream?}
+    H -->|true| I[handleStreamRequest<br/>或 handleStreamRequestAsNonStream]
+    H -->|false| J[handleNonStreamResponse<br/>或 handleNonStreamResponseAsSSE]
+```
+
+### 透传路径分支标注（按 `--stream-mode`）
+
+| 请求体 `stream` 字段 | `stream`                                                 | `auto`                                          | `non-stream`                                    | `passthrough`              |
+| --------------- | -------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------- | -------------------------- |
+| `stream: true`  | **`StreamWithBody`** — 注入 `stream:true`，上游 SSE → 客户端 SSE | **自适应** — 首次 `NonStreamAsSSE` + 探测，后续按偏好        | **`NonStreamAsSSE`** — 上游非流式 → JSON 拆解为 SSE 事件流 | **`RawStream`** — 直连透传，零处理 |
+| 无 `stream` 字段   | **`NonStream`** — 上游非流式 → 客户端 JSON                       | **`NonStream`** — chunked JSON（先写头 + Flush 防超时） | **`NonStreamAsSSE`** — 上游非流式 → SSE 包装           | **`RawNonStream`** — 直连透传  |
+| `stream: false` | **`StreamWithBody`** — 注入 `stream:true` 变流式              | **`NonStream`** — chunked JSON                  | **`NonStreamAsSSE`** — SSE 包装                   | **`RawNonStream`** — 直连透传  |
+
+**分支使用的消息转换：**
+
+| 分支函数                              | 入站→上游                  | 上游→出站           | 转换说明                                                  |
+| --------------------------------- | ---------------------- | --------------- | ----------------------------------------------------- |
+| `handlePassthroughStream`         | 无转换（但注入 `stream:true`） | 无转换（原样透传 SSE）   | 仅替换 model 名 + 统一 `data:` 前缀                           |
+| `handlePassthroughNonStream`      | 无转换（仅替换 model 名）       | 无转换（原样透传 JSON）  | chunked transfer 防超时                                  |
+| `handlePassthroughNonStreamAsSSE` | 无转换（仅替换 model 名）       | **JSON→SSE 拆解** | 上游非流式 JSON → Anthropic/OpenAI/Gemini/Responses SSE 事件 |
+| `handlePassthroughRaw`            | 无转换                    | 无转换             | 零处理，仅替换 model 名                                       |
+| `handlePassthroughStreamWithBody` | 注入 `stream:true`       | 无转换             | 适用 Anthropic 等无 stream 字段的协议                          |
+
+### 翻译路径分支标注（按 `--stream-mode`）
+
+翻译路径同样受 `--stream-mode` 控制：覆写 `internalReq.Stream` 后再根据结果路由。
+
+| 模式           | 入站 `stream` | 上游 `stream`（覆写后） | 处理函数                             | 说明                        |
+| ------------ | ----------- | ---------------- | -------------------------------- | ------------------------- |
+| `auto`       | true        | true             | `handleStreamRequest`            | 入站流式→上游流式→出站 SSE          |
+| `auto`       | false       | false            | `handleNonStreamResponse`        | 入站非流式→上游非流式→出站 JSON       |
+| `non-stream` | true        | **false**        | `handleNonStreamResponseAsSSE`   | 入站流式→上游非流式→SSE 包装         |
+| `non-stream` | false       | false            | `handleNonStreamResponse`        | 入站非流式→上游非流式→出站 JSON       |
+| `stream`     | true        | true             | `handleStreamRequest`            | 入站流式→上游流式→出站 SSE          |
+| `stream`     | false       | **true**         | `handleStreamRequestAsNonStream` | 入站非流式→上游流式→收集 SSE 组装 JSON |
+
+> `passthrough` 模式仅在透传路径生效，翻译路径忽略。
+
+**翻译管道核心流程：**
+
+```mermaid
+flowchart TD
+    A[入站请求] --> B[ingressTranslator.TranslateRequest]
+    B --> C[InternalRequest]
+    C --> D[providerTranslator.TranslateToProvider]
+    D --> E[下游请求体]
+    E --> F[p.Call / p.CallStream<br/>调用上游 Provider]
+    F --> G[providerTranslator.TranslateFromProvider]
+    G --> H[InternalResponse]
+    H --> I[ingressTranslator.TranslateResponse]
+    I --> J[出站响应]
+```
+
+**流式翻译链路：**
+
+```mermaid
+flowchart LR
+    A[下游 Provider SSE 行] --> B[providerTranslator.TranslateStreamEvent]
+    B --> C[InternalStreamEvent]
+    C --> D[ingressTranslator.TranslateStream]
+    D --> E[出站 SSE 输出]
+```
+
+**使用的翻译器：**
+
+| 翻译器                        | 文件                                               | 负责协议                  |
+| -------------------------- | ------------------------------------------------ | --------------------- |
+| `ChatCompletionTranslator` | `internal/protocol/chatcompletion/translator.go` | OpenAI ChatCompletion |
+| `AnthropicTranslator`      | `internal/protocol/anthropic/translator.go`      | Anthropic Messages    |
+| `GeminiTranslator`         | `internal/protocol/gemini/translator.go`         | Google Gemini         |
+| `ResponsesTranslator`      | `internal/protocol/responses/translator.go`      | OpenAI Responses      |
+
+***
+
+## 透传路径底层机制
+
+### `--stream-mode` 流式策略控制
+
+`--stream-mode` 控制代理如何向上游发送请求（流式/非流式）。**透传和翻译路径均生效**：透传路径直接按模式选择 handler，翻译路径先覆写 `internalReq.Stream` 再路由。
+
+**四种模式：**
+
+| 模式            | 行为                                        | 适用场景        |
+| ------------- | ----------------------------------------- | ----------- |
+| `auto`（默认）    | 自适应：首次走非流式上游 + SSE 包装，后台探测 SSE 速度，后续按偏好选择 | 日常使用        |
+| `stream`      | 强制上游走 SSE 流                               | 上游仅支持流式     |
+| `non-stream`  | 强制上游走非流式                                  | 上游流式不稳定     |
+| `passthrough` | 直连透传，仅替换 model 名                          | 协议完全对齐（零损耗） |
+
+### `auto` 模式自适应机制
+
+首次请求走非流式 (`handlePassthroughNonStream`)，响应后启动后台 goroutine 探测同上游的 SSE 流式速度。后续请求按探测结果选择。
+
+```mermaid
+flowchart TD
+    A[客户端请求到达] --> B{streamPrefer<br/>已有记录?}
+    B -->|无| C[首次请求<br/>handlePassthroughNonStream<br/>非流式 chunked JSON]
+    B -->|有 SSE 更快| D[handlePassthroughStream<br/>SSE 流式透传 + 心跳]
+    B -->|有 非流式更快| E[handlePassthroughNonStream<br/>非流式 chunked JSON]
+    C --> F[响应完成]
+    F --> G[后台 goroutine<br/>probeStreamPrefer]
+    G --> H[发送探测请求<br/>注入 stream:true]
+    H --> I[记录 SSE 耗时]
+    I --> J[与非流式耗时对比]
+    J --> K[写入 streamPrefer<br/>按 baseURL 存储]
+```
+
+偏好按上游地址独立存储 (`streamPrefer map[string]bool`)，多上游互不干扰。
+
+### chunked JSON 防超时机制
+
+`handlePassthroughNonStream` 在调用上游之前先写 `Content-Type: application/json` + `200 OK` + `Flush()`，Go 的 `net/http` 自动使用 `Transfer-Encoding: chunked`。客户端立即收到响应头，知道 body 还在后面，在上游等待期间不会误判连接已死（ECONNRESET）。
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant P as agent-proxy
+    participant U as 上游 API
+
+    C->>P: POST /v1/messages (非流式)
+    P->>C: HTTP 200 + Content-Type: application/json<br/>Transfer-Encoding: chunked
+    Note over C: 客户端收到响应头<br/>连接保持，等待 body
+    P->>U: POST 非流式请求
+    Note over U: 上游思考中... (可能 12-60s)
+    U-->>P: 完整 JSON 响应
+    P->>C: JSON body 数据
+    P->>C: chunked 结束标记
+```
+
+### 心跳机制
+
+`stream` 和 `auto`（流式偏好）路径中，每 500ms 发送 `data: {}` 心跳（空 JSON 对象），防止上游思考（cogitation）期间客户端超时断开。
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant P as agent-proxy
+    participant U as 上游 API
+
+    C->>P: POST /v1/messages (stream:true)
+    P->>C: HTTP 200 + Content-Type: text/event-stream
+    P->>U: POST 流式请求
+    loop 每 500ms 直到上游有数据
+        P->>C: data: {}<br/><br/>(心跳)
+    end
+    U-->>P: SSE 数据行
+    P->>C: data: {...}<br/><br/>(上游数据)
+    Note over P: close(done) 停止心跳
+    U-->>P: 更多 SSE 数据
+    P->>C: data: {...}<br/><br/>
+```
+
+格式为 `data: {}` 而非空 data 行——保留 `data:` 前缀供 Claude Code 重置超时计时器，同时使用合法 JSON `{}` 避免严格客户端（Kimi / Anthropic SDK）对空字符串 `JSON.parse("")` 报 `Unexpected end of JSON input`。
+
+心跳仅在等待上游响应期间发送，响应到达后立即 `close(done)` 停止。
+
+### SSE 透传 `data:` 前缀规范化
+
+透传路径对 Provider 输出行进行 `data:` 前缀规范化：`OpenAIClient` 输出纯 JSON 行（缺 `data:` 前缀），`AnthropicClient` 输出带 `data:` 前缀的行。透传写出时统一检测并补全 `data:` 前缀，确保所有 SSE 行符合 `data: <json>\n\n` 标准格式。
+
+### Anthropic SSE 事件合规性
+
+`NonStreamAsSSE` 生成的 Anthropic 流式事件严格遵循 [Anthropic Messages API 规范](https://docs.anthropic.com/en/api/messages-streaming)：
+
+| 事件                    | 关键字段                                                   | 合规要点                                                                                                  |
+| --------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `message_start`       | `message.type`, `message.stop_reason`, `message.usage` | `type` 必填 `"message"`；`stop_reason` 初始为 `null`；`usage` 为 `{input_tokens, output_tokens:1}` 对象（非 null） |
+| `content_block_start` | `content_block.citations`                              | `text` 类型必须包含 `citations: []`                                                                         |
+| `content_block_delta` | `delta.type`, `delta.text`                             | `text_delta` / `thinking_delta` 区分                                                                    |
+| `content_block_stop`  | `index`                                                | —                                                                                                     |
+| `message_delta`       | `delta.stop_reason`, `delta.stop_sequence`, `usage`    | `stop_sequence` 必填（`null`）；`usage` 仅含 `output_tokens`（`input_tokens` 已在 `message_start` 给出）           |
+| `message_stop`        | `type`                                                 | `{"type":"message_stop"}`                                                                             |
+| `error`               | `type`, `error.type`, `error.message`                  | 标准 `{"type":"error","error":{"type":"...","message":"..."}}`                                          |
+
+### `NonStreamAsSSE` 响应格式检测
+
+`writeNonStreamAsSSE` 解析上游完整 JSON，按字段检测格式并生成对应的 SSE 事件：
+
+```mermaid
+flowchart TD
+    A[上游非流式 JSON 响应] --> B[解析为 map]
+    B --> C{检测响应格式}
+    C -->|"respMap.content 为数组"| D[Anthropic Messages]
+    C -->|"respMap.choices 为数组"| E[OpenAI ChatCompletion]
+    C -->|"respMap.candidates"| F[Google Gemini]
+    C -->|"respMap.output"| G[OpenAI Responses]
+    D --> D1["message_start → content_block_start →<br/>content_block_delta → content_block_stop →<br/>message_delta + usage → message_stop"]
+    E --> E1["data: chunk 逐行...<br/>data: DONE"]
+    F --> F1["data: chunk 逐行...<br/>裸 JSON，无 DONE"]
+    G --> G1["data: chunk 逐行...<br/>data: DONE"]
+```
+
+| 检测字段                     | 协议                    | 生成的 SSE 事件                                                                                                                         |
+| ------------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `respMap["content"]` 为数组 | Anthropic Messages    | `message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta`(含 usage) → `message_stop` |
+| `respMap["choices"]` 为数组 | OpenAI ChatCompletion | `data: {chunk}...\n\ndata: [DONE]\n\n`                                                                                             |
+| `respMap["candidates"]`  | Gemini                | `data: {chunk}...\n\n`（裸 JSON，无 \[DONE]）                                                                                           |
+| `respMap["output"]`      | OpenAI Responses      | `data: {chunk}...\n\ndata: [DONE]\n\n`                                                                                             |
+
+***
+
+## 翻译路径底层机制
+
+### 8 大协议差异点处理
+
+| # | 差异点           | CC 入口                         | Anthropic 输出                             | Gemini 输出                                   |
+| - | ------------- | ----------------------------- | ---------------------------------------- | ------------------------------------------- |
+| 1 | System prompt | 提取到 `internalReq.System`      | 顶层 `system` 字段                           | `systemInstruction`                         |
+| 2 | Tool 定义       | `tools[].function.parameters` | `tools[].input_schema`                   | `tools[].functionDeclarations[].parameters` |
+| 3 | Tool call     | `tool_calls[]` 独立字段           | `content[]` 混入 `type: "tool_use"`        | `parts[]` 混入 `functionCall`                 |
+| 4 | Tool args     | `arguments` JSON 字符串          | `input` JSON 对象                          | `args` JSON 对象                              |
+| 5 | Tool result   | `role: "tool"`                | `role: "user"` + `tool_use_id`           | `role: "user"` + `functionResponse`         |
+| 6 | Usage         | `prompt_tokens`               | `input_tokens` → 映射回                     | `prompt_token_count` → 映射回                  |
+| 7 | Stop reason   | `stop` / `length`             | `end_turn`→`stop`; `max_tokens`→`length` | 同左                                          |
+| 8 | SSE 流式        | 纯 data 行，无 event              | `type` 字段区分 chunk                        | 标准 SSE                                      |
+
+### InternalMessage 结构
+
+```go
+type InternalMessage struct {
+    Role      MessageRole          `json:"role"`
+    Content   json.RawMessage      `json:"content"`    // 保留原始结构，避免信息丢失
+    ToolCalls []InternalToolCall   `json:"tool_calls,omitempty"`
+    ToolCallID string              `json:"tool_call_id,omitempty"`
+    Name      string               `json:"name,omitempty"`
+}
+```
+
+### 流式翻译详解
+
+翻译路径的流式处理以 **两层转换** 为核心：上游 SSE → 统一内部事件 → 入站协议 SSE。
+
+```mermaid
+flowchart TD
+    A1["Anthropic SSE<br/>event: content_block_delta"] --> IE[InternalStreamEvent]
+    A2["OpenAI SSE<br/>data: choices..."] --> IE
+    A3["Gemini SSE<br/>data: candidates..."] --> IE
+    A4["Responses SSE<br/>event: response.output_delta"] --> IE
+    IE --> B1["Anthropic SSE<br/>event: content_block_delta"]
+    IE --> B2["OpenAI SSE<br/>data: choices..."]
+    IE --> B3["Gemini SSE<br/>data: candidates..."]
+    IE --> B4["Responses SSE<br/>event: response.output_delta"]
+```
+
+> 左侧 4 种上游协议 SSE 经 `providerTranslator.TranslateStreamEvent()` 转为 `InternalStreamEvent`，再经 `ingressTranslator.TranslateStream()` 转回入站协议 SSE 输出。
+
+各协议翻译器的流式转换实现：
+
+| 协议             | TranslateStreamEvent（上游→内部）                                                       | TranslateStream（内部→出站）                                 |
+| -------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Anthropic      | `content_block_delta` / `message_start` / `message_delta` → `InternalStreamEvent` | `InternalStreamEvent` → 完整事件序列：`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop` |
+| ChatCompletion | CC delta chunk → `InternalStreamEvent`                                            | 直接透传 `data: {...}`                                     |
+| Gemini         | Gemini chunk → `InternalStreamEvent`                                              | `InternalStreamEvent` → Gemini SSE                     |
+| Responses      | Responses event → `InternalStreamEvent`                                           | `InternalStreamEvent` → Responses SSE                  |
+
+> **Anthropic 输出路径 SSE 事件生命周期约束**：`TranslateStream` 通过 `blockStarted` 状态标记确保严格遵守 Anthropic 规范的完整事件序列。`message_start` 的 `message.content` 初始化为 `[]`（非 `null`），`content_block_start` 包含 `citations: []`，`content_block_stop` 在 `message_delta` 之前发送，`ctx.Done()` 时也安全关闭。详见 [AGENTS.md](../AGENTS.md) 的 Anthropic SSE 事件生命周期章节。
+
+各协议 SSE 格式差异：
+
+| 协议          | SSE 格式                                                                   |
+| ----------- | ------------------------------------------------------------------------ |
+| CC / OpenAI | 纯 `data: {...}\n\n`，无 event 行，以 `data: [DONE]` 结尾                        |
+| Anthropic   | 每行带 `type` 字段（`message_start` / `content_block_delta` / `message_delta`） |
+| Gemini      | 每行是完整 `StreamChunk` 对象，带 `candidates` 数组                                 |
+| Responses   | 带 named events（`event: response.output_delta` 等）                         |
+
+#### 场景 A：入站流式 → 上游流式 → 出站 SSE（`handleStreamRequest`）
+
+翻译路径的标准流式处理，客户端发流式请求，上游也走流式，实时透出 SSE 事件。
+
+**架构：goroutine + channel 解耦**
+
+`handleStreamRequest` 采用生产者-消费者模式：一个 goroutine 从上游读取 SSE 行并翻译为 `InternalStreamEvent`，主 goroutine 将内部事件转为入站协议 SSE 写入客户端。两者通过 `events` channel 解耦，上游读取阻塞不影响客户端写入。
+
+**关键处理步骤：**
+
+1. **设置 SSE 响应头**：`Content-Type: text/event-stream`，`Cache-Control: no-cache`，`Connection: keep-alive`
+2. **调用上游流式 API**：`p.CallStream(ctx, upstreamReq)` 返回 `io.ReadCloser`，逐行读取（`bufio.Scanner`）
+3. **元数据过滤**：上游响应首行可能包含 `_type: "headers"`（透传响应头）或 `_type: "error"`（上游错误，转为 SSE 错误事件发送给客户端）
+4. **剥离** **`data:`** **前缀**：所有 SSE 数据行必须去掉 `data: `  前缀后才能解析 JSON
+5. **上游 SSE → InternalStreamEvent**：
+   - 有 `providerTranslator`（非 OpenAI 协议）：调用 `TranslateStreamEvent(line)` 将上游协议 SSE 行转为 `InternalStreamEvent`
+   - 无 `providerTranslator`（OpenAI 协议）：手动解析 CC chunk，将 `choices[0].delta` 等内容提取为 `InternalStreamEvent`
+6. **模型别名注入**：`InternalStreamEvent` 中的 `model` 字段替换为客户端假模型名（`aliasModel`），确保客户端始终看到自己发送的模型名
+7. **InternalStreamEvent → 入站协议 SSE**：`ingressTranslator.TranslateStream(ctx, events, fn)` 从 channel 读取 `InternalStreamEvent`，fn 回调将转换后的入站协议 SSE 写入 `http.ResponseWriter`
+
+```mermaid
+flowchart TD
+    A[客户端 SSE 请求] --> B[设置 SSE 响应头<br/>text/event-stream]
+    B --> C[p.CallStream<br/>调用上游流式 API]
+    C --> D[goroutine: 逐行读取上游 SSE]
+    D --> E{过滤元数据}
+    E -->|_type: headers| F[跳过]
+    E -->|_type: error| G[发送 SSE 错误事件]
+    E -->|正常数据| H[剥离 data: 前缀]
+    H --> I{providerTranslator?}
+    I -->|有非 OpenAI| J[TranslateStreamEvent<br/>上游 SSE → InternalStreamEvent]
+    I -->|无-OpenAI| K[手动解析 CC chunk<br/>→ InternalStreamEvent]
+    J --> L[注入 aliasModel<br/>假模型名回显]
+    K --> L
+    L --> M[events channel]
+    M --> N[ingressTranslator.TranslateStream<br/>InternalStreamEvent → 入站协议 SSE]
+    N --> O[写入客户端]
+```
+
+#### 场景 B：入站非流式 → 上游流式 → 出站 JSON（`handleStreamRequestAsNonStream`）
+
+当 `--stream-mode stream` 强制上游走流式，但客户端发的是非流式请求时，收集所有流式事件后组装为非流式 JSON 返回。
+
+**关键处理步骤：**
+
+1. **先写响应头**：`WriteHeader(200)` + `Flush()` 启用 chunked transfer，防止上游响应慢时客户端超时
+2. **调用上游流式 API**：`p.CallStream()` 获取 SSE 流
+3. **逐行收集 SSE 事件**：与场景 A 相同，经过元数据过滤 → 剥离 `data:` 前缀 → `TranslateStreamEvent` → 模型别名注入
+4. **累积模式**（与场景 A 的核心区别）：不实时输出 SSE，而是收集所有 `InternalStreamEvent`：
+   - 文本内容累积到 `contentBuilder`（`strings.Builder`）
+   - 推理内容累积到 `reasoningBuilder`
+   - 最后一个有效的 `finish_reason` 覆盖记录
+   - `usage` 从最后一个含 `usage` 的事件中提取
+5. **组装 InternalResponse**：将累积内容、finish\_reason、usage 组装为完整的 `InternalResponse`
+6. **翻译为入站协议 JSON**：`ingressTranslator.TranslateResponse(ctx, internalResp)` → 入站协议完整 JSON
+7. **写入客户端**：`json.NewEncoder(w).Encode(resp)`
+
+```mermaid
+flowchart TD
+    A[客户端非流式请求] --> B[先写响应头 + Flush<br/>chunked transfer 防超时]
+    B --> C[p.CallStream<br/>调用上游流式 API]
+    C --> D[逐行收集 SSE 事件]
+    D --> E[累积 content + reasoning<br/>记录 finish_reason + usage]
+    E --> F[组装 InternalResponse]
+    F --> G[ingressTranslator.TranslateResponse<br/>→ 入站协议 JSON]
+    G --> H[写入客户端]
+```
+
+元数据事件（`_type: "headers"`）被解析后用于透传响应头。
+
+#### 场景 C：入站非流式 → 上游非流式 → 出站 JSON（`handleNonStreamResponse`）
+
+翻译路径的标准非流式处理，客户端发非流式请求，上游也走非流式，返回完整 JSON。
+
+**关键处理步骤：**
+
+1. **翻译请求**：`ingressTranslator.TranslateRequest()` → `InternalRequest` → `providerTranslator.TranslateToProvider()` → 下游请求体
+2. **调用上游非流式 API**：`p.Call()` 返回完整 JSON 响应
+3. **翻译响应**：`providerTranslator.TranslateFromProvider()` → `InternalResponse` → `ingressTranslator.TranslateResponse()` → 入站协议 JSON
+4. **模型别名回显**：响应中的 `model` 字段替换为客户端假模型名
+
+```mermaid
+flowchart TD
+    A[客户端非流式请求] --> B[ingressTranslator.TranslateRequest<br/>入站协议 → InternalRequest]
+    B --> C[providerTranslator.TranslateToProvider<br/>InternalRequest → 下游请求体]
+    C --> D[p.Call<br/>调用上游非流式 API]
+    D --> E[providerTranslator.TranslateFromProvider<br/>上游响应 → InternalResponse]
+    E --> F[注入 aliasModel<br/>假模型名回显]
+    F --> G[ingressTranslator.TranslateResponse<br/>InternalResponse → 入站协议 JSON]
+    G --> H[写入客户端]
+```
+
+#### 场景 D：入站流式 → 上游非流式 → 出站 SSE（`handleNonStreamResponseAsSSE`）
+
+当 `--stream-mode non-stream` 强制上游走非流式，但客户端发的是流式请求时，将上游完整 JSON 拆解为 SSE 事件流返回。
+
+```mermaid
+flowchart TD
+    A[客户端 SSE 请求] --> B[设置 SSE 响应头<br/>text/event-stream]
+    B --> C[ingressTranslator.TranslateRequest<br/>入站协议 → InternalRequest]
+    C --> D[providerTranslator.TranslateToProvider<br/>InternalRequest → 下游请求体]
+    D --> E[p.Call<br/>调用上游非流式 API]
+    E --> F[providerTranslator.TranslateFromProvider<br/>上游响应 → InternalResponse]
+    F --> G[ingressTranslator.TranslateResponse<br/>InternalResponse → 入站协议 JSON]
+    G --> H[writeNonStreamAsSSE<br/>入站协议 JSON → 入站协议 SSE 事件流]
+    H --> I[写入客户端]
+```
+
+> 与透传路径的 `handlePassthroughNonStreamAsSSE` 不同：翻译路径多了一步 TranslateResponse（将上游协议 JSON 转为入站协议 JSON），再拆解为 SSE。透传路径直接拆解原始 JSON。
+
+### 协议感知路由
+
+```mermaid
+flowchart TD
+    A[入站协议] --> B{匹配 capabilities?}
+    B -->|命中| C[透传<br/>零开销]
+    B -->|未命中| D[经 Schema 翻译到上游]
+```
+
+***
+
+## 消息转换流转图
+
+9 张图覆盖入站/上游协议 × 流式/非流式的全部组合，展示从客户端请求到上游调用再到响应的完整消息转换路径。
+
+### 全览
+
+![全览](overview_all_scenarios.svg)
+
+### 场景 1：Anthropic 流式 → OpenAI 流式
+
+**翻译路径** — `TranslateRequest(Anthropic) → InternalRequest → TranslateToProvider(OpenAI)`，stream 保留。
+
+![场景1](scenario_01_anthropic_stream_openai_stream.svg)
+
+### 场景 2：Anthropic 非流式 → OpenAI 非流式
+
+**翻译路径** — `TranslateRequest → TranslateToProvider`，stream 保留。
+
+![场景2](scenario_02_anthropic_nonstream_openai_nonstream.svg)
+
+### 场景 3：Anthropic 流式 → OpenAI 非流式
+
+**翻译 +** **`--stream-mode non-stream`** — 入站 SSE → 收集 → TranslateFromProvider → TranslateResponse → 非流式 JSON。
+
+![场景3](scenario_03_anthropic_stream_openai_nonstream.svg)
+
+### 场景 4：Anthropic 非流式 → OpenAI 流式
+
+**翻译 +** **`--stream-mode stream`** — 入站非流式 → TranslateToProvider(stream:true) → SSE 收集 → TranslateStream → 非流式 JSON。
+
+![场景4](scenario_04_anthropic_nonstream_openai_stream.svg)
+
+### 场景 5：Anthropic 非流式 → Anthropic 流式
+
+**透传 +** **`--stream-mode stream`** — 入站非流式 JSON → 注入 `stream:true` → 上游 SSE → 客户端 SSE。
+
+![场景5](scenario_05_anthropic_nonstream_anthropic_stream.svg)
+
+### 场景 6：Anthropic 流式 → Anthropic 非流式
+
+**透传 +** **`--stream-mode non-stream`** — 入站 SSE → 上游非流式 JSON → `writeNonStreamAsSSE` SSE 包装。
+
+![场景6](scenario_06_anthropic_stream_anthropic_nonstream.svg)
+
+### 场景 7：OpenAI 流式 → OpenAI 非流式
+
+**透传 +** **`--stream-mode non-stream`** — 入站 SSE → 上游非流式 JSON → SSE 包装。
+
+![场景7](scenario_07_openai_stream_openai_nonstream.svg)
+
+### 场景 8：Responses 非流式 → OpenAI 流式
+
+**翻译 +** **`--stream-mode stream`** — `ResponsesTranslator` → `InternalRequest` → `ChatCompletionTranslator` SSE 收集 → JSON。
+
+![场景8](scenario_08_responses_nonstream_openai_stream.svg)
+
+### 场景 9：Responses 流式 → OpenAI 非流式
+
+**翻译 +** **`--stream-mode non-stream`** — `ResponsesTranslator` SSE → `InternalStreamEvent` → `ChatCompletionTranslator` 非流式 → SSE 包装。
+
+![场景9](scenario_09_responses_stream_openai_nonstream.svg)
+
+***
+
+## Claude Code 特殊处理
+
+Claude Code 使用 fable 原生模型时，agent-proxy 的完整请求处理流程见 [claude\_code\_flow.svg](claude_code_flow.svg)，包含三个阶段：
+
+1. **验证请求**（启动 / `/model` 切换）— 不带 `stream` 字段，走 `handlePassthroughNonStreamAsSSE`（上游非流式 + SSE 包装 + 心跳）
+2. **首次对话请求**（`stream:true`，未探测）— 仍走非流式上游 + SSE 包装，同时后台 `probeStreamPrefer` 异步探测 SSE 速度
+3. **后续对话请求**（已探测）— 按 `streamPrefer[baseURL]` 分流：非流式更快走 `NonStreamAsSSE`，SSE 更快走 `handlePassthroughStream`
+
+### 关键设计决策
+
+| 问题                       | 决策                         | 原因                                                 |
+| ------------------------ | -------------------------- | -------------------------------------------------- |
+| 验证请求不带 `stream` 字段       | 走 `NonStreamAsSSE`（SSE 包装） | Claude Code 的 SSE 解析器期望流式事件，`stream:false` 才走 JSON |
+| 心跳格式                     | `data: {}`（不是 `: ping`）    | Claude Code 只统计 `data:` 行重置超时；`{}` 兼容 Kimi 等严格客户端  |
+| 首次流式请求                   | 仍走非流式上游                    | 用于探测基准，避免首次就 SSE 导致 ECONNRESET                     |
+| `streamPrefer` 按 baseURL | 独立存储                       | 多上游互不干扰                                            |
+
+***
+
+## 扩展开发
+
+### 新增协议
+
+1. **定义类型**（`internal/protocol/mymodule/types.go`）：
+
+```go
+type MyRequest struct {
+    Messages []Message `json:"messages"`
+    Model    string    `json:"model"`
+}
+```
+
+1. **实现翻译器**（`internal/protocol/mymodule/translator.go`），需实现 `CombinedTranslator` 接口：
+
+```go
+type MyTranslator struct{}
+
+func (t *MyTranslator) TranslateRequest(ctx context.Context, raw json.RawMessage) (*schema.InternalRequest, error) {}
+func (t *MyTranslator) TranslateToProvider(req *schema.InternalRequest) (json.RawMessage, error) {}
+func (t *MyTranslator) TranslateFromProvider(raw json.RawMessage) (*schema.InternalResponse, error) {}
+func (t *MyTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {}
+func (t *MyTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func([]byte, bool)) {}
+func (t *MyTranslator) TranslateError(err *schema.StreamError) json.RawMessage {}
+```
+
+1. **注册 Provider 客户端**（`internal/provider/mymodule.go`）：
+
+```go
+type MyClient struct { baseURL string; timeout int }
+
+func (c *MyClient) Call(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (
+    json.RawMessage, map[string][]string, error) { ... }
+
+func (c *MyClient) CallStream(ctx context.Context, body json.RawMessage, info *schema.ProviderInfo) (
+    <-chan json.RawMessage, map[string][]string, error) { ... }
+```
+
+1. **在** **`gateway.go`** **中注册路由**。
+
+### 新增假模型名
+
+在 `internal/db/aliasfile.go` 的 `DefaultAliases()` 函数的 `names` 切片追加名字即可。
+
+***
+
+## 关键源码文件索引
+
+| 文件                                               | 职责                                                     |
+| ------------------------------------------------ | ------------------------------------------------------ |
+| `main.go`                                        | CLI 入口、启动模式分发                                          |
+| `internal/server/quick.go`                       | 快速模式核心：路由决策、透传路径、SSE 包装、心跳、自适应探测                       |
+| `internal/provider/openai.go`                    | Provider 客户端：OpenAI/Anthropic/Gemini/Responses HTTP 调用 |
+| `internal/protocol/anthropic/translator.go`      | Anthropic 翻译器：入站/出站翻译 + 流式事件转换                         |
+| `internal/protocol/chatcompletion/translator.go` | ChatCompletion 翻译器                                     |
+| `internal/protocol/gemini/translator.go`         | Gemini 翻译器                                             |
+| `internal/protocol/responses/translator.go`      | Responses 翻译器                                          |
+| `internal/db/aliasfile.go`                       | 别名映射：三层加载、自映射、DefaultAliases                           |
+| `internal/translator/registry.go`                | 翻译器注册表                                                 |
+| `internal/config/config.go`                      | 复杂模式配置                                                 |
+
