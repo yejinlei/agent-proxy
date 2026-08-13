@@ -763,6 +763,24 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	callDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write([]byte("data: {}\n\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
@@ -772,6 +790,8 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	}
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
+	close(callDone) // 停止 CallStream 期间的心跳
+
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]interface{}{
 			"_type":   "error",
@@ -817,14 +837,20 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 					flusher.Flush()
 					return
 				} else {
-					// 过滤 thinking 内容块：Claude Code 客户端不支持 thinking 类型
+					// 过滤非标准 thinking 内容块：SenseNova 的 DeepSeek 模型返回
+					// 缺少 signature 字段的非标准 thinking 块，Claude Code 无法解析。
+					// 标准 Anthropic thinking 块（含 signature）会被保留。
 					eventType, _ := meta["type"].(string)
 					switch eventType {
 					case "content_block_start":
 						if cb, ok := meta["content_block"].(map[string]any); ok {
 							if ct, _ := cb["type"].(string); ct == "thinking" {
-								inThinkingBlock = true
-								continue
+								if _, hasSig := cb["signature"]; hasSig {
+									// 标准 thinking 块，保留
+								} else {
+									inThinkingBlock = true
+									continue
+								}
 							}
 						}
 					case "content_block_delta":
@@ -983,6 +1009,24 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	callDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write([]byte("data: {}\n\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
@@ -999,6 +1043,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		w.Write(errJSON)
 		w.Write([]byte("\n\n"))
 		flusher.Flush()
+		close(callDone)
 		return
 	}
 	// 命中别名映射时，同步改写请求体中的 model 字段
@@ -1007,6 +1052,8 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	}
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
+	close(callDone) // 停止 CallStream 期间的心跳
+
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v",
@@ -1719,10 +1766,30 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	callDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w.Write([]byte("data: {}\n\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
 
 	lines, _, err := p.CallStream(callCtx, downstreamReq, q.info)
+	close(callDone) // 停止 CallStream 期间的心跳
+
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[stream] upstream stream error: %s err=%v", q.proxyBaseURL, err)
@@ -2436,8 +2503,29 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	// 防止 Claude Code 等客户端在 cogitation 期间（15-25s）因无 SSE 数据而超时断开
+	callDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write([]byte("data: {}\n\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
+	close(callDone) // 停止 CallStream 期间的心跳
+
 	if err != nil {
 		log.Printf("[passthrough] upstream stream error: %s url=%s body_len=%d err=%v",
 			aliasModel, q.proxyBaseURL, len(body), err)
