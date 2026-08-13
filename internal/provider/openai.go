@@ -466,7 +466,7 @@ func (c *AnthropicClient) CallStream(ctx context.Context, req json.RawMessage, i
 					continue
 				}
 				trimmed := strings.TrimSpace(string(line))
-				if trimmed == "" {
+				if trimmed == "" || trimmed == "data: [DONE]" || strings.HasPrefix(trimmed, ":") {
 					continue
 				}
 				linesCh <- json.RawMessage(trimmed)
@@ -634,7 +634,7 @@ func (c *GeminiClient) CallStream(ctx context.Context, req json.RawMessage, info
 					continue
 				}
 				trimmed := strings.TrimSpace(string(line))
-				if trimmed == "" {
+				if trimmed == "" || trimmed == "data: [DONE]" || strings.HasPrefix(trimmed, ":") {
 					continue
 				}
 				// Gemini 流式每行是 data: {...} 格式

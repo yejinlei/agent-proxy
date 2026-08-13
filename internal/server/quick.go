@@ -53,12 +53,12 @@ type QuickGateway struct {
 	streamMode string
 }
 
-// 心跳格式：data: \n\n（空 data 行）
-// 不用 event: ping —— Claude Code 的 SSE 解析器会忽略 ping 事件，
-// 只统计 data: 行作为"内容活动"来重置其超时计时器。
-// data: \n\n 确保 HTTP 层有数据流动（保持连接活跃），
-// 同时 SSE 解析器能识别为 data 事件但内容为空（不影响下游解析）。
-var heartbeatEvent = []byte("data: \n\n")
+// 心跳格式：data: {}（空 JSON 对象 + data: 前缀）
+// 保留 data: 行 —— Claude Code 的 SSE 解析器依赖 data: 行来重置超时计时器。
+// 使用 {} 替代空字符串 —— 避免严格客户端（Kimi/Anthropic SDK）对空 data 行做
+// JSON.parse("") 报 Unexpected end of JSON input。
+// HTTP 层有字节流动保持连接活跃，JSON 解析器视 {} 为空对象无副作用。
+var heartbeatEvent = []byte("data: {}\n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
@@ -403,9 +403,9 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 				return
 			case "stream":
-				// 无 stream 字段的请求（如 /model 验证）期望 raw JSON，走 handlePassthroughNonStream
-				// 有 stream 字段的正常对话请求仍走 SSE 流
-				if quickStreamFieldAbsent(body) {
+				// Claude Code（Anthropic Messages）不带 stream 字段，仍期望 SSE → 注入 stream 走 SSE
+				// 只有显式 stream:false 才期望 raw JSON
+				if quickStreamExplicitFalse(body) {
 					q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 				} else {
 					bodyStream := body
@@ -442,9 +442,12 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 			} else {
 				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 			}
-			// 无 stream 字段或 stream:false → 返回 raw JSON
-		} else {
+			// 无 stream 字段（Claude Code）→ 期望 SSE，包装为非流式上游响应转 SSE
+			// 显式 stream:false → 期望 raw JSON
+		} else if quickStreamExplicitFalse(body) {
 			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+		} else {
+			q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 		}
 		return
 	}
@@ -719,17 +722,20 @@ func quickInjectStreamFlag(body json.RawMessage) json.RawMessage {
 	return body
 }
 
-// quickStreamFieldAbsent 检测请求体中是否缺失 stream 字段（非 false）
-// Claude Code 的 Anthropic Messages 请求不带 stream 字段，但客户端仍期望 SSE；
-// OpenAI 客户端显式发送 stream:false 时，期望 raw JSON 非流式响应。
-// 此函数区分两者：field 不存在返回 true，field 存在（无论 true/false）返回 false。
-func quickStreamFieldAbsent(body json.RawMessage) bool {
+// quickStreamExplicitFalse 检测请求体是否显式设置了 stream:false
+// Claude Code 的 Anthropic Messages 请求不带 stream 字段，仍期望 SSE。
+// 只有显式 false 才表示客户端期望 raw JSON；缺失或 true 都表示期望 SSE。
+func quickStreamExplicitFalse(body json.RawMessage) bool {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return false
 	}
-	_, exists := m["stream"]
-	return !exists
+	v, exists := m["stream"]
+	if !exists {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && !b
 }
 
 // handlePassthroughStreamWithBody 与 handlePassthroughStream 一致，但 body 已在调用方读取
@@ -830,6 +836,17 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 					if aliasHit && aliasModel != "" {
 						writeLine = echoAliasInStreamLine(line, aliasModel)
 					}
+					// 按 SSE 标准统一添加 data: 前缀
+					writeLineStr := string(writeLine)
+					if !strings.HasPrefix(writeLineStr, "data: ") &&
+						!strings.HasPrefix(writeLineStr, "event: ") &&
+						!strings.HasPrefix(writeLineStr, "id: ") &&
+						!strings.HasPrefix(writeLineStr, "retry: ") &&
+						len(writeLineStr) > 0 && writeLineStr[0] != ':' {
+						if writeLineStr[0] == '{' || writeLineStr[0] == '[' {
+							writeLine = append([]byte("data: "), writeLine...)
+						}
+					}
 					if !writeSSE(w, writeLine) {
 						return
 					}
@@ -893,20 +910,17 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		}
 	}
 
-	// 先写响应头并 flush，防止客户端在等待上游响应时超时断开 (ECONNRESET)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
 	resp, headers, err := p.Call(callCtx, body, callInfo)
 	if err != nil {
 		log.Printf("[passthrough] upstream error: %s=%s url=%s body_len=%d err=%v",
 			aliasModel, realModel, q.proxyBaseURL, len(body), err)
-		// 状态码已写，写错误 body 并关闭连接
-		errBody := fmt.Sprintf(`{"error":{"message":"upstream error: %s","type":"provider_error"}}`, err.Error())
-		w.Write([]byte(errBody))
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			return
+		}
+		q.sendError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
 	}
 
@@ -1034,10 +1048,17 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					errData, _ := meta["data"].(string)
 					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
 						aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
-					// SSE 流已开始后不能再修改 HTTP 状态码，直接写入错误数据
-					if errData != "" {
-						w.Write([]byte(errData))
-					}
+					// SSE 流已开始后不能再修改 HTTP 状态码，写入标准 SSE 错误事件
+					errJSON, _ := json.Marshal(map[string]interface{}{
+						"type": "error",
+						"error": map[string]interface{}{
+							"type":    "upstream_error",
+							"message": errData,
+						},
+					})
+					w.Write([]byte("event: error\ndata: "))
+					w.Write(errJSON)
+					w.Write([]byte("\n\n"))
 					return
 				}
 			}
@@ -1049,6 +1070,18 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			writeLine := line
 			if aliasHit && aliasModel != "" {
 				writeLine = echoAliasInStreamLine(line, aliasModel)
+			}
+			// 按 SSE 标准统一添加 data: 前缀（Provider 输出格式不一致：
+			// OpenAIClient 输出纯 JSON，AnthropicClient 输出带 data: 前缀）
+			writeLineStr := string(writeLine)
+			if !strings.HasPrefix(writeLineStr, "data: ") &&
+				!strings.HasPrefix(writeLineStr, "event: ") &&
+				!strings.HasPrefix(writeLineStr, "id: ") &&
+				!strings.HasPrefix(writeLineStr, "retry: ") &&
+				len(writeLineStr) > 0 && writeLineStr[0] != ':' {
+				if writeLineStr[0] == '{' || writeLineStr[0] == '[' {
+					writeLine = append([]byte("data: "), writeLine...)
+				}
 			}
 			if _, err := w.Write(writeLine); err != nil {
 				log.Printf("[passthrough] stream write error: %s=%s url=%s err=%v",
@@ -1143,9 +1176,17 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 			if sr, ok := respMap["stop_reason"].(string); ok && sr != "" {
 				stopReason = sr
 			}
+			// 按 Anthropic 标准构造 message_start 事件：
+			// - type: "message" 必填
+			// - stop_reason: null（流式开始时为 null，结束时在 message_delta 给出）
+			// - usage: {input_tokens, output_tokens:1}（必须是对象，不能为 null）
+			inputTokens := 0
+			if usage != nil {
+				inputTokens = usage.PromptTokens
+			}
 			messageStart := fmt.Sprintf(
-				`{"type":"message_start","message":{"id":"%s","role":"assistant","content":[],"model":"%s","stop_reason":"%s","stop_sequence":null,"usage":null}}`,
-				msgID, effectiveModel, stopReason)
+				`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":%d,"output_tokens":1}}}`,
+				msgID, effectiveModel, inputTokens)
 			if !writeSSE(w, []byte("data: "+messageStart+"\n\n")) {
 				return usage
 			}
@@ -1160,10 +1201,11 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 					blockType = bt
 				}
 
-				// content_block_start
+				// content_block_start（按 Anthropic 标准补 citations:[]）
 				blockStartMap := map[string]interface{}{"type": blockType}
 				if blockType == "text" {
 					blockStartMap["text"] = ""
+					blockStartMap["citations"] = []interface{}{}
 				}
 				blockStart := map[string]interface{}{
 					"type":          "content_block_start",
@@ -1231,11 +1273,12 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 				}
 			}
 
-			// message_delta with stop_reason and usage
+			// message_delta: 按 Anthropic 标准，usage 仅含 output_tokens（input_tokens 已在 message_start 给出）
+			// delta 必须包含 stop_sequence:null
 			if usage != nil {
 				messageDelta := fmt.Sprintf(
-					`{"type":"message_delta","delta":{"stop_reason":"%s"},"usage":{"input_tokens":%d,"output_tokens":%d}}`,
-					stopReason, usage.PromptTokens, usage.CompletionTokens)
+					`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`,
+					stopReason, usage.CompletionTokens)
 				if !writeSSE(w, []byte("data: "+messageDelta+"\n\n")) {
 					return usage
 				}
@@ -1421,9 +1464,11 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		log.Printf("[passthrough] nonstream-as-sse error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
 		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 502,
-			"data":    fmt.Sprintf("upstream error: %v", err),
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "upstream_error",
+				"message": fmt.Sprintf("upstream error: %v", err),
+			},
 		})
 		w.Write([]byte("event: error\ndata: "))
 		w.Write(errJSON)
@@ -1835,7 +1880,14 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 		return
 	}
 
-	// 收集所有流式事件，累积文本内容
+	// 先写响应头并 flush，防止长响应收集期间客户端读超时（ECONNRESET）
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// 收集所有流式事件，累积文本与推理内容
 	var accumulatedContent strings.Builder
 	var accumulatedReasoning strings.Builder
 	var lastModel string
@@ -1848,6 +1900,11 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 	}
 
 	for line := range lines {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		var meta map[string]any
 		if json.Unmarshal(line, &meta) == nil {
 			if meta["_type"] == "headers" {
@@ -1873,9 +1930,12 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 		}
 
 		if providerTranslator != nil {
-			pte := providerTranslator.(interface {
+			pte, ok := providerTranslator.(interface {
 				TranslateStreamEvent(json.RawMessage) *schema.InternalStreamEvent
 			})
+			if !ok {
+				continue
+			}
 			event := pte.TranslateStreamEvent(json.RawMessage(payload))
 			if event != nil && event.Data != nil {
 				if event.Data.Usage != nil {
@@ -1923,6 +1983,7 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 	}
 
 	contentJSON, _ := json.Marshal(accumulatedContent.String())
+	reasoning := accumulatedReasoning.String()
 	internalResp := &schema.InternalResponse{
 		ID:    fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
 		Model: modelName,
@@ -1931,6 +1992,12 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 			Message: schema.InternalMessage{
 				Role:    schema.RoleAssistant,
 				Content: contentJSON,
+				ContentBlocks: func() []schema.InternalContentBlock {
+					if reasoning != "" {
+						return []schema.InternalContentBlock{{Type: "thinking", Thinking: reasoning}}
+					}
+					return nil
+				}(),
 			},
 			FinishReason: lastFinishReason,
 		}},
@@ -2427,6 +2494,18 @@ streamLoop:
 			writeLine := line
 			if aliasHit && aliasModel != "" {
 				writeLine = echoAliasInStreamLine(line, aliasModel)
+			}
+
+			// 按 SSE 标准统一添加 data: 前缀
+			writeLineStr := string(writeLine)
+			if !strings.HasPrefix(writeLineStr, "data: ") &&
+				!strings.HasPrefix(writeLineStr, "event: ") &&
+				!strings.HasPrefix(writeLineStr, "id: ") &&
+				!strings.HasPrefix(writeLineStr, "retry: ") &&
+				len(writeLineStr) > 0 && writeLineStr[0] != ':' {
+				if writeLineStr[0] == '{' || writeLineStr[0] == '[' {
+					writeLine = append([]byte("data: "), writeLine...)
+				}
 			}
 
 			if !writeSSE(w, writeLine) {
