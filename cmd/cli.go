@@ -448,6 +448,10 @@ func sniffAll(url, key string) *SniffResult {
 					result.ModelsMap["anthropic"] = nil
 				}
 				result.Capabilities = append(result.Capabilities, "anthropic")
+				// 如果 Anthropic 没有提取到模型名，复用 OpenAI 的模型列表
+				if len(result.ModelsMap["anthropic"]) == 0 && len(result.ModelsMap["openai"]) > 0 {
+					result.ModelsMap["anthropic"] = result.ModelsMap["openai"]
+				}
 			}
 		}
 	}
