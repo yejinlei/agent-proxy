@@ -760,6 +760,8 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
@@ -978,6 +980,8 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
@@ -1712,6 +1716,8 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
@@ -2427,6 +2433,8 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
