@@ -330,6 +330,11 @@ func NewAnthropicClient(name, baseURL, apiKey, version string, timeout int) *Ant
 		baseURL: strings.TrimRight(baseURL, "/"),
 		client: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     300 * time.Second,
+			},
 		},
 		apiKey:     apiKey,
 		apiVersion: version,
@@ -490,6 +495,11 @@ func NewGeminiClient(name, baseURL string, timeout int) *GeminiClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		client: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     300 * time.Second,
+			},
 		},
 	}
 }
