@@ -174,7 +174,7 @@ type InternalToolCall struct {
 // @CONSTRAINT: 字段增删/语义变更必须同步所有协议翻译器的 TranslateRequest + TranslateToProvider
 //   - Model: 上游真实模型名，响应时替换回别名
 //   - Messages: 不含 system 消息（已提取到 SystemPrompt）
-//   - Stream: 原始 stream 标记，后续被 --stream-mode 覆写
+//   - Stream: 原始 stream 标记，控制流/非流路由决策
 //   - AliasModel: 客户端原始模型名，用于响应回显
 //
 // @RELATED: all protocol/translator.go TranslateRequest, quick.go/gateway.go translateToProvider
