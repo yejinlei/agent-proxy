@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // buildRequestHelper creates a POST request with JSON body
@@ -385,4 +387,136 @@ func setupMockGateway(t *testing.T) *mockGateway {
 		mockServer: mockServer,
 		router:     router,
 	}
+}
+
+// TestTimingLogsSlowUpstream 测试慢速上游的耗时统计日志
+// 验证 -vv 模式下 [request]/[handler]/[upstream] 三类耗时日志在慢速上游场景下正确输出
+func TestTimingLogsSlowUpstream(t *testing.T) {
+	// 捕获日志输出
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(io.Discard)
+
+	// 模拟慢速上游（2 秒延迟）的 mock server
+	nonStreamResp := `{
+		"id":"chatcmpl-mock",
+		"object":"chat.completion",
+		"created":1700000000,
+		"model":"gpt-4o-mini",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"Hello Slow World"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+	}`
+
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		var req map[string]any
+		if json.Unmarshal(body, &req) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		stream, _ := req["stream"].(bool)
+
+		// 模拟 2 秒慢速上游
+		time.Sleep(2 * time.Second)
+
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			// 流式响应：每 500ms 发一个 chunk，模拟慢速流式
+			chunks := []string{
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"Slow"},"finish_reason":null}]}`,
+				`data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+				`data: [DONE]`,
+			}
+			for _, chunk := range chunks {
+				w.Write([]byte(chunk + "\n\n"))
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(nonStreamResp))
+		}
+	}))
+	defer slowServer.Close()
+
+	// 用 verboseLevel=2 创建 QuickGateway
+	qg := NewQuickGateway(
+		"mock-proxy",
+		slowServer.URL,
+		"mock-key",
+		[]string{"openai"},
+		nil,
+		30,
+		"", false, 2,
+	)
+	router := qg.Routes()
+
+	t.Run("non_stream_slow", func(t *testing.T) {
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"stream": false,
+		}
+		req := buildRequest("/v1/chat/completions", body)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		logs := logBuf.String()
+		// 验证三类耗时日志都存在
+		if !strings.Contains(logs, "[request] total") {
+			t.Error("missing [request] total timing log")
+		}
+		if !strings.Contains(logs, "[handler]") {
+			t.Error("missing [handler] timing log")
+		}
+		if !strings.Contains(logs, "[upstream] Call") {
+			t.Error("missing [upstream] timing log")
+		}
+		t.Logf("Slow non-stream logs:\n%s", logs)
+	})
+
+	t.Run("stream_slow", func(t *testing.T) {
+		logBuf.Reset()
+
+		body := map[string]any{
+			"model": "gpt-4o-mini",
+			"messages": []map[string]string{
+				{"role": "user", "content": "hi"},
+			},
+			"stream": true,
+		}
+		req := buildRequest("/v1/chat/completions", body)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "[request] total") {
+			t.Error("missing [request] total timing log")
+		}
+		if !strings.Contains(logs, "[handler]") {
+			t.Error("missing [handler] timing log")
+		}
+		// auto-probe 首次请求走 passthrough-nonstream-as-sse，使用 Call 而非 CallStream
+		if !strings.Contains(logs, "[upstream] Call") {
+			t.Error("missing [upstream] timing log")
+		}
+		t.Logf("Slow stream (auto-probe) logs:\n%s", logs)
+	})
 }
