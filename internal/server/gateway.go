@@ -2,9 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -434,6 +438,10 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 // handleResponses 入口：OpenAI Responses 协议
 func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		g.handleResponsesWebSocket(w, r)
+		return
+	}
 	g.handleRequest(w, r, "responses")
 }
 
@@ -940,10 +948,12 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 			mapping[alias] = target
 			if !existing[alias] {
 				models = append(models, map[string]interface{}{
-					"id":      alias,
-					"object":  "model",
-					"owner":   "proxy-alias",
-					"aliased": true,
+					"id":       alias,
+					"object":   "model",
+					"created":  time.Now().Unix(),
+					"owned_by": "proxy-alias",
+					"owner":    "proxy-alias",
+					"aliased":  true,
 				})
 			}
 		}
@@ -971,4 +981,186 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  WebSocket 支持 — OpenAI Codex 通过 WebSocket 连接 /v1/responses
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const (
+	wsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	wsOpText  byte = 0x1 // text frame
+	wsOpClose byte = 0x8 // close frame
+	wsFin          = 0x80
+	wsMask         = 0x80
+)
+
+// computeAcceptKey 计算 WebSocket Sec-WebSocket-Accept 值
+func computeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// readWSFrame 从连接读取一个 WebSocket 帧，返回 payload 数据
+func readWSFrame(conn net.Conn) ([]byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, err
+	}
+
+	masked := header[1]&wsMask != 0
+	length := uint64(header[1] & 0x7F)
+
+	switch {
+	case length == 126:
+		ext := make([]byte, 2)
+		if _, err := io.ReadFull(conn, ext); err != nil {
+			return nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext))
+	case length == 127:
+		ext := make([]byte, 8)
+		if _, err := io.ReadFull(conn, ext); err != nil {
+			return nil, err
+		}
+		length = binary.BigEndian.Uint64(ext)
+	}
+
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+			return nil, err
+		}
+	}
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return nil, err
+	}
+
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	return payload, nil
+}
+
+// writeWSFrame 向连接写入一个 WebSocket 文本帧
+func writeWSFrame(conn net.Conn, payload []byte) error {
+	length := len(payload)
+
+	var frame []byte
+	switch {
+	case length < 126:
+		frame = make([]byte, 2+length)
+		frame[0] = wsFin | wsOpText
+		frame[1] = byte(length)
+		copy(frame[2:], payload)
+	case length < 65536:
+		frame = make([]byte, 4+length)
+		frame[0] = wsFin | wsOpText
+		frame[1] = 126
+		binary.BigEndian.PutUint16(frame[2:4], uint16(length))
+		copy(frame[4:], payload)
+	default:
+		frame = make([]byte, 10+length)
+		frame[0] = wsFin | wsOpText
+		frame[1] = 127
+		binary.BigEndian.PutUint64(frame[2:10], uint64(length))
+		copy(frame[10:], payload)
+	}
+
+	_, err := conn.Write(frame)
+	return err
+}
+
+// wsResponseWriter 实现 http.ResponseWriter + http.Flusher，将 HTTP 响应写入 WebSocket 帧
+type wsResponseWriter struct {
+	conn        net.Conn
+	header      http.Header
+	wroteHeader bool
+}
+
+func (w *wsResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *wsResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if err := writeWSFrame(w.conn, b); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (w *wsResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+}
+
+// Flush implements http.Flusher. WebSocket 帧已是原子单位，无需额外缓冲。
+func (w *wsResponseWriter) Flush() {}
+
+// handleResponsesWebSocket 处理 OpenAI Codex 的 WebSocket 升级请求
+// 将 WebSocket 协议转换为内部 HTTP 处理，再通过 WebSocket 帧返回响应
+func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "WebSocket not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// WebSocket 握手
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return
+	}
+	acceptKey := computeAcceptKey(key)
+
+	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	bufrw.WriteString("Upgrade: websocket\r\n")
+	bufrw.WriteString("Connection: Upgrade\r\n")
+	bufrw.WriteString("Sec-WebSocket-Accept: " + acceptKey + "\r\n")
+	bufrw.WriteString("\r\n")
+	if err := bufrw.Flush(); err != nil {
+		return
+	}
+
+	// 读取第一个 WebSocket 帧（JSON 请求体）
+	payload, err := readWSFrame(conn)
+	if err != nil {
+		return
+	}
+
+	// 构造内部 HTTP 请求，复用 handleRequest 处理逻辑
+	wsReq, err := http.NewRequestWithContext(r.Context(), "POST", r.URL.String(), io.NopCloser(strings.NewReader(string(payload))))
+	if err != nil {
+		return
+	}
+	wsReq.Header = r.Header.Clone()
+	wsReq.Header.Del("Upgrade")
+	wsReq.Header.Del("Connection")
+	wsReq.Header.Del("Sec-WebSocket-Key")
+	wsReq.Header.Del("Sec-WebSocket-Version")
+
+	wsWriter := &wsResponseWriter{conn: conn}
+	g.handleRequest(wsWriter, wsReq, "responses")
 }
