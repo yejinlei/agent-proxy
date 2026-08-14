@@ -66,7 +66,7 @@ flowchart TD
 
     subgraph L2B["透传：流/非流决策"]
         direction LR
-        C1["--stream-mode 控制路由"] --> C2["stream / non-stream / auto / passthrough"]
+        C1["自适应路由：按 stream 字段"] --> C2["非流式→SSE 包装 / 流式直连 / 自适应探测"]
     end
 
     B3 --> L3
@@ -81,10 +81,10 @@ flowchart TD
 
     subgraph L4["第 4 层：流/非流决策（后于格式转换）"]
         direction LR
-        E1["--stream-mode 覆写<br/>internalReq.Stream"]
+        E1["internalReq.Stream 控制路由"]
         E1 --> E2{"stream?"}
-        E2 -->|true| E3["handleStreamRequest<br/>或 handleStreamRequestAsNonStream"]
-        E2 -->|false| E4["handleNonStreamResponse<br/>或 handleNonStreamResponseAsSSE"]
+        E2 -->|true| E3["handleStreamRequest"]
+        E2 -->|false| E4["handleNonStreamResponse"]
     end
 
     style L1 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
@@ -94,26 +94,7 @@ flowchart TD
     style L4 fill:#fce4ec,stroke:#d32f2f,stroke-width:2px
 ```
 
-> `InternalRequest.Stream` 在 TranslateRequest 阶段从入站协议提取并保留，传递到第 4 层供 `--stream-mode` 覆写。
-
-### `--stream-mode` 流式策略控制
-
-四种模式：`auto`（默认自适应）、`stream`（强制 SSE）、`non-stream`（强制非流式）、`passthrough`（直连）。
-
-**透传路径**：根据模式和请求体 `stream` 字段选择 handler（`handlePassthroughStream`/`NonStream`/`NonStreamAsSSE`/`Raw*`）。
-
-**翻译路径**：覆写 `internalReq.Stream` 后再路由：
-
-| 模式 | 入站 stream | 上游 stream（覆写后） | 处理函数 |
-|------|------|------|------|
-| `auto` | true | true | `handleStreamRequest` |
-| `auto` | false | false | `handleNonStreamResponse` |
-| `non-stream` | true | false | `handleNonStreamResponseAsSSE` |
-| `non-stream` | false | false | `handleNonStreamResponse` |
-| `stream` | true | true | `handleStreamRequest` |
-| `stream` | false | true | `handleStreamRequestAsNonStream` |
-
-> `passthrough` 模式仅在透传路径生效，翻译路径忽略。
+> `InternalRequest.Stream` 在 TranslateRequest 阶段从入站协议提取并保留，传递到第 4 层。
 
 ---
 
@@ -121,7 +102,9 @@ flowchart TD
 
 | 文件 | 职责 |
 |------|------|
-| `internal/server/quick.go` | 快速模式核心：路由决策、透传/翻译分发、SSE 包装、心跳、自适应探测 |
+| `internal/server/quick.go` | 快速模式核心：路由决策、透传/翻译分发、SSE 包装、自适应探测 |
+| `internal/server/gateway.go` | 复杂模式核心：与 quick.go 功能对应，必须保持同步 |
+| `internal/server/sse_heartbeat.go` | 统一 SSE 心跳 goroutine 工厂函数，所有 handler 共用 |
 | `internal/provider/openai.go` | HTTP 客户端：四种协议的 Call/CallStream |
 | `internal/protocol/schema/internal.go` | Central Schema 定义（InternalRequest/InternalResponse） |
 | `internal/protocol/<name>/translator.go` | 各协议翻译器（实现 CombinedTranslator 接口） |
@@ -215,7 +198,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（共 53 个）：**
+**已标记的关键约束点（共 50 个）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -255,21 +238,18 @@ grep -rn "@REASON:" internal/
 | `DEFAULT_ALIASES` | db/aliasfile.go | 内置别名，三层加载最底层兜底 |
 | **quick.go 核心功能** | | |
 | `HANDLE_REQUEST_ENTRY` | quick.go | 快速模式总入口，所有路由决策起点 |
-| `STREAM_MODE_ROUTING` | quick.go | 4 种模式路由矩阵 |
+| `STREAM_MODE_ROUTING` | quick.go | 透传路径自适应路由（按 stream 字段） |
 | `TRANSLATE_TO_PROVIDER` | quick.go | InternalRequest → 上游协议请求 |
 | `PASSTHROUGH_NONSTREAM` | quick.go | 透传非流式 |
 | `PASSTHROUGH_NONSTREAM_AS_SSE` | quick.go | 透传非流式→SSE 包装，必须 <-callFinished 防并发写 |
 | `PASSTHROUGH_STREAM` | quick.go | 透传流式 |
-| `PASSTHROUGH_RAW` | quick.go | passthrough 模式总入口 |
-| `PASSTHROUGH_RAW_STREAM` | quick.go | passthrough 流式直连 |
-| `PASSTHROUGH_RAW_NONSTREAM` | quick.go | passthrough 非流式直连 |
 | `NONSTREAM_RESPONSE` | quick.go | 翻译路径非流式→JSON |
 | `NONSTREAM_RESPONSE_AS_SSE` | quick.go | 翻译路径非流式→SSE |
 | `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
 | `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
 | `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式 |
-| `CALLDONE_CALLFINISHED` | quick.go | 通道同步 |
+| `SSE_HEARTBEAT_FACTORY` | sse_heartbeat.go | 统一心跳工厂函数，所有 handler 共用 |
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
 | `TRANSLATE_STREAM_OUTPUT` | quick.go | Anthropic SSE 事件序列 |

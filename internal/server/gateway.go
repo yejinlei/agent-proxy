@@ -394,24 +394,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone := make(chan struct{})
-	callFinished := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		defer close(callFinished)
-		for {
-			select {
-			case <-callDone:
-				return
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-				w.Write(heartbeatEvent)
-				flusher.Flush()
-			}
-		}
-	}()
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context())
 
 	callInfo := makePassthroughInfo(info, realModel)
 	lines, headers, err := client.CallStream(ctx, rawBody, callInfo)
@@ -658,24 +641,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone := make(chan struct{})
-	callFinished := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		defer close(callFinished)
-		for {
-			select {
-			case <-callDone:
-				return
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-				w.Write(heartbeatEvent)
-				flusher.Flush()
-			}
-		}
-	}()
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context())
 
 	lines, _, err := client.CallStream(ctx, downstreamReq, info)
 
