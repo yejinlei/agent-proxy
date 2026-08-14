@@ -1682,13 +1682,13 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
 }
 
-// @AI_GUARD: NONSTREAM_RESPONSE_AS_SSE - 翻译路径非流式→SSE，调用 writeNonStreamAsSSE
-// @CONSTRAINT: 上游非流式请求期间发送心跳，防止客户端超时；close(done) 在 <-callFinished 之前
-// @RELATED: writeNonStreamAsSSE, handlePassthroughNonStreamAsSSE
-// @REASON: 翻译路径的非流式→SSE 包装与透传路径共用 writeNonStreamAsSSE，但心跳逻辑独立
-// handleNonStreamResponseAsSSE 翻译路径 + --stream-mode non-stream：
-// 调用上游非流式 API，经翻译管道得到入站协议格式的响应，
-// 然后拆解为 SSE 事件流返回给客户端（客户端建立了 SSE 连接）。
+// @AI_GUARD: NONSTREAM_RESPONSE_AS_SSE - 翻译路径非流式→SSE 包装
+// @CONSTRAINT: 上游非流式请求期间发送心跳，close(callDone) 必须在 <-callFinished 之前（顺序不可颠倒）
+//   - 必须等待 callFinished 确保心跳 goroutine 完全退出后再写 SSE 响应，否则并发写 ResponseWriter 造成 SSE 数据损坏
+//   - 响应体必须经过 stripThinkingContentBlocks 过滤
+//
+// @RELATED: CALLDONE_CALLFINISHED (同步模式), writeNonStreamAsSSE, handlePassthroughNonStreamAsSSE (透传路径对应)
+// @REASON: 历史血泪教训 - 遗漏 <-callFinished 导致心跳与 SSE 响应并发写入 http.ResponseWriter，Claude Code 解析到损坏 SSE 后报 "API returned an empty or malformed response (HTTP 200)"
 func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
 	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
@@ -1706,19 +1706,20 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	// 心跳 goroutine：上游非流式可能耗时较长，发送心跳防止客户端超时
-	var writeMu sync.Mutex
-	done := make(chan struct{})
+	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
-			case <-done:
+			case <-callDone:
+				return
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				writeMu.Lock()
 				w.Write(heartbeatEvent)
-				writeMu.Unlock()
 				flusher.Flush()
 			}
 		}
@@ -1726,7 +1727,8 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
-	close(done) // 立即停止心跳
+	close(callDone) // 停止心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止与后续 SSE 写入并发
 	cancel()
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]interface{}{

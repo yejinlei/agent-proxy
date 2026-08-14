@@ -171,6 +171,12 @@ message_start → content_block_start → content_block_delta* → content_block
 - 双向替换：请求 `model` 假→真，响应 `model` 真→假
 - `_default_` 兜底，`@default` 动态取上游首个模型
 
+### 版本标识
+- `main.go` 中 `var version = "vX.Y.Z"`，可通过 `-ldflags "-X main.version=vX.Y.Z"` 构建时注入
+- 每次发布必须更新版本号，同步更新 `main.go` 中的 `version` 变量
+- 启动日志（快速/复杂模式）均显示版本号，如 `🚀 Agent-Proxy v0.2.55 (快速模式) running on ...`
+- 支持 `agent-proxy --version` / `agent-proxy -V` / `agent-proxy version` 查看版本
+
 ### 双模式同步：quick.go ↔ gateway.go
 
 **quick.go（快速模式）和 gateway.go（复杂模式）必须保持同步。** 所有修复必须同时应用到两个文件，否则会出现「修 A 坏 B」的顾此失彼情况。
