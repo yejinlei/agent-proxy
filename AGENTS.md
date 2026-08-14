@@ -138,8 +138,10 @@ flowchart TD
 
 ### SSE 格式
 - 所有 SSE 数据行必须带 `data: ` 前缀
-- 心跳格式：`data: {}\n\n`（合法 JSON `{}`，兼容 Claude Code 和 Kimi）
-- 错误事件：`{"type":"error","error":{"type":"...","message":"..."}}`
+- 心跳格式：`: heartbeat\n\n`（SSE 注释，RFC 6455 §3.4）
+  - 不可用 `data: {}\n\n`（Claude Code 解析为 Anthropic 事件，缺少 type 字段→失败）
+  - 不可用 `data: \n\n`（Kimi 等严格客户端空 data 行 JSON.parse 报错）
+- 错误事件：`event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n`
 - Anthropic 事件字段合规性见 `docs/DESIGN.md`
 
 #### Anthropic SSE 事件生命周期
@@ -168,6 +170,111 @@ message_start → content_block_start → content_block_delta* → content_block
 - 三层加载：`--aliases` > `model-aliases.yaml` > 内置 `DefaultAliases()`
 - 双向替换：请求 `model` 假→真，响应 `model` 真→假
 - `_default_` 兜底，`@default` 动态取上游首个模型
+
+### 双模式同步：quick.go ↔ gateway.go
+
+**quick.go（快速模式）和 gateway.go（复杂模式）必须保持同步。** 所有修复必须同时应用到两个文件，否则会出现「修 A 坏 B」的顾此失彼情况。
+
+**已知不一致点（已修复）：**
+- 心跳机制：gateway.go 已补全 `callDone`/`callFinished` 同步
+- SSE 换行符：gateway.go 已修复 `\n` → `\n\n `
+- SSE 前缀：gateway.go 已补全 `data: ` 前缀自动检测
+- Thinking 过滤：gateway.go 已补全非流式 `stripThinkingContentBlocks` + 流式过滤
+- Chunked Transfer：gateway.go 已补全 `WriteHeader(200)` + `Flush()` 在 CallStream 前
+- SSE 错误事件：gateway.go 已改用 `event: error` 而非 `sendError`
+
+**修改检查清单：** 修改任一下列函数时，必须同步修改另一文件中的对应函数：
+| quick.go | gateway.go |
+|----------|------------|
+| `handlePassthroughStreamWithBody` | `handlePassthroughStream` |
+| `handleStreamRequest` | `handleStreamRequest` |
+| `handlePassthroughNonStream` | `handlePassthroughNonStream` |
+
+### @AI_GUARD 代码标记系统
+
+**代码中关键约束位置使用 `@AI_GUARD` 标记，防止 AI/LLM 盲目修改导致「顾此失彼」。**
+
+标记格式：
+```
+// @AI_GUARD: <类别> - <简述>
+// @CONSTRAINT: <硬约束，修改前必须检查>
+// @RELATED: <关联文件或函数>
+// @REASON: <历史原因/血泪教训>
+```
+
+**查找所有标记：**
+```bash
+grep -rn "@AI_GUARD:" internal/
+grep -rn "@CONSTRAINT:" internal/
+grep -rn "@REASON:" internal/
+```
+
+**已标记的关键约束点（共 53 个）：**
+
+| 类别 | 文件 | 约束 |
+|------|------|------|
+| `TRANSLATOR_INTERFACES` | interfaces.go | 翻译器接口定义，新增协议必须实现全部方法 |
+| **Central Schema（消息格式定义）** | | |
+| `CENTRAL_SCHEMA` | schema/internal.go | 中枢消息模型，所有协议翻译的中枢 |
+| `INTERNAL_MESSAGE` | schema/internal.go | 中枢消息对象，字段变更必须同步所有翻译器 |
+| `INTERNAL_CONTENT_BLOCK` | schema/internal.go | 多模态内容块，图片/文件格式汇聚点 |
+| `INTERNAL_TOOL` | schema/internal.go | 工具定义，各协议 tool 格式差异汇聚点 |
+| `INTERNAL_REQUEST` | schema/internal.go | 中枢请求对象，所有入站翻译目标结构 |
+| `INTERNAL_RESPONSE` | schema/internal.go | 中枢响应对象，所有出站翻译源结构 |
+| `INTERNAL_STREAM_EVENT` | schema/internal.go | 流式事件，所有流式翻译中转结构 |
+| **ChatCompletionTranslator** | | |
+| `CC_TRANSLATE_REQUEST` | chatcompletion/translator.go | CC → InternalRequest 消息格式转换 |
+| `CC_TRANSLATE_RESPONSE` | chatcompletion/translator.go | InternalResponse → CC 消息格式转换 |
+| `CC_TRANSLATE_STREAM` | chatcompletion/translator.go | CC SSE 流式出口 |
+| **AnthropicTranslator** | | |
+| `ANTHROPIC_TRANSLATE_REQUEST` | anthropic/translator.go | Anthropic → InternalRequest 消息格式转换 |
+| `ANTHROPIC_TRANSLATE_RESPONSE` | anthropic/translator.go | InternalResponse → Anthropic 消息格式转换 |
+| `ANTHROPIC_TRANSLATE_STREAM` | anthropic/translator.go | SSE 事件生命周期 |
+| `MESSAGE_START_CONTENT` | anthropic/translator.go | Content 必须 `[]ContentBlock{}` |
+| `CONTENT_BLOCK_START_BEFORE_DELTA` | anthropic/translator.go | `citations: []` 必须存在 |
+| `TRANSLATE_STREAM_EVENT` | anthropic/translator.go | 上游 Anthropic SSE → InternalStreamEvent |
+| **GeminiTranslator** | | |
+| `GEMINI_TRANSLATE_REQUEST` | gemini/translator.go | Gemini → InternalRequest 消息格式转换 |
+| `GEMINI_TRANSLATE_RESPONSE` | gemini/translator.go | InternalResponse → Gemini 消息格式转换 |
+| `GEMINI_TRANSLATE_STREAM` | gemini/translator.go | Gemini SSE 流式出口 |
+| `GEMINI_TRANSLATE_STREAM_EVENT` | gemini/translator.go | 上游 Gemini SSE → InternalStreamEvent |
+| **ResponsesTranslator** | | |
+| `RESPONSES_TRANSLATE_REQUEST` | responses/translator.go | Responses → InternalRequest 消息格式转换 |
+| `RESPONSES_TRANSLATE_RESPONSE` | responses/translator.go | InternalResponse → Responses 消息格式转换 |
+| `RESPONSES_TRANSLATE_STREAM` | responses/translator.go | Responses SSE 流式出口 |
+| `RESPONSES_TRANSLATE_STREAM_EVENT` | responses/translator.go | 上游 Responses SSE → InternalStreamEvent |
+| **模型别名** | | |
+| `ALIAS_RESOLVE` | db/aliasfile.go | 别名解析核心，三层优先级 |
+| `ALIAS_LOAD_AUTO` | db/aliasfile.go | 别名文件自动加载 |
+| `DEFAULT_ALIASES` | db/aliasfile.go | 内置别名，三层加载最底层兜底 |
+| **quick.go 核心功能** | | |
+| `HANDLE_REQUEST_ENTRY` | quick.go | 快速模式总入口，所有路由决策起点 |
+| `STREAM_MODE_ROUTING` | quick.go | 4 种模式路由矩阵 |
+| `TRANSLATE_TO_PROVIDER` | quick.go | InternalRequest → 上游协议请求 |
+| `PASSTHROUGH_NONSTREAM` | quick.go | 透传非流式 |
+| `PASSTHROUGH_NONSTREAM_AS_SSE` | quick.go | 透传非流式→SSE 包装 |
+| `PASSTHROUGH_STREAM` | quick.go | 透传流式 |
+| `PASSTHROUGH_RAW` | quick.go | passthrough 模式总入口 |
+| `PASSTHROUGH_RAW_STREAM` | quick.go | passthrough 流式直连 |
+| `PASSTHROUGH_RAW_NONSTREAM` | quick.go | passthrough 非流式直连 |
+| `NONSTREAM_RESPONSE` | quick.go | 翻译路径非流式→JSON |
+| `NONSTREAM_RESPONSE_AS_SSE` | quick.go | 翻译路径非流式→SSE |
+| `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
+| `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
+| `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
+| `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式 |
+| `CALLDONE_CALLFINISHED` | quick.go | 通道同步 |
+| `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
+| `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
+| `TRANSLATE_STREAM_OUTPUT` | quick.go | Anthropic SSE 事件序列 |
+| **gateway.go** | | |
+| `GATEWAY_HANDLE_REQUEST_ENTRY` | gateway.go | 复杂模式总入口，必须同步 quick.go |
+| `GATEWAY_TRANSLATE_TO_PROVIDER` | gateway.go | Central Schema 出口，必须同步 quick.go |
+| `BUILD_CC_REQUEST` | gateway.go | InternalRequest → CC 消息格式转换核心 |
+| `GATEWAY_PASSTHROUGH_STREAM` | gateway.go | 必须同步 quick.go |
+| `GATEWAY_STREAM_REQUEST` | gateway.go | 必须同步 quick.go |
+| **provider** | | |
+| `CONNECTION_POOL_CONFIG` | openai.go | 4 个 Provider 配置一致 |
 
 ---
 

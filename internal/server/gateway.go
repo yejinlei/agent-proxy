@@ -161,6 +161,14 @@ func (g *Gateway) Routes() chi.Router {
 }
 
 // handleRequest 统一请求处理：入站协议 → InternalRequest → 路由 → Provider → InternalResponse → 入站协议
+// @AI_GUARD: GATEWAY_HANDLE_REQUEST_ENTRY - 复杂模式总入口，所有路由决策的起点
+// @CONSTRAINT: 必须与 quick.go handleRequest 保持同步
+//   - 透传路径：入站协议==上游协议，直接转发，仅替换 model 名
+//   - 翻译路径：入站协议≠上游协议，经过 Central Schema 完整翻译
+//   - 模型别名解析必须在路由之前
+//   - stream 检测影响后续 handler 选择
+//
+// @RELATED: quick.go handleRequest (快速模式入口，必须保持同步)
 func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressProtocol string) {
 	startTime := time.Now()
 	g.store.IncrActiveConns()
@@ -335,6 +343,9 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 		return
 	}
 
+	// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
+	resp = stripThinkingContentBlocks(resp)
+
 	// 别名回显：将响应 JSON 中的 model 字段替换为客户端原始模型名
 	if aliasHit && aliasModel != "" {
 		resp = echoAliasInResponseBody(resp, aliasModel)
@@ -354,6 +365,16 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
 }
 
+// @AI_GUARD: GATEWAY_PASSTHROUGH_STREAM - 必须与 quick.go handlePassthroughStreamWithBody 保持同步
+// @CONSTRAINT: 修改此函数时必须同步修改 quick.go 对应的 handlePassthroughStreamWithBody
+//   - WriteHeader(200)+Flush 必须在 CallStream 之前（chunked transfer 防超时）
+//   - callDone/callFinished 心跳同步不可移除（防止并发写 ResponseWriter）
+//   - SSE 换行必须为 \n\n（双换行），不可改为 \n
+//   - 所有 SSE 数据行必须带 data: 前缀
+//   - 心跳格式必须为 SSE 注释 : heartbeat\n\n
+//
+// @RELATED: quick.go handlePassthroughStreamWithBody, heartbeatEvent
+// @REASON: 历史血泪教训 - 与 quick.go 不同步导致复杂模式无法正常工作
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
 func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
@@ -369,12 +390,48 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
+
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		defer close(callFinished)
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write(heartbeatEvent)
+				flusher.Flush()
+			}
+		}
+	}()
 
 	callInfo := makePassthroughInfo(info, realModel)
 	lines, headers, err := client.CallStream(ctx, rawBody, callInfo)
+
+	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+
 	if err != nil {
+		// SSE 错误事件，避免 superfluous response.WriteHeader
+		errData, _ := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "stream_error",
+				"message": err.Error(),
+			},
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errData)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
-		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "stream error", err.Error())
 		return
 	}
 
@@ -385,13 +442,52 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		}
 	}
 
+	// 流式 thinking 过滤状态
+	var inThinkingBlock bool
+
 	for line := range lines {
 		var meta map[string]interface{}
 		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
 			continue
 		}
-		w.Write(line)
-		w.Write([]byte("\n"))
+
+		// 确保 SSE 数据行有 data: 前缀
+		lineStr := string(line)
+		if !strings.HasPrefix(lineStr, "data: ") && !strings.HasPrefix(lineStr, ":") && !strings.HasPrefix(lineStr, "event:") {
+			lineStr = "data: " + lineStr
+		}
+
+		// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
+		if strings.HasPrefix(lineStr, "data: ") {
+			payload := lineStr[6:] // 去掉 "data: " 前缀
+			var evt map[string]interface{}
+			if json.Unmarshal([]byte(payload), &evt) == nil {
+				evtType, _ := evt["type"].(string)
+				switch evtType {
+				case "content_block_start":
+					if cb, ok := evt["content_block"].(map[string]interface{}); ok {
+						if ct, _ := cb["type"].(string); ct == "thinking" {
+							if _, hasSig := cb["signature"]; !hasSig {
+								inThinkingBlock = true
+								continue
+							}
+						}
+					}
+				case "content_block_delta":
+					if inThinkingBlock {
+						continue
+					}
+				case "content_block_stop":
+					if inThinkingBlock {
+						inThinkingBlock = false
+						continue
+					}
+				}
+			}
+		}
+
+		w.Write([]byte(lineStr))
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
 	}
 
@@ -533,6 +629,15 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
 }
 
+// @AI_GUARD: GATEWAY_STREAM_REQUEST - 必须与 quick.go handleStreamRequest 保持同步
+// @CONSTRAINT: 修改此函数时必须同步修改 quick.go 对应的 handleStreamRequest
+//   - WriteHeader(200)+Flush 必须在 CallStream 之前
+//   - callDone/callFinished 心跳同步不可移除
+//   - 上游 SSE 行必须剥离 "data: " 前缀后再传入 TranslateStreamEvent
+//   - TranslateStreamEvent 类型断言签名必须为 json.RawMessage
+//
+// @RELATED: quick.go handleStreamRequest, anthropic/translator.go TranslateStream
+// @REASON: 历史血泪教训 - 与 quick.go 不同步导致翻译路径在复杂模式下失败
 // handleStreamRequest 流式请求
 func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, downstreamReq json.RawMessage,
@@ -549,11 +654,47 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
+
+	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
+	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		defer close(callFinished)
+		for {
+			select {
+			case <-callDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				w.Write(heartbeatEvent)
+				flusher.Flush()
+			}
+		}
+	}()
 
 	lines, _, err := client.CallStream(ctx, downstreamReq, info)
+
+	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+
 	if err != nil {
+		// SSE 错误事件，避免 superfluous response.WriteHeader
+		errData, _ := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "stream_error",
+				"message": err.Error(),
+			},
+		})
+		w.Write([]byte("event: error\ndata: "))
+		w.Write(errData)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
-		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "stream error", err.Error())
 		return
 	}
 
@@ -569,12 +710,18 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 				continue
 			}
 
+			// 剥离 data: 前缀（与 quick.go 保持一致）
+			payload := strings.TrimPrefix(string(line), "data: ")
+			if payload == "[DONE]" {
+				continue
+			}
+
 			// Provider 翻译器解析流式事件
 			if providerTranslator != nil {
 				pte := providerTranslator.(interface {
 					TranslateStreamEvent(json.RawMessage) *schema.InternalStreamEvent
 				})
-				event := pte.TranslateStreamEvent(line)
+				event := pte.TranslateStreamEvent(json.RawMessage(payload))
 				if event != nil {
 					if internalReq != nil && internalReq.AliasModel != "" && event.Data != nil {
 						event.Data.Model = internalReq.AliasModel
@@ -582,8 +729,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 					events <- *event
 				}
 			} else {
-				// OpenAI 兼容：解析 SSE delta 行（可能带 "data: " 前缀）
-				payload := strings.TrimPrefix(string(line), "data: ")
+				// OpenAI 兼容：解析 SSE delta 行
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
 				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
@@ -616,7 +762,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 				if internalReq != nil && internalReq.AliasModel != "" {
 					modelName = internalReq.AliasModel
 				}
-				events <- schema.InternalStreamEvent{
+				evt := schema.InternalStreamEvent{
 					Type: eventType,
 					Data: &schema.InternalStreamChunk{
 						ID:    ccChunk.ID,
@@ -629,6 +775,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 						Usage: mapInternalUsage(ccChunk.Usage),
 					},
 				}
+				events <- evt
 			}
 		}
 	}()
@@ -645,7 +792,13 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
 }
 
-// translateToProvider 根据目标 Provider 类型选择翻译器并构建下游请求体
+// @AI_GUARD: GATEWAY_TRANSLATE_TO_PROVIDER - InternalRequest → 上游协议请求（Central Schema 出口）
+// @CONSTRAINT: 必须与 quick.go translateToProvider 保持同步
+//   - 根据 providerType 选择正确的翻译器并构建下游请求体
+//   - 返回 (providerTranslator, downstreamReq) 供后续 handler 使用
+//   - 新增协议时必须在此 switch 中注册对应的翻译器
+//
+// @RELATED: quick.go translateToProvider, all protocol/translator.go TranslateToProvider 方法
 func (g *Gateway) translateToProvider(info *schema.ProviderInfo, internalReq *schema.InternalRequest) (interface{}, json.RawMessage) {
 	providerType := info.Version
 
@@ -681,7 +834,14 @@ func (g *Gateway) translateToProvider(info *schema.ProviderInfo, internalReq *sc
 	}
 }
 
-// buildCCRequest 将 InternalRequest 构建为 OpenAI 兼容请求体
+// @AI_GUARD: BUILD_CC_REQUEST - InternalRequest → CC 请求体构建，消息格式转换的核心函数
+// @CONSTRAINT: 修改消息映射逻辑必须同步检查所有调用方
+//   - SystemPrompt → messages[0] role:system
+//   - ContentBlocks 优先于 Content（多模态还原）
+//   - ToolCalls.Arguments 是 JSON 字符串（不可 Marshal 为对象）
+//   - Stop 序列化：string/[]string 两种格式
+//
+// @RELATED: quick.go buildCCRequest (两个文件各自有独立实现，修改需同步)
 func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionRequest {
 	messages := make([]chatcompletion.Message, 0, len(req.Messages)+1)
 

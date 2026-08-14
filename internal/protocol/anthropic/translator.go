@@ -25,6 +25,16 @@ func (t *AnthropicTranslator) Protocol() string { return "anthropic" }
 //  REQUEST: Anthropic MessageRequest → InternalRequest (入站解析)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: ANTHROPIC_TRANSLATE_REQUEST - Anthropic MessageRequest → InternalRequest（Central Schema 入口）
+// @CONSTRAINT: 消息格式转换必须经过 Central Schema，禁止直接翻译到其他协议
+//   - System: 透传原始 JSON（string 或 []SystemBlock）
+//   - Messages: 逐条转换（assistant 消息支持 content+tool_use 混合内容）
+//   - Thinking: 提取 thinking 配置到 InternalRequest.OutputConfig
+//   - 流: stream 字段原样保留到 InternalRequest.Stream
+//   - 新增字段映射时必须同步修改 MessageRequest 结构体
+//
+// @RELATED: chatcompletion/translator.go TranslateRequest, gemini/translator.go TranslateRequest
+// @REASON: Anthropic 消息格式最复杂（content 数组、thinking 块、tool_use），字段映射错误影响 Claude Code 和 Kimi
 // TranslateRequest 将 Anthropic 原生请求解析为 InternalRequest
 func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var antReq MessageRequest
@@ -240,6 +250,14 @@ func userIDFromMetadata(m *Metadata) string {
 //  RESPONSE: InternalResponse → Anthropic MessageResponse (出站)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: ANTHROPIC_TRANSLATE_RESPONSE - InternalResponse → Anthropic MessageResponse（Central Schema 出口）
+// @CONSTRAINT: 必须正确映射 InternalResponse 到 Anthropic 原生响应格式
+//   - ContentBlocks 优先于 Content 字符串（支持多模态/thinking/tool_use）
+//   - thinking 块必须包含 signature 字段
+//   - stop_reason 映射必须正确（end_turn/max_tokens/tool_use/stop_sequence）
+//   - usage 必须包含 input_tokens/output_tokens
+//
+// @RELATED: chatcompletion/translator.go TranslateResponse, gemini/translator.go TranslateResponse
 // TranslateResponse 将 InternalResponse 翻译为 Anthropic 原生响应
 func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var contentBlocks []ContentBlock
@@ -341,6 +359,19 @@ func mapStopReasonReverse(reason string) string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // TranslateStream 将内部流式事件翻译为 Anthropic 格式 SSE
+// @AI_GUARD: ANTHROPIC_TRANSLATE_STREAM - Anthropic SSE 事件生命周期，绝对不可修改序列
+// @CONSTRAINT: 必须严格遵循事件序列：
+//
+//	message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop
+//	- message_start 的 message.content 必须序列化为 []（空数组），不能为 null
+//	- content_block_start 必须包含 citations: []（空数组）
+//	- content_block_start 必须在第一个 content_block_delta 之前发送
+//	- content_block_stop 必须在 message_delta 之前发送
+//	- ctx.Done() 时也必须发送 content_block_stop + message_delta + message_stop
+//	- 所有事件后必须跟 \n\n 双换行
+//
+// @RELATED: quick.go handleStreamRequest (调用方), quick.go writeNonStreamAsSSE (非流式 SSE 包装)
+// @REASON: 历史血泪教训 - 事件序列/字段缺失导致 Kimi/Claude Code 解析失败，修复 N 次才稳定
 func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	blockStarted := false // 当前内容块是否已发送 content_block_start
 	for {
@@ -381,6 +412,11 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 			case "start":
 				blockStarted = false
 				if event.Data != nil {
+					// @AI_GUARD: MESSAGE_START_CONTENT - Content 必须为 []ContentBlock{}，不能为 nil
+					// @CONSTRAINT: json.Marshal(nil) 输出 "null"，json.Marshal([]ContentBlock{}) 输出 "[]"
+					//   - Claude Code 客户端期望 content 为 []，null 会导致解析失败
+					// @RELATED: quick.go writeNonStreamAsSSE (Anthropic 分支)
+					// @REASON: 历史血泪教训 - content: null 导致 Claude Code /model 命令报错
 					msg := EventMessage{
 						ID:           event.Data.ID,
 						Type:         "message",
@@ -412,6 +448,10 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 						delta = &Delta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}
 					}
 					if delta != nil {
+						// @AI_GUARD: CONTENT_BLOCK_START_BEFORE_DELTA - 第一个 delta 前必须发送 content_block_start
+						// @CONSTRAINT: content_block_start 必须包含 citations: []（空数组），不能省略
+						// @RELATED: quick.go writeNonStreamAsSSE (Anthropic 分支)
+						// @REASON: 历史血泪教训 - 缺少 content_block_start 导致 Kimi 解析失败
 						// 第一个 delta 之前发送 content_block_start
 						if !blockStarted {
 							blockStarted = true
@@ -789,6 +829,13 @@ func joinText(parts []string) string {
 //  STREAMING
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: TRANSLATE_STREAM_EVENT - 上游 Anthropic SSE 事件 → InternalStreamEvent
+// @CONSTRAINT: 签名必须为 TranslateStreamEvent(json.RawMessage)，与 handleStreamRequest 类型断言一致
+//   - message_delta 事件必须提取 usage.output_tokens，确保 CC SSE 响应包含 usage 数据
+//   - content_block_start 类型为 "thinking" 且无 signature 的是非标准块，返回 nil 跳过
+//
+// @RELATED: quick.go handleStreamRequest (类型断言), gemini/translator.go (签名一致)
+// @REASON: 历史血泪教训 - usage 丢失导致 Claude Code /model 命令报错
 func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.InternalStreamEvent {
 	var event StreamEvent
 	if err := json.Unmarshal(raw, &event); err != nil {

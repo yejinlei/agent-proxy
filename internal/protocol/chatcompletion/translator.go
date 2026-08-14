@@ -22,6 +22,15 @@ type ChatCompletionTranslator struct{}
 
 func (t *ChatCompletionTranslator) Protocol() string { return "chatcompletion" }
 
+// @AI_GUARD: CC_TRANSLATE_REQUEST - OpenAI ChatCompletion → InternalRequest（Central Schema 入口）
+// @CONSTRAINT: 消息格式转换必须经过 Central Schema，禁止直接翻译到其他协议
+//   - system prompt 提取为 SystemPrompt
+//   - messages 逐条转换（role 映射、content 保持、tool_calls 保持）
+//   - stream 字段原样保留到 InternalRequest.Stream
+//   - 新增字段映射时必须同步修改 ChatCompletionRequest 结构体
+//
+// @RELATED: anthropic/translator.go TranslateRequest, gemini/translator.go TranslateRequest
+// @REASON: 消息格式转换是整个网关的核心，字段映射错误会导致所有下游客户端崩溃
 // TranslateRequest 将 ChatCompletionRequest 翻译为 InternalRequest
 func (t *ChatCompletionTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var ccReq ChatCompletionRequest
@@ -201,12 +210,25 @@ func parseStopSequences(raw json.RawMessage) []string {
 	return nil
 }
 
+// @AI_GUARD: CC_TRANSLATE_RESPONSE - InternalResponse → OpenAI ChatCompletion（Central Schema 出口）
+// @CONSTRAINT: 必须正确映射 InternalResponse 的 Choices/Usage/Model 到 CC 响应格式
+//   - finish_reason 映射必须正确（stop/length/tool_calls/content_filter）
+//   - usage 必须包含 prompt_tokens/completion_tokens/total_tokens
+//
+// @RELATED: anthropic/translator.go TranslateResponse, gemini/translator.go TranslateResponse
 // TranslateResponse 将 InternalResponse 翻译为 CC 响应
 func (t *ChatCompletionTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	ccResp := InternalToCCResponse(resp)
 	return json.Marshal(ccResp)
 }
 
+// @AI_GUARD: CC_TRANSLATE_STREAM - InternalStreamEvent → OpenAI CC SSE（流式出口）
+// @CONSTRAINT: CC SSE 格式为 "data: <json>\n\n"，结束标记为 "data: [DONE]\n\n"
+//   - 每个 delta 事件生成一个 CC SSE chunk
+//   - done 事件发送 finish_reason 和 usage
+//   - ctx.Done() 时发送 [DONE] 结束
+//
+// @RELATED: anthropic/translator.go TranslateStream (事件序列完全不同)
 // TranslateStream 将内部流式事件翻译为 CC SSE（ChatCompletion 是网关入口协议，直接透传）
 func (t *ChatCompletionTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	for {
@@ -405,7 +427,7 @@ func buildCCResponseContentBlocks(blocks []schema.InternalContentBlock) []map[st
 				url = b.URL
 			}
 			ccBlocks = append(ccBlocks, map[string]interface{}{
-				"type": "image_url",
+				"type":      "image_url",
 				"image_url": map[string]interface{}{"url": url},
 			})
 		}
