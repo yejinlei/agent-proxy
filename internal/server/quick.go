@@ -53,12 +53,10 @@ type QuickGateway struct {
 	streamMode string
 }
 
-// 心跳格式：data: {}（空 JSON 对象 + data: 前缀）
-// 保留 data: 行 —— Claude Code 的 SSE 解析器依赖 data: 行来重置超时计时器。
-// 使用 {} 替代空字符串 —— 避免严格客户端（Kimi/Anthropic SDK）对空 data 行做
-// JSON.parse("") 报 Unexpected end of JSON input。
-// HTTP 层有字节流动保持连接活跃，JSON 解析器视 {} 为空对象无副作用。
-var heartbeatEvent = []byte("data: {}\n\n")
+// 心跳格式：SSE 注释行（RFC 6455 §3.4）
+// 所有 SSE 客户端忽略以冒号开头的注释行，但能重置 TCP 连接超时计时器。
+// 使用注释而非 data: 行 —— 避免 Claude Code 将空 JSON {} 当作 Anthropic 事件解析失败。
+var heartbeatEvent = []byte(": heartbeat\n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
@@ -765,9 +763,11 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
 	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
 			case <-callDone:
@@ -775,7 +775,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				w.Write([]byte("data: {}\n\n"))
+				w.Write(heartbeatEvent)
 				flusher.Flush()
 			}
 		}
@@ -791,6 +791,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]interface{}{
@@ -815,9 +816,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	inThinkingBlock := false // 跟踪当前是否在 thinking 内容块中
 	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
-	if !writeSSE(w, heartbeatEvent) {
-		return
-	}
+	w.Write(heartbeatEvent)
 	flusher.Flush()
 	for {
 		select {
@@ -903,9 +902,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
-			if !writeSSE(w, heartbeatEvent) {
-				return
-			}
+			w.Write(heartbeatEvent)
 			flusher.Flush()
 		}
 	}
@@ -1011,9 +1008,11 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
 	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
 			case <-callDone:
@@ -1021,7 +1020,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				w.Write([]byte("data: {}\n\n"))
+				w.Write(heartbeatEvent)
 				flusher.Flush()
 			}
 		}
@@ -1053,6 +1052,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
@@ -1082,9 +1082,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
 	// 心跳格式 data: \n\n（空 data 行），Claude Code 将其识别为内容活动来重置超时
-	if !writeSSE(w, heartbeatEvent) {
-		return
-	}
+	w.Write(heartbeatEvent)
 	flusher.Flush()
 	for {
 		select {
@@ -1149,10 +1147,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			w.Write([]byte("\n\n")) // SSE 协议要求空行分隔事件
 			flusher.Flush()
 		case <-heartbeat.C:
-			if !writeSSE(w, heartbeatEvent) {
-				// 客户端已断开，退出循环
-				return
-			}
+			w.Write(heartbeatEvent)
 			flusher.Flush()
 		}
 	}
@@ -1502,12 +1497,9 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 				return
 			case <-ticker.C:
 				writeMu.Lock()
-				if !writeSSE(w, heartbeatEvent) {
-					writeMu.Unlock()
-					return
-				}
-				flusher.Flush()
+				w.Write(heartbeatEvent)
 				writeMu.Unlock()
+				flusher.Flush()
 			}
 		}
 	}()
@@ -1655,12 +1647,9 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 				return
 			case <-ticker.C:
 				writeMu.Lock()
-				if !writeSSE(w, heartbeatEvent) {
-					writeMu.Unlock()
-					return
-				}
-				flusher.Flush()
+				w.Write(heartbeatEvent)
 				writeMu.Unlock()
+				flusher.Flush()
 			}
 		}
 	}()
@@ -1768,9 +1757,11 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
 	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
 			case <-callDone:
@@ -1778,7 +1769,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				w.Write([]byte("data: {}\n\n"))
+				w.Write(heartbeatEvent)
 				flusher.Flush()
 			}
 		}
@@ -1789,6 +1780,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 
 	lines, _, err := p.CallStream(callCtx, downstreamReq, q.info)
 	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
@@ -2506,9 +2498,11 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
 	// 防止 Claude Code 等客户端在 cogitation 期间（15-25s）因无 SSE 数据而超时断开
 	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
 			case <-callDone:
@@ -2516,7 +2510,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				w.Write([]byte("data: {}\n\n"))
+				w.Write(heartbeatEvent)
 				flusher.Flush()
 			}
 		}
@@ -2525,6 +2519,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
 	close(callDone) // 停止 CallStream 期间的心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		log.Printf("[passthrough] upstream stream error: %s url=%s body_len=%d err=%v",
@@ -2552,9 +2547,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
 	// 立即发送首个 SSE 事件，防止客户端在等待上游首个响应时超时断开
-	if !writeSSE(w, heartbeatEvent) {
-		return
-	}
+	w.Write(heartbeatEvent)
 	flusher.Flush()
 streamLoop:
 	for {
@@ -2563,9 +2556,7 @@ streamLoop:
 			log.Printf("[passthrough] raw stream context cancelled: %v", callCtx.Err())
 			return
 		case <-heartbeat.C:
-			if !writeSSE(w, heartbeatEvent) {
-				return
-			}
+			w.Write(heartbeatEvent)
 			flusher.Flush()
 		case line, ok := <-lines:
 			if !ok {
