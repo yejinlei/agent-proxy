@@ -1541,22 +1541,21 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	}
 
 	// 在等待非流式上游响应期间发送 SSE 心跳，防止客户端（Claude Code 等）超时断开
-	// 互斥锁保护 w，防止心跳与后续响应写入并发（TOCTOU 竞态）
-	var writeMu sync.Mutex
-	done := make(chan struct{})
+	// callDone/callFinished 双通道同步：确保心跳 goroutine 完全退出后再写响应，防止并发写 http.ResponseWriter
+	callDone := make(chan struct{})
+	callFinished := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		defer close(callFinished)
 		for {
 			select {
-			case <-done:
+			case <-callDone:
 				return
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				writeMu.Lock()
 				w.Write(heartbeatEvent)
-				writeMu.Unlock()
 				flusher.Flush()
 			}
 		}
@@ -1564,7 +1563,8 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	respBody, _, err := p.Call(callCtx, nsBody, callInfo)
-	close(done) // 立即停止心跳，防止与后续响应写入并发
+	close(callDone) // 停止心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止与 writeNonStreamAsSSE 并发写
 	cancel()
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
