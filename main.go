@@ -20,7 +20,7 @@ import (
 )
 
 // version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
-var version = "v0.2.58"
+var version = "v0.2.59"
 
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
@@ -458,7 +458,7 @@ func startComplexMode(confPath string) http.Handler {
 		cfg = file
 	}
 
-	return server.NewGateway(cfg).Routes()
+	return server.NewGateway(cfg, verboseLevel).Routes()
 }
 
 // normalizeBaseURL 去掉 URL 末尾的 /v1

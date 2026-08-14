@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -62,9 +63,10 @@ type Gateway struct {
 	webServer          *web.Server
 	rateLimiter        *rateLimiter
 	aliasFile          *db.AliasFile
+	verboseLevel       int // 0=关闭 1=-v 2=-vv
 }
 
-func NewGateway(cfg *config.Config) *Gateway {
+func NewGateway(cfg *config.Config, verboseLevel int) *Gateway {
 	store := monitor.NewStore(cfg.Monitor.LogSize)
 
 	// 注册 4 个协议的完整翻译器
@@ -110,6 +112,7 @@ func NewGateway(cfg *config.Config) *Gateway {
 		store:              store,
 		webServer:          webServer,
 		rateLimiter:        newRateLimiter(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst),
+		verboseLevel:       verboseLevel,
 	}
 }
 
@@ -171,12 +174,20 @@ func (g *Gateway) Routes() chi.Router {
 // @RELATED: quick.go handleRequest (快速模式入口，必须保持同步)
 func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressProtocol string) {
 	startTime := time.Now()
+	if g.verboseLevel >= 2 {
+		defer func() {
+			log.Printf("[request] total → %v (path=%s, protocol=%s)", time.Since(startTime), r.URL.Path, ingressProtocol)
+		}()
+	}
 	g.store.IncrActiveConns()
 	defer g.store.DecrActiveConns()
 
 	// 读取请求体
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] read body failed: %v", err)
+		}
 		g.sendError(w, ingressProtocol, http.StatusBadRequest, "invalid JSON", err.Error())
 		return
 	}
@@ -184,6 +195,9 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	// 速率限制
 	if g.cfg.RateLimit.Enabled {
 		if !g.rateLimiter.Allow() {
+			if g.verboseLevel >= 2 {
+				log.Printf("[error] rate limited: remote=%s", r.RemoteAddr)
+			}
 			g.sendError(w, ingressProtocol, http.StatusTooManyRequests, "rate limited", "exceeded rate limit")
 			return
 		}
@@ -199,22 +213,38 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 		}
 	}
 	if model == "" {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] missing model: ingress=%s", ingressProtocol)
+		}
 		g.sendError(w, ingressProtocol, http.StatusBadRequest, "missing model", "model is required")
 		return
 	}
 
 	// ── 模型别名解析（优先于 ModelRouter） ──
 	realModel, originalModel, aliasHit := g.resolveAlias(model)
+	if g.verboseLevel >= 2 {
+		if aliasHit {
+			log.Printf("[route] alias resolved: %s → %s (hit)", originalModel, realModel)
+		} else {
+			log.Printf("[route] alias resolved: %s (no mapping, passthrough)", realModel)
+		}
+	}
 
 	// ── 路由 Provider ──
 	info, providerName, err := g.router.Resolve(realModel)
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] model not found: %s → %v", realModel, err)
+		}
 		g.sendError(w, ingressProtocol, http.StatusNotFound, "model not found", err.Error())
 		return
 	}
 
 	providerClient := g.registry.Get(providerName)
 	if providerClient == nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] provider not found: name=%s, model=%s", providerName, realModel)
+		}
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider not found", providerName)
 		return
 	}
@@ -225,25 +255,47 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	// ── 透传 vs 翻译 ──
 	// ingress 协议 == provider 协议时，直接透传原始 body，零损耗
 	providerType := info.Version
+	if g.verboseLevel >= 2 {
+		log.Printf("[route] protocol ingress=%s → provider=%s", ingressProtocol, providerType)
+	}
+
 	if ingressProtocol == providerType {
+		if g.verboseLevel >= 2 {
+			log.Printf("[route] PASSTHROUGH: model=%s, ingress=%s, provider=%s", realModel, ingressProtocol, providerType)
+		}
 		ctx := r.Context()
 		if stream {
+			if g.verboseLevel >= 2 {
+				log.Printf("[route] passthrough stream=true")
+			}
 			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, realModel, ingressProtocol, startTime)
 		} else {
+			if g.verboseLevel >= 2 {
+				log.Printf("[route] passthrough stream=false")
+			}
 			g.handlePassthroughNonStream(ctx, w, r, providerClient, info, body, realModel, originalModel, aliasHit, ingressProtocol, startTime)
 		}
 		return
 	}
 
 	// ── 入站翻译：协议请求 → InternalRequest ──
+	if g.verboseLevel >= 2 {
+		log.Printf("[route] TRANSLATION: model=%s, ingress=%s → provider=%s", realModel, ingressProtocol, providerType)
+	}
 	ingressTranslator := g.translatorRegistry.Get(ingressProtocol)
 	if ingressTranslator == nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] unknown protocol: %s", ingressProtocol)
+		}
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "unknown protocol", ingressProtocol)
 		return
 	}
 
 	internalReq, err := ingressTranslator.TranslateRequest(r.Context(), body)
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] translate request failed: ingress=%s, model=%s, err=%v", ingressProtocol, realModel, err)
+		}
 		g.sendError(w, ingressProtocol, http.StatusBadRequest, "translate request failed", err.Error())
 		return
 	}
@@ -262,8 +314,14 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	// ── 执行 Provider 调用 ──
 	ctx := r.Context()
 	if stream {
+		if g.verboseLevel >= 2 {
+			log.Printf("[route] translation stream=true, calling handleStreamRequest")
+		}
 		g.handleStreamRequest(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
 	} else {
+		if g.verboseLevel >= 2 {
+			log.Printf("[route] translation stream=false, calling handleNonStreamResponse")
+		}
 		g.handleNonStreamResponse(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)
 	}
 }
@@ -334,9 +392,24 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
 	realModel string, aliasModel string, aliasHit bool, ingressProtocol string, startTime time.Time) {
 
+	if g.verboseLevel >= 2 {
+		handlerStart := time.Now()
+		log.Printf("[handler] gateway-passthrough-nonstream: model=%s, alias=%s", realModel, aliasModel)
+		defer func() {
+			log.Printf("[handler] gateway-passthrough-nonstream → %v (alias=%s, model=%s)", time.Since(handlerStart), aliasModel, realModel)
+		}()
+	}
+
 	callInfo := makePassthroughInfo(info, realModel)
+	upstreamStart := time.Now()
 	resp, headers, err := client.Call(ctx, rawBody, callInfo)
+	if g.verboseLevel >= 2 {
+		log.Printf("[upstream] Call %s → %v", realModel, time.Since(upstreamStart))
+	}
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] gateway-passthrough-nonstream → Call failed: model=%s, err=%v", realModel, err)
+		}
 		latency := time.Since(startTime).Milliseconds()
 		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider error", err.Error())
@@ -349,6 +422,9 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	// 别名回显：将响应 JSON 中的 model 字段替换为客户端原始模型名
 	if aliasHit && aliasModel != "" {
 		resp = echoAliasInResponseBody(resp, aliasModel)
+		if g.verboseLevel >= 2 {
+			log.Printf("[passthrough] alias echo: %s → %s in response body", realModel, aliasModel)
+		}
 	}
 
 	for k, v := range headers {
@@ -360,6 +436,10 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(resp)
+
+	if g.verboseLevel >= 2 {
+		log.Printf("[handler] gateway-passthrough-nonstream → response=%d bytes", len(resp))
+	}
 
 	latency := time.Since(startTime).Milliseconds()
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
@@ -380,6 +460,14 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
 	realModel string, ingressProtocol string, startTime time.Time) {
 
+	if g.verboseLevel >= 2 {
+		handlerStart := time.Now()
+		log.Printf("[handler] gateway-passthrough-stream: model=%s", realModel)
+		defer func() {
+			log.Printf("[handler] gateway-passthrough-stream → %v (model=%s)", time.Since(handlerStart), realModel)
+		}()
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
@@ -394,16 +482,23 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context())
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), g.verboseLevel)
 
 	callInfo := makePassthroughInfo(info, realModel)
+	upstreamStart := time.Now()
 	lines, headers, err := client.CallStream(ctx, rawBody, callInfo)
+	if g.verboseLevel >= 2 {
+		log.Printf("[upstream] CallStream %s → %v", realModel, time.Since(upstreamStart))
+	}
 
 	close(callDone) // 停止 CallStream 期间的心跳
 	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		// SSE 错误事件，避免 superfluous response.WriteHeader
+		if g.verboseLevel >= 2 {
+			log.Printf("[sse-error] gateway-passthrough-stream → CallStream failed: %v", err)
+		}
 		errData, _ := json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]interface{}{
@@ -427,52 +522,78 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 
 	// 流式 thinking 过滤状态
 	var inThinkingBlock bool
-
-	for line := range lines {
-		var meta map[string]interface{}
-		if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
-			continue
+	streamHeartbeatStart := time.Now()
+	streamHeartbeatCount := 0
+	streamHeartbeat := time.NewTicker(500 * time.Millisecond)
+	defer func() {
+		streamHeartbeat.Stop()
+		if g.verboseLevel >= 2 {
+			log.Printf("[heartbeat] stream stopped → %v (total=%d beats)", time.Since(streamHeartbeatStart), streamHeartbeatCount)
 		}
+	}()
+	w.Write(heartbeatEvent)
+	flusher.Flush()
 
-		// 确保 SSE 数据行有 data: 前缀
-		lineStr := string(line)
-		if !strings.HasPrefix(lineStr, "data: ") && !strings.HasPrefix(lineStr, ":") && !strings.HasPrefix(lineStr, "event:") {
-			lineStr = "data: " + lineStr
-		}
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				goto streamDone
+			}
+			streamHeartbeat.Reset(500 * time.Millisecond)
+			var meta map[string]interface{}
+			if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
+				continue
+			}
 
-		// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
-		if strings.HasPrefix(lineStr, "data: ") {
-			payload := lineStr[6:] // 去掉 "data: " 前缀
-			var evt map[string]interface{}
-			if json.Unmarshal([]byte(payload), &evt) == nil {
-				evtType, _ := evt["type"].(string)
-				switch evtType {
-				case "content_block_start":
-					if cb, ok := evt["content_block"].(map[string]interface{}); ok {
-						if ct, _ := cb["type"].(string); ct == "thinking" {
-							if _, hasSig := cb["signature"]; !hasSig {
-								inThinkingBlock = true
-								continue
+			// 确保 SSE 数据行有 data: 前缀
+			lineStr := string(line)
+			if !strings.HasPrefix(lineStr, "data: ") && !strings.HasPrefix(lineStr, ":") && !strings.HasPrefix(lineStr, "event:") {
+				lineStr = "data: " + lineStr
+			}
+
+			// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
+			if strings.HasPrefix(lineStr, "data: ") {
+				payload := lineStr[6:] // 去掉 "data: " 前缀
+				var evt map[string]interface{}
+				if json.Unmarshal([]byte(payload), &evt) == nil {
+					evtType, _ := evt["type"].(string)
+					switch evtType {
+					case "content_block_start":
+						if cb, ok := evt["content_block"].(map[string]interface{}); ok {
+							if ct, _ := cb["type"].(string); ct == "thinking" {
+								if _, hasSig := cb["signature"]; !hasSig {
+									inThinkingBlock = true
+									continue
+								}
 							}
 						}
-					}
-				case "content_block_delta":
-					if inThinkingBlock {
-						continue
-					}
-				case "content_block_stop":
-					if inThinkingBlock {
-						inThinkingBlock = false
-						continue
+					case "content_block_delta":
+						if inThinkingBlock {
+							continue
+						}
+					case "content_block_stop":
+						if inThinkingBlock {
+							inThinkingBlock = false
+							continue
+						}
 					}
 				}
 			}
-		}
 
-		w.Write([]byte(lineStr))
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+			w.Write([]byte(lineStr))
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+		case <-streamHeartbeat.C:
+			streamHeartbeatCount++
+			w.Write(heartbeatEvent)
+			flusher.Flush()
+			if g.verboseLevel >= 2 {
+				log.Printf("[heartbeat] stream sent #%d → %v", streamHeartbeatCount, time.Since(streamHeartbeatStart))
+			}
+		}
 	}
+streamDone:
 
 	g.recordRequest(r, startTime, "", http.StatusOK, time.Since(startTime).Milliseconds(), "")
 }
@@ -552,8 +673,23 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	providerTranslator interface{}, ingressTranslator translator.CombinedTranslator,
 	ingressProtocol string, internalReq *schema.InternalRequest, startTime time.Time) {
 
+	if g.verboseLevel >= 2 {
+		handlerStart := time.Now()
+		log.Printf("[handler] gateway-translation-nonstream: model=%s, stream=%v", internalReq.Model, internalReq.Stream)
+		defer func() {
+			log.Printf("[handler] gateway-translation-nonstream → %v (model=%s)", time.Since(handlerStart), internalReq.Model)
+		}()
+	}
+
+	upstreamStart := time.Now()
 	resp, headers, err := client.Call(ctx, downstreamReq, info)
+	if g.verboseLevel >= 2 {
+		log.Printf("[upstream] Call %s → %v", internalReq.Model, time.Since(upstreamStart))
+	}
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] gateway-translation-nonstream → Call failed: model=%s, err=%v", internalReq.Model, err)
+		}
 		latency := time.Since(startTime).Milliseconds()
 		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "provider error", err.Error())
@@ -568,6 +704,9 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 		})
 		internalResp, err = pt.TranslateFromProvider(resp)
 		if err != nil {
+			if g.verboseLevel >= 2 {
+				log.Printf("[error] gateway-translation-nonstream → TranslateFromProvider failed: model=%s, err=%v", internalReq.Model, err)
+			}
 			latency := time.Since(startTime).Milliseconds()
 			g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 			g.sendError(w, ingressProtocol, http.StatusInternalServerError, "translate response failed", err.Error())
@@ -577,6 +716,9 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 		// OpenAI 兼容：直接解析为 InternalResponse（用 CC 翻译器转换）
 		var ccResp chatcompletion.ChatCompletionResponse
 		if err := json.Unmarshal(resp, &ccResp); err != nil {
+			if g.verboseLevel >= 2 {
+				log.Printf("[error] gateway-translation-nonstream → json.Unmarshal failed: model=%s, err=%v", internalReq.Model, err)
+			}
 			latency := time.Since(startTime).Milliseconds()
 			g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 			g.sendError(w, ingressProtocol, http.StatusInternalServerError, "parse response failed", err.Error())
@@ -591,6 +733,9 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	}
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
+		if g.verboseLevel >= 2 {
+			log.Printf("[error] gateway-translation-nonstream → TranslateResponse failed: model=%s, err=%v", internalReq.Model, err)
+		}
 		latency := time.Since(startTime).Milliseconds()
 		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "encode response failed", err.Error())
@@ -607,6 +752,10 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(outgoingResp)
+
+	if g.verboseLevel >= 2 {
+		log.Printf("[handler] gateway-translation-nonstream → response=%d bytes", len(outgoingResp))
+	}
 
 	latency := time.Since(startTime).Milliseconds()
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
@@ -627,6 +776,14 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	providerTranslator interface{}, ingressTranslator translator.CombinedTranslator,
 	ingressProtocol string, internalReq *schema.InternalRequest, startTime time.Time) {
 
+	if g.verboseLevel >= 2 {
+		handlerStart := time.Now()
+		log.Printf("[handler] gateway-translation-stream: model=%s, stream=%v", internalReq.Model, internalReq.Stream)
+		defer func() {
+			log.Printf("[handler] gateway-translation-stream → %v (model=%s)", time.Since(handlerStart), internalReq.Model)
+		}()
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		g.sendError(w, ingressProtocol, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
@@ -641,15 +798,22 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context())
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), g.verboseLevel)
 
+	upstreamStart := time.Now()
 	lines, _, err := client.CallStream(ctx, downstreamReq, info)
+	if g.verboseLevel >= 2 {
+		log.Printf("[upstream] CallStream %s → %v", internalReq.Model, time.Since(upstreamStart))
+	}
 
 	close(callDone) // 停止 CallStream 期间的心跳
 	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
 		// SSE 错误事件，避免 superfluous response.WriteHeader
+		if g.verboseLevel >= 2 {
+			log.Printf("[sse-error] gateway-stream → CallStream failed: %v", err)
+		}
 		errData, _ := json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]interface{}{

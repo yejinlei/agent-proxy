@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"time"
 )
@@ -19,22 +20,42 @@ import (
 //
 // StartSSEHeartbeat 启动 SSE 心跳 goroutine，在等待上游响应期间定期发送心跳事件。
 // 返回 callDone 和 callFinished 通道用于控制心跳生命周期。
-func StartSSEHeartbeat(w http.ResponseWriter, flusher http.Flusher, ctx context.Context) (callDone chan struct{}, callFinished chan struct{}) {
+func StartSSEHeartbeat(w http.ResponseWriter, flusher http.Flusher, ctx context.Context, verboseLevel int) (callDone chan struct{}, callFinished chan struct{}) {
 	callDone = make(chan struct{})
 	callFinished = make(chan struct{})
 	go func() {
+		heartbeatStart := time.Now()
+		heartbeatCount := 0
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		defer close(callFinished)
+		defer func() {
+			if verboseLevel >= 2 {
+				log.Printf("[heartbeat] stopped → %v (total=%d beats)", time.Since(heartbeatStart), heartbeatCount)
+			}
+		}()
+		if verboseLevel >= 2 {
+			log.Printf("[heartbeat] started → interval=500ms")
+		}
 		for {
 			select {
 			case <-callDone:
+				if verboseLevel >= 2 {
+					log.Printf("[heartbeat] callDone received → %v", time.Since(heartbeatStart))
+				}
 				return
 			case <-ctx.Done():
+				if verboseLevel >= 2 {
+					log.Printf("[heartbeat] ctx.Done received → %v", time.Since(heartbeatStart))
+				}
 				return
 			case <-ticker.C:
+				heartbeatCount++
 				w.Write(heartbeatEvent)
 				flusher.Flush()
+				if verboseLevel >= 2 {
+					log.Printf("[heartbeat] sent #%d → %v", heartbeatCount, time.Since(heartbeatStart))
+				}
 			}
 		}
 	}()
