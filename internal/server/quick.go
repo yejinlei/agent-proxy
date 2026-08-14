@@ -831,15 +831,11 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 502,
-			"data":    fmt.Sprintf("stream error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		// @AI_GUARD: STREAM_ERROR_FORMAT - 流式错误必须用标准 Anthropic SSE error 格式
+		// @CONSTRAINT: 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
+		//   - 必须发送 message_stop 终止 SSE 流
+		//   - 不能使用 _type/_status 内部字段
+		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
 		return
 	}
 
@@ -867,10 +863,9 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 				if meta["_type"] == "headers" {
 					// 已在上方透传，跳过
 				} else if meta["_type"] == "error" {
-					w.Write([]byte("event: error\ndata: "))
-					w.Write(line)
-					w.Write([]byte("\n\n"))
-					flusher.Flush()
+					// 上游 provider 内部错误 → 转为标准 Anthropic SSE error 事件
+					errData, _ := meta["data"].(string)
+					sendSSEErrorBody(w, flusher, "api_error", errData)
 					return
 				} else {
 					// 过滤非标准 thinking 内容块：SenseNova 的 DeepSeek 模型返回
@@ -1074,17 +1069,10 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
-		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 400,
-			"data":    fmt.Sprintf("read body: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
-		close(callDone)
+		// @AI_GUARD: READ_BODY_ERROR - 必须先停止心跳再写错误，防止并发写
+		close(callDone) // 停止心跳
+		<-callFinished  // 等待心跳 goroutine 退出
+		sendSSEErrorBody(w, flusher, "invalid_request_error", fmt.Sprintf("read body: %v", err))
 		return
 	}
 	// 命中别名映射时，同步改写请求体中的 model 字段
@@ -1100,15 +1088,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v",
 			aliasModel, realModel, q.proxyBaseURL, len(body), err)
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 502,
-			"data":    fmt.Sprintf("stream error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
 		return
 	}
 
@@ -1150,13 +1130,16 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					errJSON, _ := json.Marshal(map[string]interface{}{
 						"type": "error",
 						"error": map[string]interface{}{
-							"type":    "upstream_error",
+							"type":    "api_error",
 							"message": errData,
 						},
 					})
 					w.Write([]byte("event: error\ndata: "))
 					w.Write(errJSON)
 					w.Write([]byte("\n\n"))
+					// 发送 message_stop 终止 SSE 流，防止客户端等待超时
+					w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+					flusher.Flush()
 					return
 				}
 			}
@@ -1198,6 +1181,70 @@ streamDone:
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = body
 	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
+}
+
+// sendSSEErrorFromUpstream 将上游错误转为合法的 Anthropic SSE error 事件并发送
+// 解析 provider 错误格式 "HTTP %d: <body>"，提取上游错误 JSON 中的 type/message 字段
+// 如果上游返回的是合法错误 JSON（如 {"type":"error","error":{...}}），直接透传
+// 否则包装为通用错误格式
+// 错误事件后发送 message_stop 以正确终止 SSE 流
+// @AI_GUARD: SSE_ERROR_TRANSPARENCY - 上游错误必须透明传递，不丢失信息
+func sendSSEErrorFromUpstream(w http.ResponseWriter, flusher http.Flusher, err error) {
+	errStr := err.Error()
+	errorType := "api_error"
+	errorMessage := errStr
+
+	// provider 错误格式：HTTP %d: <json_body>
+	// 尝试从 "HTTP XXX: " 后提取上游错误 JSON
+	if idx := strings.IndexByte(errStr, ':'); idx > 0 && strings.HasPrefix(errStr[:idx], "HTTP ") {
+		bodyStr := strings.TrimSpace(errStr[idx+1:])
+		var upstreamErr map[string]interface{}
+		if json.Unmarshal([]byte(bodyStr), &upstreamErr) == nil {
+			// 检查是否是标准错误格式 {"type":"error","error":{...}}
+			if errType, ok := upstreamErr["type"].(string); ok && errType == "error" {
+				// 直接透传上游错误体
+				errJSON, _ := json.Marshal(upstreamErr)
+				w.Write([]byte("event: error\ndata: "))
+				w.Write(errJSON)
+				w.Write([]byte("\n\n"))
+				// 发送 message_stop 终止 SSE 流
+				w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+				flusher.Flush()
+				return
+			}
+			// 如果是其他错误格式，提取 error.message
+			if errObj, ok := upstreamErr["error"].(map[string]interface{}); ok {
+				if t, ok := errObj["type"].(string); ok && t != "" {
+					errorType = t
+				}
+				if m, ok := errObj["message"].(string); ok && m != "" {
+					errorMessage = m
+				}
+			}
+		}
+	}
+
+	sendSSEErrorBody(w, flusher, errorType, errorMessage)
+}
+
+// sendSSEErrorBody 发送标准 Anthropic SSE error 事件 + message_stop
+// @AI_GUARD: SSE_ERROR_BODY - 所有 SSE 错误出口必须统一使用此函数
+// @CONSTRAINT: 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
+//   - 必须发送 message_stop 终止 SSE 流（否则客户端等待超时）
+func sendSSEErrorBody(w http.ResponseWriter, flusher http.Flusher, errorType, errorMessage string) {
+	errJSON, _ := json.Marshal(map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    errorType,
+			"message": errorMessage,
+		},
+	})
+	w.Write([]byte("event: error\ndata: "))
+	w.Write(errJSON)
+	w.Write([]byte("\n\n"))
+	// 发送 message_stop 终止 SSE 流
+	w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	flusher.Flush()
 }
 
 // probeStreamPrefer 后台异步探测 SSE 速度，完成后写入 streamPrefer 偏好
@@ -1571,19 +1618,16 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError（会触发 superfluous response.WriteHeader）
 		// 直接写入 SSE 错误事件
+		// @AI_GUARD: PASSTHROUGH_ERROR_HANDLING - 上游错误必须转为合法 Anthropic SSE error 事件
+		// @CONSTRAINT: 错误事件后必须发送 message_stop 终止 SSE 流，否则客户端等待超时
+		//   - 解析上游错误体，提取 error type/message 而非原样嵌套
+		//   - 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
+		//   - 如果上游返回的是合法错误 JSON（如 {"type":"error","error":{...}}），直接透传
+		// @REASON: 原代码将上游错误嵌套为 "upstream error: HTTP 400: {...}" 字符串，
+		//   message 字段含转义 JSON，Claude Code 解析困难 → "empty or malformed response (HTTP 200)"
 		log.Printf("[passthrough] nonstream-as-sse error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"type": "error",
-			"error": map[string]interface{}{
-				"type":    "upstream_error",
-				"message": fmt.Sprintf("upstream error: %v", err),
-			},
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		sendSSEErrorFromUpstream(w, flusher, err)
 		return
 	}
 
@@ -1731,13 +1775,11 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	<-callFinished  // 等待心跳 goroutine 退出，防止与后续 SSE 写入并发
 	cancel()
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type": "error", "_status": 502, "data": fmt.Sprintf("upstream error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		// @AI_GUARD: NONSTREAM_AS_SSE_ERROR - 翻译路径错误必须用标准 Anthropic SSE error 格式
+		// @CONSTRAINT: 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
+		//   - 必须发送 message_stop 终止 SSE 流
+		//   - 不能使用 _type/_status 内部字段（客户端无法解析）
+		sendSSEErrorFromUpstream(w, flusher, err)
 		return
 	}
 
@@ -1749,25 +1791,16 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 		})
 		internalResp, err = pt.TranslateFromProvider(resp)
 		if err != nil {
-			errJSON, _ := json.Marshal(map[string]interface{}{
-				"_type": "error", "_status": 500, "data": fmt.Sprintf("translate error: %v", err),
-			})
-			w.Write([]byte("event: error\ndata: "))
-			w.Write(errJSON)
-			w.Write([]byte("\n\n"))
+			// 翻译错误必须用标准 Anthropic SSE error 格式
+			sendSSEErrorFromUpstream(w, flusher, err)
 			flusher.Flush()
 			return
 		}
 	} else {
 		var ccResp chatcompletion.ChatCompletionResponse
 		if err := json.Unmarshal(resp, &ccResp); err != nil {
-			errJSON, _ := json.Marshal(map[string]interface{}{
-				"_type": "error", "_status": 500, "data": fmt.Sprintf("parse error: %v", err),
-			})
-			w.Write([]byte("event: error\ndata: "))
-			w.Write(errJSON)
-			w.Write([]byte("\n\n"))
-			flusher.Flush()
+			// 解析错误必须用标准 Anthropic SSE error 格式
+			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("parse error: %w", err))
 			return
 		}
 		internalResp = chatCompletionToInternal(&ccResp)
@@ -1781,13 +1814,8 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type": "error", "_status": 500, "data": fmt.Sprintf("encode error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		// @AI_GUARD: STREAM_TRANSLATE_ERROR - 翻译错误必须用标准 Anthropic SSE error 格式
+		sendSSEErrorBody(w, flusher, "internal_error", fmt.Sprintf("encode error: %v", err))
 		return
 	}
 
@@ -1866,15 +1894,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[stream] upstream stream error: %s err=%v", q.proxyBaseURL, err)
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 502,
-			"data":    fmt.Sprintf("stream error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
 		return
 	}
 
@@ -2645,15 +2665,7 @@ func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx conte
 	if err != nil {
 		log.Printf("[passthrough] upstream stream error: %s url=%s body_len=%d err=%v",
 			aliasModel, q.proxyBaseURL, len(body), err)
-		errJSON, _ := json.Marshal(map[string]interface{}{
-			"_type":   "error",
-			"_status": 502,
-			"data":    fmt.Sprintf("stream error: %v", err),
-		})
-		w.Write([]byte("event: error\ndata: "))
-		w.Write(errJSON)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
 		return
 	}
 
