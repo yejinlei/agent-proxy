@@ -346,17 +346,26 @@ func mapResponsesStatus(status string, stopReason string) string {
 
 // @AI_GUARD: RESPONSES_TRANSLATE_STREAM - InternalStreamEvent → OpenAI Responses SSE（流式出口）
 // @CONSTRAINT: OpenAI Responses SSE 格式为 "data: <json>\n\n"，结束标记为 "data: [DONE]\n\n"
-//   - ctx.Done() 时发送 [DONE] 结束
+//   - channel 关闭或 ctx.Done() 时必须补发 response.completed 再发 [DONE]
+//   - 不可只发 [DONE]（Codex 报 "stream closed before response.completed"）
 //
 // @RELATED: chatcompletion/translator.go TranslateStream (格式相同), anthropic/translator.go TranslateStream (格式不同)
 func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	for {
 		select {
 		case <-ctx.Done():
+			// ctx 取消时也补发 response.completed，确保客户端收到完整事件序列
+			raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &EventData{Type: "response"}})
+			fn(append([]byte("event: response.completed\ndata: "), raw...), false)
+			fn([]byte("\n\n"), false)
 			fn([]byte("data: [DONE]\n\n"), true)
 			return
 		case event, ok := <-events:
 			if !ok {
+				// channel 关闭但未收到 done 事件（上游 [DONE] 无 FinishReason）→ 补发 response.completed
+				raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &EventData{Type: "response"}})
+				fn(append([]byte("event: response.completed\ndata: "), raw...), false)
+				fn([]byte("\n\n"), false)
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
@@ -369,12 +378,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				continue
 
 			case "start":
+				// start 事件始终发送 response.created（即使 ID 为空），
+				// 否则 Codex 报 "stream closed before response.completed"
+				eventData := EventData{Type: "response"}
 				if event.Data != nil && event.Data.ID != "" {
-					eventData := EventData{ID: event.Data.ID, Type: "response"}
-					raw, _ := json.Marshal(StreamEvent{Type: "response.created", Data: &eventData})
-					fn(append([]byte("event: response.created\ndata: "), raw...), false)
-					fn([]byte("\n\n"), false)
+					eventData.ID = event.Data.ID
 				}
+				raw, _ := json.Marshal(StreamEvent{Type: "response.created", Data: &eventData})
+				fn(append([]byte("event: response.created\ndata: "), raw...), false)
+				fn([]byte("\n\n"), false)
 				continue
 
 			case "delta":

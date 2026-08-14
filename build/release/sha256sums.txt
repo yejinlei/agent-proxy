@@ -1,0 +1,4 @@
+f6095af1609732d24f75a7834f4b6d3a49c98759dfaaae279e5bb165a97054b9  agent-proxy-windows-amd64.exe
+09ee4acd12bd9ea6db5c21c178c8c53d6b50751cbb31ef45889cc4eebe68eb2b  agent-proxy-linux-amd64
+e6ccb5dd23adf985c741150829bf7a605c29c1900f9cf9d2ef81b20b9cab595a  agent-proxy-darwin-amd64
+847c46049e78ddbb1483391ad0cef9a3b9af5c5735a37f76cc3c4269dd57f0e6  agent-proxy-darwin-arm64

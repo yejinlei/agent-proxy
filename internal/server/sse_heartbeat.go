@@ -4,8 +4,42 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
+
+// MutexSSEWriter wraps http.ResponseWriter and http.Flusher with a mutex
+// to prevent concurrent writes between heartbeat goroutine and TranslateStream callback.
+// Go's http.ResponseWriter is NOT thread-safe — concurrent Write calls corrupt SSE output.
+type MutexSSEWriter struct {
+	w  http.ResponseWriter
+	f  http.Flusher
+	mu *sync.Mutex
+}
+
+func NewMutexSSEWriter(w http.ResponseWriter, f http.Flusher) *MutexSSEWriter {
+	return &MutexSSEWriter{w: w, f: f, mu: &sync.Mutex{}}
+}
+
+func (m *MutexSSEWriter) Write(data []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.w.Write(data)
+}
+
+func (m *MutexSSEWriter) Header() http.Header {
+	return m.w.Header()
+}
+
+func (m *MutexSSEWriter) WriteHeader(statusCode int) {
+	m.w.WriteHeader(statusCode)
+}
+
+func (m *MutexSSEWriter) Flush() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.f.Flush()
+}
 
 // @AI_GUARD: SSE_HEARTBEAT_FACTORY - 统一心跳 goroutine 工厂，所有 handler 必须使用此函数
 // @CONSTRAINT: 调用方必须遵循 close(callDone) → <-callFinished 清理顺序（顺序不可颠倒）

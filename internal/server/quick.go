@@ -52,16 +52,18 @@ type QuickGateway struct {
 	streamPrefer   map[string]bool // baseURL -> true=非流式更快, false=SSE 更快; key 不存在=未探测
 }
 
-// 心跳格式：SSE 注释行（RFC 6455 §3.4）
+// 心跳格式：Anthropic 标准 ping 事件（必须包含 event: ping 前缀）
 // @AI_GUARD: SSE_HEARTBEAT_FORMAT - 心跳格式绝对不可修改
-// @CONSTRAINT: 必须用 SSE 注释格式 ": heartbeat\n\n"，不可改为 data: 行
+// @CONSTRAINT: 必须用 event: ping\ndata: {"type":"ping"}\n\n 格式
 //   - data: {}\n\n → Claude Code 解析为 Anthropic 事件，缺少 type 字段 → 解析失败
 //   - data: \n\n → Kimi 等严格客户端对空行做 JSON.parse 报错
-//     -: heartbeat\n\n → RFC 6455 §3.4 注释格式，客户端忽略但重置 TCP 超时计时器
+//   - : heartbeat\n\n → SSE 注释，Claude Code 不识别为"内容活动"，不重置 HTTP 超时 → 长上游响应时客户端断开
+//   - data: {"type":"ping"}\n\n → 缺少 event: 前缀，Claude Code 不识别为 ping 事件，不重置超时 → 仍报 empty response
+//   - event: ping\ndata: {"type":"ping"}\n\n → 完整 Anthropic SSE 格式，Claude Code 正确识别并重置超时 ✅
 //
 // @RELATED: all handlePassthrough* / handleNonStream* handlers that write heartbeat
-// @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n，均导致不同客户端崩溃
-var heartbeatEvent = []byte(": heartbeat\n\n")
+// @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n、: heartbeat\n\n、data: {"type":"ping"}，各有问题
+var heartbeatEvent = []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
@@ -698,6 +700,76 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 	return json.RawMessage(out)
 }
 
+// fixNullUsageInResponse 修复透传响应中 usage 为 null 的问题
+// Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
+// 上游（如 sensenova）可能返回 "usage": null，需要补默认值 {"input_tokens":0,"output_tokens":0}
+func fixNullUsageInResponse(resp json.RawMessage) json.RawMessage {
+	if len(resp) == 0 {
+		return resp
+	}
+	// 快速检测：如果包含 "usage":null 或不包含 "usage" 键，需要修复
+	hasNullUsage := bytes.Contains(resp, []byte(`"usage":null`)) || bytes.Contains(resp, []byte(`"usage": null`))
+	hasUsageKey := bytes.Contains(resp, []byte(`"usage":`))
+	if !hasNullUsage && hasUsageKey {
+		return resp
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return resp
+	}
+
+	// 检测响应格式：Anthropic（有 content 数组）/ ChatCompletion（有 choices 数组）
+	isAnthropic := false
+	isCC := false
+	if _, ok := raw["content"].([]interface{}); ok {
+		isAnthropic = true
+	}
+	if _, ok := raw["choices"].([]interface{}); ok {
+		isCC = true
+	}
+
+	needsFix := false
+	usageVal, usageExists := raw["usage"]
+	if !usageExists {
+		needsFix = true
+	} else if usageVal == nil {
+		needsFix = true
+	}
+
+	if !needsFix {
+		return resp
+	}
+
+	if isAnthropic {
+		raw["usage"] = map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		}
+	} else if isCC {
+		raw["usage"] = map[string]interface{}{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		}
+	} else {
+		// 未知格式：同时写入两种字段，安全兜底
+		raw["usage"] = map[string]interface{}{
+			"input_tokens":      0,
+			"output_tokens":     0,
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		}
+	}
+
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return resp
+	}
+	return json.RawMessage(out)
+}
+
 // echoAliasInStreamLine 将流式 SSE 行中的 model 字段回显为客户端原始模型名
 // 使用字符串替换，保持原始 JSON 结构不变。
 func echoAliasInStreamLine(line json.RawMessage, aliasModel string) json.RawMessage {
@@ -1001,6 +1073,10 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	// "API returned an empty or malformed response (HTTP 200)" 错误
 	outResp = stripThinkingContentBlocks(outResp)
 
+	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
+	// 上游（如 sensenova）可能返回 usage: null，需要补默认值
+	outResp = fixNullUsageInResponse(outResp)
+
 	if _, err := w.Write(outResp); err != nil {
 		log.Printf("[passthrough] write error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
@@ -1111,6 +1187,15 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					errData, _ := meta["data"].(string)
 					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
 						aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
+					// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
+					// id 和 model 不能为空，否则 Claude Code 报 "empty or malformed response"
+					msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+					echoModel := realModel
+					if aliasHit && aliasModel != "" {
+						echoModel = aliasModel
+					}
+					w.Write([]byte(`event: message_start` + "\n" +
+						fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID, echoModel) + "\n\n"))
 					// SSE 流已开始后不能再修改 HTTP 状态码，写入标准 SSE 错误事件
 					errJSON, _ := json.Marshal(map[string]interface{}{
 						"type": "error",
@@ -1122,8 +1207,8 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					w.Write([]byte("event: error\ndata: "))
 					w.Write(errJSON)
 					w.Write([]byte("\n\n"))
-					// 发送 message_stop 终止 SSE 流，防止客户端等待超时
-					w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+					// 发送 message_stop 终止 SSE 流（带 event: 前缀）
+					w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 					flusher.Flush()
 					return
 				}
@@ -1245,13 +1330,17 @@ func sendSSEErrorFromUpstream(w http.ResponseWriter, flusher http.Flusher, err e
 		if json.Unmarshal([]byte(bodyStr), &upstreamErr) == nil {
 			// 检查是否是标准错误格式 {"type":"error","error":{...}}
 			if errType, ok := upstreamErr["type"].(string); ok && errType == "error" {
+				// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
+				msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+				w.Write([]byte(`event: message_start` + "\n" +
+					fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID) + "\n\n"))
 				// 直接透传上游错误体
 				errJSON, _ := json.Marshal(upstreamErr)
 				w.Write([]byte("event: error\ndata: "))
 				w.Write(errJSON)
 				w.Write([]byte("\n\n"))
-				// 发送 message_stop 终止 SSE 流
-				w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+				// 发送 message_stop 终止 SSE 流（带 event: 前缀）
+				w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 				flusher.Flush()
 				return
 			}
@@ -1272,9 +1361,17 @@ func sendSSEErrorFromUpstream(w http.ResponseWriter, flusher http.Flusher, err e
 
 // sendSSEErrorBody 发送标准 Anthropic SSE error 事件 + message_stop
 // @AI_GUARD: SSE_ERROR_BODY - 所有 SSE 错误出口必须统一使用此函数
-// @CONSTRAINT: 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
+// @CONSTRAINT: 错误事件格式：message_start → event: error → event: message_stop
+//   - 必须先发 message_start（Claude Code 要求 SSE 事件序列以 message_start 开头，否则报 "empty or malformed response"）
 //   - 必须发送 message_stop 终止 SSE 流（否则客户端等待超时）
+//   - message_stop 必须带 event: 前缀（Anthropic 标准 SSE 事件格式）
 func sendSSEErrorBody(w http.ResponseWriter, flusher http.Flusher, errorType, errorMessage string) {
+	// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
+	// id 不能为空，否则 Claude Code 报 "empty or malformed response"
+	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	w.Write([]byte(`event: message_start` + "\n" +
+		fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID) + "\n\n"))
+
 	errJSON, _ := json.Marshal(map[string]interface{}{
 		"type": "error",
 		"error": map[string]interface{}{
@@ -1285,8 +1382,8 @@ func sendSSEErrorBody(w http.ResponseWriter, flusher http.Flusher, errorType, er
 	w.Write([]byte("event: error\ndata: "))
 	w.Write(errJSON)
 	w.Write([]byte("\n\n"))
-	// 发送 message_stop 终止 SSE 流
-	w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	// 发送 message_stop 终止 SSE 流（带 event: 前缀）
+	w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	flusher.Flush()
 }
 
@@ -1374,15 +1471,15 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 			// 按 Anthropic 标准构造 message_start 事件：
 			// - type: "message" 必填
 			// - stop_reason: null（流式开始时为 null，结束时在 message_delta 给出）
-			// - usage: {input_tokens, output_tokens:1}（必须是对象，不能为 null）
+			// - usage: {input_tokens, output_tokens:0}（必须是对象，不能为 null；流式开始 output_tokens 为 0，最终值在 message_delta）
 			inputTokens := 0
 			if usage != nil {
 				inputTokens = usage.PromptTokens
 			}
 			messageStart := fmt.Sprintf(
-				`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":%d,"output_tokens":1}}}`,
+				`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":%d,"output_tokens":0}}}`,
 				msgID, effectiveModel, inputTokens)
-			if !writeSSE(w, []byte("data: "+messageStart+"\n\n")) {
+			if !writeSSE(w, []byte("event: message_start\ndata: "+messageStart+"\n\n")) {
 				return usage
 			}
 
@@ -1411,7 +1508,7 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 				if err != nil {
 					continue
 				}
-				if !writeSSE(w, []byte("data: "+string(blockStartJSON)+"\n\n")) {
+				if !writeSSE(w, []byte("event: content_block_start\ndata: "+string(blockStartJSON)+"\n\n")) {
 					return usage
 				}
 
@@ -1451,7 +1548,7 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 				if err != nil || len(deltaJSON) == 0 {
 					continue
 				}
-				if !writeSSE(w, []byte("data: "+string(deltaJSON)+"\n\n")) {
+				if !writeSSE(w, []byte("event: content_block_delta\ndata: "+string(deltaJSON)+"\n\n")) {
 					return usage
 				}
 
@@ -1463,23 +1560,25 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 				if err != nil {
 					continue
 				}
-				if !writeSSE(w, []byte("data: "+string(blockStopJSON)+"\n\n")) {
+				if !writeSSE(w, []byte("event: content_block_stop\ndata: "+string(blockStopJSON)+"\n\n")) {
 					return usage
 				}
 			}
 
 			// message_delta: 按 Anthropic 标准，usage 仅含 output_tokens（input_tokens 已在 message_start 给出）
-			// delta 必须包含 stop_sequence:null
+			// delta 必须包含 stop_sequence:null；usage 始终存在（即使为 0），确保客户端能解析 K.usage
+			outputTokens := 0
 			if usage != nil {
-				messageDelta := fmt.Sprintf(
-					`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`,
-					stopReason, usage.CompletionTokens)
-				if !writeSSE(w, []byte("data: "+messageDelta+"\n\n")) {
-					return usage
-				}
+				outputTokens = usage.CompletionTokens
+			}
+			messageDelta := fmt.Sprintf(
+				`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`,
+				stopReason, outputTokens)
+			if !writeSSE(w, []byte("event: message_delta\ndata: "+messageDelta+"\n\n")) {
+				return usage
 			}
 			// message_stop
-			if !writeSSE(w, []byte("data: {\"type\":\"message_stop\"}\n\n")) {
+			if !writeSSE(w, []byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")) {
 				return usage
 			}
 			flusher.Flush()
@@ -1621,6 +1720,18 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 // @REASON: 历史血泪教训 - 心跳 goroutine 先触发 WriteHeader(200)，上游返回 400 时无法修改为正确状态码，
 //
 //	Claude Code 看到 HTTP 200 + event:error → 解析为 "API returned an empty or malformed response (HTTP 200)"
+//
+// @AI_GUARD: PASSTHROUGH_NONSTREAM_AS_SSE - 透传非流→SSE 包装，必须同步 gateway.go
+// @CONSTRAINT: 心跳必须在 Call 之前启动，防止上游慢响应（> 30s）时客户端超时断开
+//   - 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
+//   - 启动心跳 goroutine，在 Call 阻塞期间持续发送心跳
+//   - Call 返回后先停心跳 (close(callDone) → <-callFinished) 再写 SSE 响应
+//   - 错误路径：SSE 头已设置，必须发 SSE error 事件
+//
+// @RELATED: StartSSEHeartbeat, writeNonStreamAsSSE, handleNonStreamResponseAsSSE (翻译路径对应)
+// @REASON: 历史血泪教训 - 心跳在 Call 之后启动，71s 上游响应期间 0 beats，
+//
+//	客户端超时断开报 "API returned an empty or malformed response (HTTP 200)"
 func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
 
@@ -1639,8 +1750,22 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
 	}
 
-	// 先调用上游，再决定 HTTP 状态码
-	// 非流式上游调用响应时间通常很短（< 5s），不需要心跳
+	// 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// 在 Call 阻塞等待上游响应期间发送 SSE 心跳
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), q.verboseLevel)
+
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	upstreamStart := time.Now()
 	respBody, _, err := p.Call(callCtx, nsBody, callInfo)
@@ -1648,21 +1773,12 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	if q.verboseLevel >= 2 {
 		log.Printf("[upstream] Call %s → %v", realModel, time.Since(upstreamStart))
 	}
+	close(callDone) // 停止心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+
 	if err != nil {
-		// 上游返回错误，直接返回 JSON 错误响应（非 SSE）
-		// 解析上游错误 JSON，提取 type/message 字段
 		log.Printf("[passthrough] nonstream-as-sse error: %s=%s url=%s err=%v",
 			aliasModel, realModel, q.proxyBaseURL, err)
-		// 客户端期望 SSE 格式，必须发 SSE 错误而非 JSON
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			sendUpstreamErrorAsJSON(w, err)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
 		if q.verboseLevel >= 2 {
 			log.Printf("[sse-error] passthrough-nonstream-as-sse → SSE error event (was JSON)")
 		}
@@ -1670,21 +1786,6 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		flusher.Flush()
 		return
 	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
-		return
-	}
-
-	// 上游成功，设置 SSE 头
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	// 启动心跳，防止客户端在 writeNonStreamAsSSE 期间超时
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), q.verboseLevel)
 
 	// 回显客户端模型名（嵌入到 SSE 事件的 model 字段）
 	effectiveModel := realModel
@@ -1695,10 +1796,10 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	// 过滤 thinking 内容块（同 handlePassthroughNonStream）
 	respBody = stripThinkingContentBlocks(respBody)
 
-	usage := q.writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
+	respBody = fixNullUsageInResponse(respBody)
 
-	close(callDone) // 停止心跳
-	<-callFinished  // 等待心跳 goroutine 退出
+	usage := q.writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = nsBody
@@ -1804,6 +1905,15 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 //
 // @RELATED: CALLDONE_CALLFINISHED (同步模式), writeNonStreamAsSSE, handlePassthroughNonStreamAsSSE (透传路径对应)
 // @REASON: 历史血泪教训 - 遗漏 <-callFinished 导致心跳与 SSE 响应并发写入 http.ResponseWriter，Claude Code 解析到损坏 SSE 后报 "API returned an empty or malformed response (HTTP 200)"
+// @AI_GUARD: NONSTREAM_RESPONSE_AS_SSE - 翻译路径非流式→SSE 包装
+// @CONSTRAINT: 心跳必须在 Call 之前启动，防止上游慢响应时客户端超时断开
+//   - 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
+//   - 启动心跳 goroutine，在 Call 阻塞期间持续发送心跳
+//   - Call 返回后先停心跳 (close(callDone) → <-callFinished) 再处理响应
+//   - 错误路径：SSE 头已设置，必须发 SSE error 事件
+//
+// @RELATED: StartSSEHeartbeat, handlePassthroughNonStreamAsSSE (透传路径对应)
+// @REASON: 历史血泪教训 - 心跳在 Call 之后启动，上游慢响应期间 0 beats，客户端超时断开
 func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
 	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
@@ -1816,7 +1926,23 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 			log.Printf("[handler] translation-nonstream-as-sse → %v (model=%s)", time.Since(handlerStart), internalReq.Model)
 		}()
 	}
-	// 先调用上游，再决定 HTTP 状态码
+
+	// 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// 在 Call 阻塞等待上游响应期间发送 SSE 心跳
+	callDone, callFinished := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
+
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	upstreamStart := time.Now()
 	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
@@ -1824,17 +1950,10 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	if q.verboseLevel >= 2 {
 		log.Printf("[upstream] Call %s → %v", internalReq.Model, time.Since(upstreamStart))
 	}
+	close(callDone) // 停止心跳
+	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+
 	if err != nil {
-		// 客户端期望 SSE 格式，必须发 SSE 错误而非 JSON
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			sendUpstreamErrorAsJSON(w, err)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
 		if q.verboseLevel >= 2 {
 			log.Printf("[sse-error] translation-nonstream-as-sse → SSE error event (was JSON)")
 		}
@@ -1842,21 +1961,6 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 		flusher.Flush()
 		return
 	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		q.sendError(w, http.StatusInternalServerError, "streaming not supported", "server does not support streaming")
-		return
-	}
-
-	// 上游成功，设置 SSE 头
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	// 启动心跳，防止客户端在 writeNonStreamAsSSE 期间超时
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
 
 	// ── 出 Provider 翻译：Provider 响应 → InternalResponse ──
 	var internalResp *schema.InternalResponse
@@ -1866,9 +1970,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 		})
 		internalResp, err = pt.TranslateFromProvider(resp)
 		if err != nil {
-			close(callDone) // 停止心跳
-			<-callFinished  // 等待心跳 goroutine 退出
-			// 翻译错误必须用标准 Anthropic SSE error 格式
+			// 心跳已停止（Call 返回后 close(callDone)），此处直接写 SSE 错误
 			if q.verboseLevel >= 2 {
 				log.Printf("[sse-error] translation-nonstream-as-sse → TranslateFromProvider failed: %v", err)
 			}
@@ -1879,9 +1981,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	} else {
 		var ccResp chatcompletion.ChatCompletionResponse
 		if err := json.Unmarshal(resp, &ccResp); err != nil {
-			close(callDone) // 停止心跳
-			<-callFinished  // 等待心跳 goroutine 退出
-			// 解析错误必须用标准 Anthropic SSE error 格式
+			// 心跳已停止，直接写 SSE 错误
 			if q.verboseLevel >= 2 {
 				log.Printf("[sse-error] translation-nonstream-as-sse → json.Unmarshal failed: %v", err)
 			}
@@ -1899,9 +1999,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
-		// @AI_GUARD: STREAM_TRANSLATE_ERROR - 翻译错误必须用标准 Anthropic SSE error 格式
-		close(callDone) // 停止心跳
-		<-callFinished  // 等待心跳 goroutine 退出
+		// 心跳已停止，直接写 SSE 错误
 		if q.verboseLevel >= 2 {
 			log.Printf("[sse-error] translation-nonstream-as-sse → TranslateResponse failed: %v", err)
 		}
@@ -1921,9 +2019,6 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	effectiveModel := internalResp.Model
 	usage := q.writeNonStreamAsSSE(w, flusher, outgoingResp, effectiveModel)
 
-	close(callDone) // 停止心跳
-	<-callFinished  // 等待心跳 goroutine 退出
-
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamResp = resp
 	vctx.outgoingBody = outgoingResp
@@ -1940,6 +2035,16 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 // @RELATED: TranslateStreamEvent (各翻译器), TranslateStream (入站翻译器)
 // @REASON: 历史血泪教训 - 修改 SSE 事件格式后未同步 TranslateStream，导致 Kimi 解析失败
 // handleStreamRequest 流式请求
+// @AI_GUARD: HANDLE_STREAM_REQUEST - 翻译路径流式处理，必须同步 gateway.go
+// @CONSTRAINT: 两阶段心跳保护：
+//   - 阶段 1: CallStream 期间的心跳（保护 HTTP 连接建立）
+//   - 阶段 2: 流处理期间的心跳（保护等待上游首个数据到达）
+//     每个阶段必须独立使用 callDone/callFinished 防止并发写
+//
+// @RELATED: StartSSEHeartbeat, TranslateStream
+// @REASON: 历史血泪教训 - 只有阶段 1 心跳，CallStream 返回后 channel 等待数据期间无心跳，
+//
+//	客户端超时断开。71s 上游响应就是因为这个问题。
 func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
 	ingressTranslator translator.CombinedTranslator, internalReq *schema.InternalRequest,
@@ -1965,8 +2070,8 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
-	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
+	// ── 阶段 1: CallStream 期间的心跳 ──
+	callDone1, callFinished1 := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
@@ -1976,8 +2081,8 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	if q.verboseLevel >= 2 {
 		log.Printf("[upstream] CallStream %s → %v", internalReq.Model, time.Since(upstreamStart))
 	}
-	close(callDone) // 停止 CallStream 期间的心跳
-	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+	close(callDone1) // 停止阶段 1 心跳
+	<-callFinished1  // 等待心跳 goroutine 退出
 
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
@@ -1992,11 +2097,17 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 		aliasModel = internalReq.AliasModel
 	}
 
+	// ── 阶段 2: 流处理期间的心跳（保护等待上游数据到达的空窗期） ──
+	// 使用 MutexSSEWriter 防止心跳 goroutine 与 TranslateStream 回调并发写 w
+	mw := NewMutexSSEWriter(w, flusher)
+	callDone2, callFinished2 := StartSSEHeartbeat(mw, mw, ctx, q.verboseLevel)
+
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
 	var accumulatedUsage *schema.InternalUsage
 	go func() {
 		defer close(events)
+		ccStartSent := false // OpenAI 兼容路径是否已发送 start 事件
 		for line := range lines {
 			// 跳过元数据
 			var meta map[string]any
@@ -2012,6 +2123,19 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 					data, _ := meta["data"].(string)
 					if data == "" {
 						data = fmt.Sprintf("upstream error: HTTP %.0f", status)
+					}
+					// 首个事件就是错误时，先发 start 让 Responses 翻译器生成 response.created
+					if !ccStartSent {
+						ccStartSent = true
+						events <- schema.InternalStreamEvent{
+							Type: "start",
+							Data: &schema.InternalStreamChunk{
+								Model: internalReq.Model,
+								Choices: []schema.InternalChoice{{
+									Message: schema.InternalMessage{Role: schema.RoleAssistant},
+								}},
+							},
+						}
 					}
 					events <- schema.InternalStreamEvent{
 						Type: "error",
@@ -2060,6 +2184,26 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
 				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
+				}
+				// 首个有效 delta 事件前先发 start，Responses 入站翻译器据此生成 response.created
+				// Codex 期望完整事件序列：response.created → response.output_delta → response.completed
+				if !ccStartSent {
+					ccStartSent = true
+					modelName := ccChunk.Model
+					if aliasModel != "" {
+						modelName = aliasModel
+					}
+					events <- schema.InternalStreamEvent{
+						Type: "start",
+						Data: &schema.InternalStreamChunk{
+							ID:    ccChunk.ID,
+							Model: modelName,
+							Choices: []schema.InternalChoice{{
+								Index:   ccChunk.Choices[0].Index,
+								Message: schema.InternalMessage{Role: schema.RoleAssistant},
+							}},
+						},
+					}
 				}
 				choice := ccChunk.Choices[0]
 				msg := schema.InternalMessage{Role: schema.RoleAssistant}
@@ -2121,12 +2265,15 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// @RELATED: anthropic/translator.go:344 TranslateStream
 	// @REASON: 历史血泪教训 - 事件序列不完整导致 Kimi 解析失败，修复多次才稳定
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
+	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
-		w.Write(eventData)
-		if !isDone {
-			flusher.Flush()
-		}
+		mw.Write(eventData)
+		mw.Flush()
 	})
+
+	// 流处理完成，停止阶段 2 心跳
+	close(callDone2)
+	<-callFinished2
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	q.logRequest(vctx, startTime, http.StatusOK, accumulatedUsage, nil)
@@ -2605,30 +2752,40 @@ func (q *QuickGateway) extractUsage(resp []byte) *schema.InternalUsage {
 		return nil
 	}
 
+	foundAny := false
 	usage := &schema.InternalUsage{}
 	if v, ok := usageMap["prompt_tokens"].(float64); ok {
 		usage.PromptTokens = int(v)
+		foundAny = true
 	}
 	if v, ok := usageMap["completion_tokens"].(float64); ok {
 		usage.CompletionTokens = int(v)
+		foundAny = true
 	}
 	// Anthropic/Responses 用 input_tokens / output_tokens
 	if v, ok := usageMap["input_tokens"].(float64); ok {
 		usage.PromptTokens = int(v)
+		foundAny = true
 	}
 	if v, ok := usageMap["output_tokens"].(float64); ok {
 		usage.CompletionTokens = int(v)
+		foundAny = true
 	}
 	if v, ok := usageMap["total_tokens"].(float64); ok {
 		usage.TotalTokens = int(v)
+		foundAny = true
 	}
 	if v, ok := usageMap["cache_creation_input_tokens"].(float64); ok {
 		usage.CacheCreationTokens = int(v)
+		foundAny = true
 	}
 	if v, ok := usageMap["cache_read_input_tokens"].(float64); ok {
 		usage.CacheReadTokens = int(v)
+		foundAny = true
 	}
-	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0 {
+	// 只有 usage 字段存在但没有任何可识别的 token 数字时，才返回 nil
+	// 全 0 是合法值（如空响应），不能返回 nil
+	if !foundAny {
 		return nil
 	}
 	return usage

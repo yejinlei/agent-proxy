@@ -320,7 +320,8 @@ func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (
 
 	stopReason := mapStopReasonReverse(resp.Choices[0].FinishReason)
 
-	usage := (*Usage)(nil)
+	// usage 必须为对象（不能为 null），Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
+	usage := &Usage{InputTokens: 0, OutputTokens: 0}
 	if resp.Usage != nil {
 		usage = &Usage{
 			InputTokens:  resp.Usage.PromptTokens,

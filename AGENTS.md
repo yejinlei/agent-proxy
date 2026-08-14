@@ -121,9 +121,10 @@ flowchart TD
 
 ### SSE 格式
 - 所有 SSE 数据行必须带 `data: ` 前缀
-- 心跳格式：`: heartbeat\n\n`（SSE 注释，RFC 6455 §3.4）
+- 心跳格式：`data: {"type":"ping"}\n\n`（Anthropic 标准 ping 事件）
   - 不可用 `data: {}\n\n`（Claude Code 解析为 Anthropic 事件，缺少 type 字段→失败）
   - 不可用 `data: \n\n`（Kimi 等严格客户端空 data 行 JSON.parse 报错）
+  - 不可用 `: heartbeat\n\n`（SSE 注释，Claude Code 不识别为"内容活动"，不重置 HTTP 超时→长上游响应时客户端断开）
 - 错误事件：`event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n`
 - Anthropic 事件字段合规性见 `docs/DESIGN.md`
 
@@ -248,7 +249,7 @@ grep -rn "@REASON:" internal/
 | `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
 | `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
-| `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式 |
+| `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`data: {"type":"ping"}`，不可改为注释格式） |
 | `SSE_HEARTBEAT_FACTORY` | sse_heartbeat.go | 统一心跳工厂函数，所有 handler 共用 |
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
