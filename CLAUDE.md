@@ -252,7 +252,7 @@ grep -rn "@REASON:" internal/
 | `STREAM_MODE_ROUTING` | quick.go | 4 种模式路由矩阵 |
 | `TRANSLATE_TO_PROVIDER` | quick.go | InternalRequest → 上游协议请求 |
 | `PASSTHROUGH_NONSTREAM` | quick.go | 透传非流式 |
-| `PASSTHROUGH_NONSTREAM_AS_SSE` | quick.go | 透传非流式→SSE 包装 |
+| `PASSTHROUGH_NONSTREAM_AS_SSE` | quick.go | 透传非流式→SSE 包装，必须 <-callFinished 防并发写 |
 | `PASSTHROUGH_STREAM` | quick.go | 透传流式 |
 | `PASSTHROUGH_RAW` | quick.go | passthrough 模式总入口 |
 | `PASSTHROUGH_RAW_STREAM` | quick.go | passthrough 流式直连 |

@@ -1512,11 +1512,13 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 }
 
 // @AI_GUARD: PASSTHROUGH_NONSTREAM_AS_SSE - 透传路径非流式→SSE 包装，调用 writeNonStreamAsSSE
-// @CONSTRAINT: 上游非流式请求期间发送心跳，close(done) 在 <-callFinished 之前
+// @CONSTRAINT: 上游非流式请求期间发送心跳，close(callDone) 必须在 <-callFinished 之前（顺序不可颠倒）
+//   - 必须等待 callFinished 确保心跳 goroutine 完全退出后再写 SSE 响应，否则并发写 ResponseWriter 造成 SSE 数据损坏
 //   - 响应体必须经过 stripThinkingContentBlocks 过滤
 //   - 拆解为 SSE 事件流通过 writeNonStreamAsSSE 完成
 //
-// @RELATED: writeNonStreamAsSSE, handleNonStreamResponseAsSSE (翻译路径对应)
+// @RELATED: CALLDONE_CALLFINISHED (同步模式), writeNonStreamAsSSE, handleNonStreamResponseAsSSE (翻译路径对应)
+// @REASON: 历史血泪教训 - 遗漏 <-callFinished 导致心跳与 SSE 响应并发写入 http.ResponseWriter，Claude Code 解析到损坏 SSE 后报 "API returned an empty or malformed response (HTTP 200)"
 // handlePassthroughNonStreamAsSSE 非流式调上游，包装成 SSE 返回
 func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
