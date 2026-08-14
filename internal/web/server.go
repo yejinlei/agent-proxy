@@ -190,8 +190,8 @@ func (s *Server) handleLogsSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			// 心跳
-			fmt.Fprintf(w, ": heartbeat\n\n")
+			// 心跳（与代理 SSE 心跳格式保持一致）
+			fmt.Fprintf(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
 			flusher.Flush()
 
 			// 轮询最新日志

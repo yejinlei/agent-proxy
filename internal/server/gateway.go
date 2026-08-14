@@ -419,6 +419,9 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
 	resp = stripThinkingContentBlocks(resp)
 
+	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
+	resp = fixNullUsageInResponse(resp)
+
 	// 别名回显：将响应 JSON 中的 model 字段替换为客户端原始模型名
 	if aliasHit && aliasModel != "" {
 		resp = echoAliasInResponseBody(resp, aliasModel)
@@ -451,7 +454,7 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 //   - callDone/callFinished 心跳同步不可移除（防止并发写 ResponseWriter）
 //   - SSE 换行必须为 \n\n（双换行），不可改为 \n
 //   - 所有 SSE 数据行必须带 data: 前缀
-//   - 心跳格式必须为 SSE 注释 : heartbeat\n\n
+//   - 心跳格式必须为 event: ping\ndata: {"type":"ping"}\n\n（Anthropic 标准 ping 事件，必须包含 event: 前缀）
 //
 // @RELATED: quick.go handlePassthroughStreamWithBody, heartbeatEvent
 // @REASON: 历史血泪教训 - 与 quick.go 不同步导致复杂模式无法正常工作
@@ -499,6 +502,11 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		if g.verboseLevel >= 2 {
 			log.Printf("[sse-error] gateway-passthrough-stream → CallStream failed: %v", err)
 		}
+		// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
+		// id 不能为空，否则 Claude Code 报 "empty or malformed response"
+		msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+		w.Write([]byte(`event: message_start` + "\n" +
+			fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID) + "\n\n"))
 		errData, _ := json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]interface{}{
@@ -509,6 +517,8 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		w.Write([]byte("event: error\ndata: "))
 		w.Write(errData)
 		w.Write([]byte("\n\n"))
+		// 发送 message_stop 终止 SSE 流（带 event: 前缀）
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 		flusher.Flush()
 		return
 	}
@@ -797,8 +807,8 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
-	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
-	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), g.verboseLevel)
+	// ── 阶段 1: CallStream 期间的心跳 ──
+	callDone1, callFinished1 := StartSSEHeartbeat(w, flusher, r.Context(), g.verboseLevel)
 
 	upstreamStart := time.Now()
 	lines, _, err := client.CallStream(ctx, downstreamReq, info)
@@ -806,14 +816,19 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 		log.Printf("[upstream] CallStream %s → %v", internalReq.Model, time.Since(upstreamStart))
 	}
 
-	close(callDone) // 停止 CallStream 期间的心跳
-	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
+	close(callDone1) // 停止阶段 1 心跳
+	<-callFinished1  // 等待心跳 goroutine 退出
 
 	if err != nil {
 		// SSE 错误事件，避免 superfluous response.WriteHeader
 		if g.verboseLevel >= 2 {
 			log.Printf("[sse-error] gateway-stream → CallStream failed: %v", err)
 		}
+		// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
+		// id 不能为空，否则 Claude Code 报 "empty or malformed response"
+		msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+		w.Write([]byte(`event: message_start` + "\n" +
+			fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID) + "\n\n"))
 		errData, _ := json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]interface{}{
@@ -824,20 +839,65 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 		w.Write([]byte("event: error\ndata: "))
 		w.Write(errData)
 		w.Write([]byte("\n\n"))
+		// 发送 message_stop 终止 SSE 流（带 event: 前缀）
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 		flusher.Flush()
 		return
 	}
+
+	// ── 阶段 2: 流处理期间的心跳（保护等待上游数据到达的空窗期） ──
+	// 使用 MutexSSEWriter 防止心跳 goroutine 与 TranslateStream 回调并发写 w
+	mw := NewMutexSSEWriter(w, flusher)
+	callDone2, callFinished2 := StartSSEHeartbeat(mw, mw, r.Context(), g.verboseLevel)
 
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
 	go func() {
 		defer close(events)
+		ccStartSent := false // OpenAI 兼容路径是否已发送 start 事件
 		for line := range lines {
 			// 跳过元数据
 			var meta map[string]interface{}
-			if json.Unmarshal(line, &meta) == nil && meta["_type"] == "headers" {
-				// 处理响应头
-				continue
+			if json.Unmarshal(line, &meta) == nil {
+				if meta["_type"] == "headers" {
+					continue
+				}
+				if meta["_type"] == "error" {
+					status, _ := meta["_status"].(float64)
+					if status == 0 {
+						status = 502
+					}
+					data, _ := meta["data"].(string)
+					if data == "" {
+						data = fmt.Sprintf("upstream error: HTTP %.0f", status)
+					}
+					// 首个事件就是错误时，先发 start 让 Responses 翻译器生成 response.created
+					if !ccStartSent {
+						ccStartSent = true
+						modelName := ""
+						if internalReq != nil {
+							modelName = internalReq.Model
+						}
+						events <- schema.InternalStreamEvent{
+							Type: "start",
+							Data: &schema.InternalStreamChunk{
+								Model: modelName,
+								Choices: []schema.InternalChoice{{
+									Message: schema.InternalMessage{Role: schema.RoleAssistant},
+								}},
+							},
+						}
+					}
+					events <- schema.InternalStreamEvent{
+						Type: "error",
+						Error: &schema.StreamError{
+							Message: data,
+							Type:    "upstream_error",
+							Code:    int(status),
+						},
+					}
+					return
+				}
 			}
 
 			// 剥离 data: 前缀（与 quick.go 保持一致）
@@ -863,6 +923,25 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
 				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
 					continue
+				}
+				// 首个有效 delta 事件前先发 start，Responses 入站翻译器据此生成 response.created
+				if !ccStartSent {
+					ccStartSent = true
+					modelName := ccChunk.Model
+					if internalReq != nil && internalReq.AliasModel != "" {
+						modelName = internalReq.AliasModel
+					}
+					events <- schema.InternalStreamEvent{
+						Type: "start",
+						Data: &schema.InternalStreamChunk{
+							ID:    ccChunk.ID,
+							Model: modelName,
+							Choices: []schema.InternalChoice{{
+								Index:   ccChunk.Choices[0].Index,
+								Message: schema.InternalMessage{Role: schema.RoleAssistant},
+							}},
+						},
+					}
 				}
 				choice := ccChunk.Choices[0]
 				msg := schema.InternalMessage{Role: schema.RoleAssistant}
@@ -911,12 +990,15 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	}()
 
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
+	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
-		w.Write(eventData)
-		if !isDone {
-			flusher.Flush()
-		}
+		mw.Write(eventData)
+		mw.Flush()
 	})
+
+	// 流处理完成，停止阶段 2 心跳
+	close(callDone2)
+	<-callFinished2
 
 	latency := time.Since(startTime).Milliseconds()
 	g.recordRequest(r, startTime, info.Name, http.StatusOK, latency, "")
