@@ -19,6 +19,9 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/server"
 )
 
+// version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
+var version = "v0.2.56"
+
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
 func main() {
@@ -27,6 +30,13 @@ func main() {
 		printUsage()
 		os.Exit(0)
 	}
+
+	// 顶层 --version / -V 标志
+	if args[0] == "--version" || args[0] == "-V" {
+		fmt.Println("agent-proxy", version)
+		os.Exit(0)
+	}
+
 	command := args[0]
 	switch command {
 	case "run":
@@ -66,6 +76,8 @@ func main() {
 		}
 	case "db":
 		runDBCommand(args[1:])
+	case "version":
+		fmt.Println("agent-proxy", version)
 	case "--help", "-h":
 		printUsage()
 	default:
@@ -313,7 +325,7 @@ func runServer(args []string) {
 	}()
 
 	if quickMode {
-		fmt.Printf("\n🚀 Agent-Proxy (快速模式) running on http://%s:%d\n", host, port)
+		fmt.Printf("\n🚀 Agent-Proxy %s (快速模式) running on http://%s:%d\n", version, host, port)
 		if quickClientKeyEnabled {
 			fmt.Printf("🔑 Proxy Key: %s\n", quickClientKey)
 			fmt.Printf("🔐 客户端需使用 Authorization: Bearer %s 连接\n", quickClientKey)
@@ -327,7 +339,7 @@ func runServer(args []string) {
 		fmt.Printf("🔍 Model list:        GET  http://localhost:%d/v1/models\n", port)
 		fmt.Printf("🏥 Health check:      GET  http://localhost:%d/health\n", port)
 	} else {
-		fmt.Printf("\n🚀 Agent-Proxy (复杂模式) running on http://%s:%d\n", host, port)
+		fmt.Printf("\n🚀 Agent-Proxy %s (复杂模式) running on http://%s:%d\n", version, host, port)
 		fmt.Printf("📊 Web UI: http://localhost:%d/ui\n", port)
 		fmt.Printf("📝 Chat Completions: POST http://localhost:%d/v1/chat/completions\n", port)
 		fmt.Printf("💬 Anthropic Messages: POST http://localhost:%d/v1/messages\n", port)
@@ -500,6 +512,10 @@ func printUsage() {
   agent-proxy db find     <关键词>                           搜索代理
   agent-proxy db check                      核对所有代理（重新探测，提示删除无效记录）
   agent-proxy db detect  --url <u> --key <k> [--name <n>]  新增代理（兼容 alias → add）
+
+其他命令:
+  agent-proxy version          查看版本号
+  agent-proxy --version, -V    查看版本号
 
 示例:
   # 添加 Sensenova
