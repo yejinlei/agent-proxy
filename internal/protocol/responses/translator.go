@@ -69,6 +69,13 @@ func (t *ResponsesTranslator) Protocol() string { return "responses" }
 //  REQUEST: Responses ResponseRequest → InternalRequest (入站解析)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: RESPONSES_TRANSLATE_REQUEST - OpenAI Responses → InternalRequest（Central Schema 入口）
+// @CONSTRAINT: 消息格式转换必须经过 Central Schema，禁止直接翻译到其他协议
+//   - instructions → SystemPrompt
+//   - input 数组逐条转换（支持文本/图片/文件等多种类型）
+//   - 新增字段映射时必须同步修改 ResponseRequest 结构体
+//
+// @RELATED: chatcompletion/translator.go TranslateRequest, anthropic/translator.go TranslateRequest
 func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var req ResponseRequest
 	if err := json.Unmarshal(rawReq, &req); err != nil {
@@ -213,6 +220,12 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 //  RESPONSE: InternalResponse → Responses Response (出站)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: RESPONSES_TRANSLATE_RESPONSE - InternalResponse → OpenAI Response（Central Schema 出口）
+// @CONSTRAINT: 必须正确映射 InternalResponse 到 OpenAI Responses 原生响应格式
+//   - ContentBlocks 转换为 output 数组
+//   - status 映射：completed → completed, 其他 → incomplete
+//
+// @RELATED: chatcompletion/translator.go TranslateResponse, anthropic/translator.go TranslateResponse
 func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var contentBlocks []ContentBlock
 
@@ -331,6 +344,11 @@ func mapResponsesStatus(status string, stopReason string) string {
 //  STREAM: InternalStreamEvents → Responses SSE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: RESPONSES_TRANSLATE_STREAM - InternalStreamEvent → OpenAI Responses SSE（流式出口）
+// @CONSTRAINT: OpenAI Responses SSE 格式为 "data: <json>\n\n"，结束标记为 "data: [DONE]\n\n"
+//   - ctx.Done() 时发送 [DONE] 结束
+//
+// @RELATED: chatcompletion/translator.go TranslateStream (格式相同), anthropic/translator.go TranslateStream (格式不同)
 func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	for {
 		select {
@@ -718,6 +736,16 @@ func joinText(parts []string) string {
 //  STREAMING: Responses 流式事件 → InternalStreamEvent
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: RESPONSES_TRANSLATE_STREAM_EVENT - 上游 Responses SSE 事件 → InternalStreamEvent（流式入口）
+// @CONSTRAINT: 签名与 anthropic/gemini 不同（*StreamEvent vs json.RawMessage），
+//
+//	调用方需通过类型断言兼容处理，不可直接统一签名（会破坏现有逻辑）
+//	- response.output_delta: 提取 delta.content[0].text
+//	- response.content_block_delta: 提取 delta.text
+//	- response.completed: 提取 usage + finish_reason
+//
+// @RELATED: anthropic/translator.go TranslateStreamEvent, gemini/translator.go TranslateStreamEvent
+// @REASON: 历史遗留 - Responses 翻译器使用强类型 *StreamEvent，与其他翻译器的 json.RawMessage 不一致
 func (t *ResponsesTranslator) TranslateStreamEvent(event *StreamEvent) *schema.InternalStreamEvent {
 	if event.Data == nil {
 		return nil

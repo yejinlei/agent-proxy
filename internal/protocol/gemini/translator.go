@@ -87,6 +87,14 @@ func (t *GeminiTranslator) Protocol() string { return "gemini" }
 //  REQUEST: Gemini GenerateContentRequest → InternalRequest (入站解析)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: GEMINI_TRANSLATE_REQUEST - Gemini GenerateContent → InternalRequest（Central Schema 入口）
+// @CONSTRAINT: 消息格式转换必须经过 Central Schema，禁止直接翻译到其他协议
+//   - systemInstruction → SystemPrompt
+//   - contents 逐条转换（role 映射：user/model → user/assistant）
+//   - parts 数组转换为 content/text 或 contentBlocks
+//   - 新增字段映射时必须同步修改 GenerateContentRequest 结构体
+//
+// @RELATED: chatcompletion/translator.go TranslateRequest, anthropic/translator.go TranslateRequest
 func (t *GeminiTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var req GenerateContentRequest
 	if err := json.Unmarshal(rawReq, &req); err != nil {
@@ -268,6 +276,12 @@ func extractStopSequences(cfg *GenerationConfig) []string {
 //  RESPONSE: InternalResponse → Gemini GenerateContentResponse (出站)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: GEMINI_TRANSLATE_RESPONSE - InternalResponse → Gemini GenerateContentResponse（Central Schema 出口）
+// @CONSTRAINT: 必须正确映射 InternalResponse 到 Gemini 原生响应格式
+//   - ContentBlocks 转换为 candidates[].content.parts[]
+//   - 文本块 → text part，工具调用 → functionCall part
+//
+// @RELATED: chatcompletion/translator.go TranslateResponse, anthropic/translator.go TranslateResponse
 func (t *GeminiTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var parts []Part
 	var toolCalls []schema.InternalToolCall
@@ -361,6 +375,11 @@ func mapFinishReasonReverse(reason string) string {
 //  STREAM: InternalStreamEvents → Gemini SSE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: GEMINI_TRANSLATE_STREAM - InternalStreamEvent → Gemini SSE（流式出口）
+// @CONSTRAINT: Gemini SSE 格式为 "data: <json>\n\n"，结束标记为 "data: [DONE]\n\n"
+//   - ctx.Done() 时发送 [DONE] 结束
+//
+// @RELATED: chatcompletion/translator.go TranslateStream (格式相同), anthropic/translator.go TranslateStream (格式不同)
 func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	for {
 		select {
@@ -768,6 +787,13 @@ func joinText(parts []string) string {
 //  STREAMING
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// @AI_GUARD: GEMINI_TRANSLATE_STREAM_EVENT - 上游 Gemini SSE 事件 → InternalStreamEvent（流式入口）
+// @CONSTRAINT: 签名必须为 TranslateStreamEvent(json.RawMessage)，与 handleStreamRequest 类型断言一致
+//   - Candidates[0].Content.Parts 中提取 text 和 functionCall
+//   - usageMetadata 提取 token 统计
+//   - finishReason 映射：STOP→stop, MAX_TOKENS→length, 其他→stop
+//
+// @RELATED: anthropic/translator.go TranslateStreamEvent, quick.go/gateway.go handleStreamRequest
 func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.InternalStreamEvent {
 	var chunk StreamChunk
 	if err := json.Unmarshal(raw, &chunk); err != nil {

@@ -26,6 +26,13 @@ type openaiClient struct {
 type OpenAIClient openaiClient
 
 // NewOpenAIClient OpenAI 兼容 API 客户端（Chat Completions 端点）
+// @AI_GUARD: CONNECTION_POOL_CONFIG - 所有 Provider 必须使用相同的连接池配置
+// @CONSTRAINT: 4 个 Provider (OpenAI/Anthropic/Gemini/Responses) 必须保持连接池配置一致：
+//   MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 300s
+//   - 修改任一 Provider 的连接池配置，必须同步修改其他 3 个
+//   - 非流式请求使用独立 http.Client，与 SSE 连接池隔离
+// @RELATED: NewAnthropicClient, NewGeminiClient, NewResponsesClient (必须同步)
+// @REASON: 历史血泪教训 - 连接池不一致导致部分协议请求失败
 func NewOpenAIClient(name, baseURL string, timeout int) *OpenAIClient {
 	return &OpenAIClient{
 		name:     name,

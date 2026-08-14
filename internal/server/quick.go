@@ -54,8 +54,14 @@ type QuickGateway struct {
 }
 
 // 心跳格式：SSE 注释行（RFC 6455 §3.4）
-// 所有 SSE 客户端忽略以冒号开头的注释行，但能重置 TCP 连接超时计时器。
-// 使用注释而非 data: 行 —— 避免 Claude Code 将空 JSON {} 当作 Anthropic 事件解析失败。
+// @AI_GUARD: SSE_HEARTBEAT_FORMAT - 心跳格式绝对不可修改
+// @CONSTRAINT: 必须用 SSE 注释格式 ": heartbeat\n\n"，不可改为 data: 行
+//   - data: {}\n\n → Claude Code 解析为 Anthropic 事件，缺少 type 字段 → 解析失败
+//   - data: \n\n → Kimi 等严格客户端对空行做 JSON.parse 报错
+//     -: heartbeat\n\n → RFC 6455 §3.4 注释格式，客户端忽略但重置 TCP 超时计时器
+//
+// @RELATED: all handlePassthrough* / handleNonStream* handlers that write heartbeat
+// @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n，均导致不同客户端崩溃
 var heartbeatEvent = []byte(": heartbeat\n\n")
 
 // NewQuickGateway 从 DB 记录创建一个超简易网关
@@ -334,6 +340,13 @@ func (q *QuickGateway) Routes() chi.Router {
 }
 
 // handleRequest 统一请求处理：入站协议 → InternalRequest → 下游 Provider → InternalResponse → 入站协议
+// @AI_GUARD: HANDLE_REQUEST_ENTRY - 快速模式总入口，所有路由决策的起点
+// @CONSTRAINT: 修改路由逻辑必须理解整个处理流水线（协议识别→路径决策→格式转换→流决策）
+//   - 透传路径：入站协议==上游协议，直接转发，仅替换 model 名
+//   - 翻译路径：入站协议≠上游协议，经过 Central Schema 完整翻译
+//   - --stream-mode 覆写路由优先级：auto < stream/non-stream < passthrough
+//
+// @RELATED: gateway.go handleRequest (复杂模式入口，必须保持同步)
 // 协议感知路由：先按入站协议选择匹配的上游协议（透传优先），无匹配则回退到 openai 翻译转换。
 func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressProtocol string) {
 	startTime := time.Now()
@@ -388,6 +401,12 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		ingressBody:     body,
 	}
 
+	// @AI_GUARD: STREAM_MODE_ROUTING - --stream-mode 路由矩阵，修改前必须理解全部 4 种模式
+	// @CONSTRAINT: 四种模式 auto/stream/non-stream/passthrough 的行为必须与 DESIGN.md 文档一致
+	// @RELATED: handleStreamRequest, handleStreamRequestAsNonStream, handleNonStreamResponse,
+	//           handleNonStreamResponseAsSSE, handlePassthroughStreamWithBody,
+	//           handlePassthroughNonStream, handlePassthroughNonStreamAsSSE
+	// @REASON: 每修正一种模式可能破坏另一种模式的客户端（Claude Code / Kimi / Codex 行为不同）
 	if normalizedIngress == providerType && realModel != "" {
 		ctx := context.WithValue(r.Context(), verboseCtxKey{}, vctx)
 		stream := quickDetectStream(body)
@@ -621,6 +640,13 @@ func echoAliasInResponseBody(resp json.RawMessage, aliasModel string) json.RawMe
 	return resp
 }
 
+// @AI_GUARD: THINKING_BLOCK_FILTER - 只过滤非标准 thinking 块，不可全局过滤
+// @CONSTRAINT: 仅过滤缺少 signature 字段的非标准 thinking 块（SenseNova DeepSeek 特有）
+//   - 标准 Anthropic thinking 块（含 signature 字段）必须保留，确保 Kimi 等客户端能接收推理过程
+//   - 不可无条件过滤所有 "thinking" 类型，否则会破坏标准 Anthropic 客户端的推理功能
+//
+// @RELATED: handlePassthroughStreamWithBody (流式 thinking 过滤), handlePassthroughNonStream (非流式过滤)
+// @REASON: 历史血泪教训 - 初期无条件过滤 thinking 导致 Claude Code 无法显示推理过程
 // stripThinkingContentBlocks 从响应 JSON 中移除非标准 thinking 类型内容块。
 // SenseNova 的 DeepSeek 模型在 high effort 模式下返回非标准 thinking 类型内容块
 // （缺少 Anthropic 标准要求的 signature 字段），Claude Code 等客户端无法解析。
@@ -743,6 +769,10 @@ func quickStreamExplicitFalse(body json.RawMessage) bool {
 	return ok && !b
 }
 
+// @AI_GUARD: PASSTHROUGH_STREAM - 透传流式处理，修改前必须同步 gateway.go
+// @CONSTRAINT: callDone/callFinished 通道同步模式不可移除，防止并发写 http.ResponseWriter
+// @RELATED: gateway.go handlePassthroughStream (必须保持同步), handlePassthroughStreamWithBody (同函数)
+// @REASON: 历史血泪教训 - 心跳 goroutine 在 CallStream 返回后可能继续写 w，导致 panic
 // handlePassthroughStreamWithBody 与 handlePassthroughStream 一致，但 body 已在调用方读取
 // 供 --stream-mode stream 路径使用，避免重复读取 r.Body
 func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx context.Context, w http.ResponseWriter,
@@ -761,6 +791,13 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// @AI_GUARD: CALLDONE_CALLFINISHED - 心跳 goroutine 同步机制，不可修改顺序
+	// @CONSTRAINT: close(callDone) 必须在 <-callFinished 之前，顺序不可颠倒
+	//   - callDone 关闭 → 心跳 goroutine 退出 → close(callFinished) → 主 goroutine 在 <-callFinished 解除阻塞
+	//   - 如果先 <-callFinished 再 close(callDone)，会导致死锁
+	//   - 遗漏 <-callFinished 会导致心跳 goroutine 与主 goroutine 并发写 w → panic
+	// @RELATED: all handlers with heartbeat goroutine
+	// @REASON: 历史血泪教训 - 并发写 ResponseWriter 导致 panic，修复多次才稳定
 	// 在 CallStream 阻塞等待上游首个响应期间发送 SSE 心跳
 	callDone := make(chan struct{})
 	callFinished := make(chan struct{})
@@ -915,6 +952,11 @@ streamDone:
 	q.logRequest(vctx, startTime, http.StatusOK, lastUsage, nil)
 }
 
+// @AI_GUARD: PASSTHROUGH_NONSTREAM - 透传非流式，必须同步 gateway.go
+// @CONSTRAINT: 响应必须经过 stripThinkingContentBlocks 过滤非标准 thinking 块
+//   - 别名模型：响应中 model 字段替换为客户端原始模型名
+//
+// @RELATED: gateway.go handlePassthroughNonStream (必须同步)
 // handlePassthroughNonStream 透传非流式：请求/响应都不翻译，原样转发
 func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time) {
@@ -1200,6 +1242,16 @@ func (q *QuickGateway) probeStreamPrefer(p provider.Provider, callInfo *schema.P
 	q.streamPreferMu.Unlock()
 }
 
+// @AI_GUARD: NONSTREAM_AS_SSE - 非流式响应拆解为 SSE 事件流，修改前必须验证所有入站协议
+// @CONSTRAINT: 自动检测响应格式（Anthropic/OpenAI/Gemini/Responses），每种协议的拆分逻辑不同
+//   - Anthropic: 每个 content 块拆分为一个 SSE 事件
+//   - OpenAI CC: choices[0].message.content 拆分为一个 content_block_delta
+//   - Gemini: candidates[0].content.parts 拆分为一个 content_block_delta
+//   - Responses: output 拆分为一个 content_block_delta
+//   - 所有格式的输出必须用 data: 前缀 + \n\n 双换行
+//
+// @RELATED: handleNonStreamResponseAsSSE, handlePassthroughNonStreamAsSSE
+// @REASON: 历史血泪教训 - 各种协议的非流式响应结构不同，修改拆解逻辑需同步所有格式
 // writeNonStreamAsSSE 将非流式完整响应 JSON 拆解为对应协议的 SSE 多事件流写入 w。
 // 自动检测响应格式（Anthropic / OpenAI ChatCompletion / Gemini / OpenAI Responses），
 // 返回从响应中提取的 usage（用于日志）。
@@ -1459,6 +1511,12 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 	return usage
 }
 
+// @AI_GUARD: PASSTHROUGH_NONSTREAM_AS_SSE - 透传路径非流式→SSE 包装，调用 writeNonStreamAsSSE
+// @CONSTRAINT: 上游非流式请求期间发送心跳，close(done) 在 <-callFinished 之前
+//   - 响应体必须经过 stripThinkingContentBlocks 过滤
+//   - 拆解为 SSE 事件流通过 writeNonStreamAsSSE 完成
+//
+// @RELATED: writeNonStreamAsSSE, handleNonStreamResponseAsSSE (翻译路径对应)
 // handlePassthroughNonStreamAsSSE 非流式调上游，包装成 SSE 返回
 func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, body []byte) {
@@ -1544,6 +1602,12 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
 }
 
+// @AI_GUARD: NONSTREAM_RESPONSE - 翻译路径非流式→非流式 JSON 返回
+// @CONSTRAINT: 翻译管道：TranslateToProvider → Call → TranslateFromProvider → TranslateResponse → JSON
+//   - 先 WriteHeader(200) + Flush() 启用 chunked transfer
+//   - 非流式请求使用独立 http.Client，与 SSE 连接池隔离
+//
+// @RELATED: handleNonStreamResponseAsSSE (翻译路径非流式→SSE 包装)
 // handleNonStreamResponse 非流式响应
 func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
@@ -1616,6 +1680,10 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
 }
 
+// @AI_GUARD: NONSTREAM_RESPONSE_AS_SSE - 翻译路径非流式→SSE，调用 writeNonStreamAsSSE
+// @CONSTRAINT: 上游非流式请求期间发送心跳，防止客户端超时；close(done) 在 <-callFinished 之前
+// @RELATED: writeNonStreamAsSSE, handlePassthroughNonStreamAsSSE
+// @REASON: 翻译路径的非流式→SSE 包装与透传路径共用 writeNonStreamAsSSE，但心跳逻辑独立
 // handleNonStreamResponseAsSSE 翻译路径 + --stream-mode non-stream：
 // 调用上游非流式 API，经翻译管道得到入站协议格式的响应，
 // 然后拆解为 SSE 事件流返回给客户端（客户端建立了 SSE 连接）。
@@ -1736,6 +1804,15 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	q.logRequest(vctx, startTime, http.StatusOK, usage, nil)
 }
 
+// @AI_GUARD: HANDLE_STREAM_REQUEST - 翻译路径流式处理，核心约束密集
+// @CONSTRAINT:
+//  1. TranslateStreamEvent 类型断言签名必须为 json.RawMessage（Gemini/Anthropic 一致，Responses 除外）
+//  2. 入站翻译器 TranslateStream 负责最终 SSE 事件序列（Anthropic 必须 message_start→...→message_stop）
+//  3. callDone/callFinished 同步不可移除
+//  4. 上游 SSE 行必须剥离 "data: " 前缀后再传入翻译器
+//
+// @RELATED: TranslateStreamEvent (各翻译器), TranslateStream (入站翻译器)
+// @REASON: 历史血泪教训 - 修改 SSE 事件格式后未同步 TranslateStream，导致 Kimi 解析失败
 // handleStreamRequest 流式请求
 func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	downstreamReq json.RawMessage, providerTranslator any,
@@ -1845,6 +1922,13 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 			}
 
 			if providerTranslator != nil {
+				// @AI_GUARD: TRANSLATE_STREAM_EVENT_SIGNATURE - 类型断言签名必须为 json.RawMessage
+				// @CONSTRAINT: 所有协议的 TranslateStreamEvent 必须接受 json.RawMessage 参数
+				//   - Anthropic/Gemini: 签名一致 ✓
+				//   - Responses: 签名为 *StreamEvent，类型断言失败 → 走 else 分支（OpenAI 兼容路径）
+				//   - 新增协议翻译器必须实现 TranslateStreamEvent(json.RawMessage) 签名
+				// @RELATED: anthropic/translator.go:792, gemini/translator.go:771, responses/translator.go:721
+				// @REASON: 历史血泪教训 - Responses 翻译器签名不一致导致其 TranslateStreamEvent 成为死代码
 				pte := providerTranslator.(interface {
 					TranslateStreamEvent(json.RawMessage) *schema.InternalStreamEvent
 				})
@@ -1917,6 +2001,13 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 		}
 	}()
 
+	// @AI_GUARD: TRANSLATE_STREAM_OUTPUT - 入站翻译器 TranslateStream 负责最终 SSE 事件序列
+	// @CONSTRAINT: Anthropic 翻译器必须严格遵循事件序列：
+	//   message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop
+	//   - 每个事件后必须跟 \n\n 双换行
+	//   - 所有数据行必须带 data: 前缀
+	// @RELATED: anthropic/translator.go:344 TranslateStream
+	// @REASON: 历史血泪教训 - 事件序列不完整导致 Kimi 解析失败，修复多次才稳定
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
 		w.Write(eventData)
@@ -1929,6 +2020,13 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	q.logRequest(vctx, startTime, http.StatusOK, accumulatedUsage, nil)
 }
 
+// @AI_GUARD: STREAM_REQUEST_AS_NONSTREAM - 翻译路径上游流式→非流式 JSON 返回
+// @CONSTRAINT: 收集所有 SSE 事件 → 组装 InternalResponse → 翻译为入站协议 JSON
+//   - 先 WriteHeader(200) + Flush() 启用 chunked transfer，防止客户端等待超时
+//   - usage 需要从最后一个有 usage 的 SSE 事件提取
+//
+// @RELATED: handleStreamRequest (反向路径)
+// @REASON: 历史血泪教训 - 未先写响应头导致客户端等待上游 SSE 收集时超时 ECONNRESET
 // handleStreamRequestAsNonStream 翻译路径 + --stream-mode stream：
 // 调用上游流式 API，收集所有 SSE 事件经翻译管道组装为完整 InternalResponse，
 // 再翻译为入站协议格式的 JSON 返回（客户端发的是非流式请求）。
@@ -2095,6 +2193,12 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 
 // translateToProvider 根据目标 Provider 类型选择翻译器并构建下游请求体
 // providerType 来自调用方本地变量，避免读取共享 q.info.Version 造成数据竞争。
+// @AI_GUARD: TRANSLATE_TO_PROVIDER - InternalRequest → 上游协议请求（Central Schema 出口）
+// @CONSTRAINT: 根据 providerType 选择正确的翻译器并构建下游请求体
+//   - 返回 (providerTranslator, downstreamReq) 供后续 handleStreamRequest/handleNonStreamResponse 使用
+//   - 新增协议时必须在此 switch 中注册对应的翻译器
+//
+// @RELATED: all protocol/translator.go TranslateToProvider 方法
 func (q *QuickGateway) translateToProvider(providerType string, internalReq *schema.InternalRequest) (any, json.RawMessage) {
 
 	switch providerType {
@@ -2451,6 +2555,13 @@ func writeSSE(w http.ResponseWriter, data []byte) bool {
 // handlePassthroughRaw HTTP 直连透传：客户端要什么协议就发什么协议，上游返回什么客户端收到什么
 // 不注入心跳、不做 SSE 包装，仅替换 model 名
 // streamMode=="passthrough" 时调用，适用于已知上下游协议完全对齐的场景（零损耗）
+// @AI_GUARD: PASSTHROUGH_RAW - --stream-mode passthrough 总入口，分发到 RawStream/RawNonStream
+// @CONSTRAINT: passthrough 模式仅透传路径生效，不经过任何格式转换
+//   - Anthropic 协议不带 stream 字段：走 handlePassthroughRawStream（SSE + 心跳）
+//   - 其他协议带 stream:true：走 handlePassthroughRawStream
+//   - 显式 stream:false：走 handlePassthroughRawNonStream（raw JSON）
+//
+// @RELATED: handlePassthroughRawStream, handlePassthroughRawNonStream
 func (q *QuickGateway) handlePassthroughRaw(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, realModel string, aliasModel string, aliasHit bool, startTime time.Time, ingressProtocol string) {
 
@@ -2476,6 +2587,12 @@ func (q *QuickGateway) handlePassthroughRaw(p provider.Provider, ctx context.Con
 }
 
 // handlePassthroughRawStream 透传流式：上游 SSE 原样管道转发，零注入
+// @AI_GUARD: PASSTHROUGH_RAW_STREAM - passthrough 模式流式直连，仅替换 model 名
+// @CONSTRAINT: 不注入心跳、不做 SSE 包装、不做格式转换，仅替换 model 名
+//   - 必须带 callDone/callFinished 同步（防止并发写）
+//   - SSE 换行必须 \n\n（双换行）
+//
+// @RELATED: handlePassthroughStreamWithBody (非 passthrough 透传流式)
 func (q *QuickGateway) handlePassthroughRawStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, body []byte, aliasHit bool, aliasModel string, startTime time.Time, realModel string) {
 
@@ -2620,6 +2737,9 @@ streamLoop:
 }
 
 // handlePassthroughRawNonStream 透传非流式：上游 JSON 原样返回，不做 SSE 包装
+// @AI_GUARD: PASSTHROUGH_RAW_NONSTREAM - passthrough 模式非流式直连，仅替换 model 名
+// @CONSTRAINT: 不注入心跳、不做 SSE 包装、不做格式转换，仅替换 model 名
+// @RELATED: handlePassthroughNonStream (非 passthrough 透传非流式)
 func (q *QuickGateway) handlePassthroughRawNonStream(p provider.Provider, ctx context.Context, w http.ResponseWriter,
 	r *http.Request, body []byte, aliasHit bool, aliasModel string, startTime time.Time, realModel string) {
 

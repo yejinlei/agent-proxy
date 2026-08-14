@@ -55,11 +55,15 @@ func (af *AliasFile) Lookup(alias string) (string, bool) {
 	return v, ok
 }
 
-// Resolve 解析别名：
-//  1. 先 Lookup(alias) 取原始映射值
-//  2. 如果 target == alias（即没有单独配置具体映射目标），且 entries 中存在特殊
-//     key "_default_"，则返回 _default_ 的值作为单目标兜底
-//  3. 否则返回原始 target
+// @AI_GUARD: ALIAS_RESOLVE - 模型别名解析核心逻辑，三层优先级：--aliases > model-aliases.yaml > DefaultAliases()
+// @CONSTRAINT: 修改解析逻辑必须理解三层加载机制
+//   - 先 Lookup(alias) 取原始映射值
+//   - 如果 target == alias（无具体映射），且存在 _default_，则使用 _default_ 值
+//   - _default_ 兜底，@default 动态取上游首个模型
+//   - 双向替换：请求 model 假→真，响应 model 真→假
+//
+// @RELATED: DefaultAliases(), LoadAliasFileAuto(), quick.go/gateway.go resolveAlias
+// @REASON: 别名解析错误会导致所有请求路由到错误模型
 func (af *AliasFile) Resolve(alias string) (target string, hit bool) {
 	af.mu.RLock()
 	defer af.mu.RUnlock()
@@ -119,6 +123,14 @@ func LoadAliasFile(path string) (*AliasFile, error) {
 	return af, nil
 }
 
+// @AI_GUARD: ALIAS_LOAD_AUTO - 别名文件自动加载，三层优先级机制的核心
+// @CONSTRAINT: 加载顺序绝对不可修改：用户文件 > 内置 DefaultAliases()
+//   - 以 DefaultAliases() 为基础，用文件中的条目覆盖（Merge）
+//   - 文件不存在时回退到 DefaultAliases()
+//   - 用户只需配置 _default_ 或少量别名，内置别名仍生效
+//
+// @RELATED: DefaultAliases(), Resolve(), quick.go/gateway.go alias 初始化
+// @REASON: 加载顺序错误会导致用户配置被内置覆盖，所有别名映射失效
 func LoadAliasFileAuto(dir string, warn func(string)) (*AliasFile, bool) {
 	if dir == "" {
 		if p, err := os.Executable(); err == nil {
@@ -149,6 +161,12 @@ func LoadAliasFileAuto(dir string, warn func(string)) (*AliasFile, bool) {
 	return DefaultAliases(), false
 }
 
+// @AI_GUARD: DEFAULT_ALIASES - 内置模型别名，三层加载的最底层兜底
+// @CONSTRAINT: 修改别名列表必须同步更新 model-aliases.yaml 模板
+//   - 所有别名初始值映射到自身（同名），由 _default_ 或用户配置覆盖
+//   - 新增别名需同时更新 AGENTS.md 中的模型别名说明
+//
+// @RELATED: LoadAliasFileAuto(), Resolve(), model-aliases.yaml
 func DefaultAliases() *AliasFile {
 	m := make(map[string]string)
 

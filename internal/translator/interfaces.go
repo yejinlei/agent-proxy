@@ -8,6 +8,14 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  @AI_GUARD: TRANSLATOR_INTERFACES - 翻译器接口定义，新增协议必须实现全部方法
+//  @CONSTRAINT: 所有协议翻译器必须实现 CombinedTranslator 接口（Request+Response+Stream）
+//    - TranslateRequest: 入站协议 → InternalRequest（Central Schema 入口）
+//    - TranslateResponse: InternalResponse → 入站协议（Central Schema 出口）
+//    - TranslateStream: InternalStreamEvent → 入站协议 SSE（流式出口）
+//    - TranslateStreamEvent: 上游协议 SSE → InternalStreamEvent（流式入口，签名必须 json.RawMessage）
+//  @RELATED: all protocol/translator.go files, quick.go handleStreamRequest, gateway.go handleStreamRequest
+//  @REASON: 历史血泪教训 - Responses 翻译器 TranslateStreamEvent 签名不一致导致死代码
 //  翻译器接口
 //
 //  设计核心：每个协议适配器实现双向翻译。
