@@ -426,6 +426,11 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	// 过滤非标准 thinking 内容块（SenseNova DeepSeek 特有，缺少 signature 字段）
 	resp = stripThinkingContentBlocks(resp)
 
+	// 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
+	// @REASON: Fable 5 在 Anthropic tool_use 的 input 中额外添加 description 字段，
+	//         Claude Code v2.1.233+ 的 Bash tool schema 不接受该字段，导致 "tool call could not be parsed"
+	resp = stripToolUseDescription(resp)
+
 	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
 	resp = fixNullUsageInResponse(resp)
 
@@ -550,6 +555,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		}
 		// 过滤 thinking + 修复 usage（同 quick.go handlePassthroughNonStreamAsSSE）
 		respBody = stripThinkingContentBlocks(respBody)
+		respBody = stripToolUseDescription(respBody)
 		respBody = fixNullUsageInResponse(respBody)
 		writeNonStreamAsSSE(w, flusher, respBody, realModel)
 		return
@@ -661,11 +667,22 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 					evtType, _ := evt["type"].(string)
 					switch evtType {
 					case "content_block_start":
+						var ct string
 						if cb, ok := evt["content_block"].(map[string]interface{}); ok {
-							if ct, _ := cb["type"].(string); ct == "thinking" {
+							if cbtype, ok := cb["type"].(string); ok {
+								ct = cbtype
+							}
+							if ct == "thinking" {
 								if _, hasSig := cb["signature"]; !hasSig {
 									inThinkingBlock = true
 									continue
+								}
+							}
+							if ct == "tool_use" {
+								if input, ok := cb["input"].(map[string]interface{}); ok {
+									delete(input, "description")
+									filteredEvt, _ := json.Marshal(evt)
+									lineStr = "data: " + string(filteredEvt)
 								}
 							}
 						}

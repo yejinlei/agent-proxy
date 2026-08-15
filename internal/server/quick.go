@@ -714,6 +714,54 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 	return json.RawMessage(out)
 }
 
+// stripToolUseDescription 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
+// @REASON: Fable 5 在 Anthropic tool_use 的 input 中额外添加 description 字段，
+//
+//	Claude Code 的 Bash tool schema 不接受该字段，导致 "tool call could not be parsed"
+//	注意：description 字段在 tool 定义（请求 tools 数组）层面是合法的，
+//	只有出现在 tool_use.input 里才是问题。
+func stripToolUseDescription(resp json.RawMessage) json.RawMessage {
+	if len(resp) == 0 {
+		return resp
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return resp
+	}
+
+	contentRaw, ok := raw["content"]
+	if !ok {
+		return resp
+	}
+	contentArr, ok := contentRaw.([]interface{})
+	if !ok {
+		return resp
+	}
+
+	filtered := make([]interface{}, 0, len(contentArr))
+	for _, item := range contentArr {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		if t, _ := itemMap["type"].(string); t == "tool_use" {
+			if input, ok := itemMap["input"].(map[string]interface{}); ok {
+				delete(input, "description")
+			}
+		}
+		filtered = append(filtered, item)
+	}
+
+	raw["content"] = filtered
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return resp
+	}
+	return json.RawMessage(out)
+}
+
 // fixNullUsageInResponse 修复透传响应中 usage 为 null 的问题
 // Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
 // 上游（如 sensenova）可能返回 "usage": null，需要补默认值 {"input_tokens":0,"output_tokens":0}
@@ -906,8 +954,9 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
-		// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+		// 过滤 thinking + description + 修复 usage
 		respBody = stripThinkingContentBlocks(respBody)
+		respBody = stripToolUseDescription(respBody)
 		respBody = fixNullUsageInResponse(respBody)
 		effectiveModel := realModel
 		if aliasHit && aliasModel != "" {
@@ -980,6 +1029,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 						return
 					}
 					respBody = stripThinkingContentBlocks(respBody)
+					respBody = stripToolUseDescription(respBody)
 					respBody = fixNullUsageInResponse(respBody)
 					effectiveModel := realModel
 					if aliasHit && aliasModel != "" {
@@ -996,15 +1046,26 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 					// 缺少 signature 字段的非标准 thinking 块，Claude Code 无法解析。
 					// 标准 Anthropic thinking 块（含 signature）会被保留。
 					eventType, _ := meta["type"].(string)
+					modifiedLine := false
 					switch eventType {
 					case "content_block_start":
+						var ct string
 						if cb, ok := meta["content_block"].(map[string]any); ok {
-							if ct, _ := cb["type"].(string); ct == "thinking" {
+							if cbtype, ok := cb["type"].(string); ok {
+								ct = cbtype
+							}
+							if ct == "thinking" {
 								if _, hasSig := cb["signature"]; hasSig {
 									// 标准 thinking 块，保留
 								} else {
 									inThinkingBlock = true
 									continue
+								}
+							}
+							if ct == "tool_use" {
+								if input, ok := cb["input"].(map[string]interface{}); ok {
+									delete(input, "description")
+									modifiedLine = true
 								}
 							}
 						}
@@ -1017,6 +1078,10 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 							inThinkingBlock = false
 							continue
 						}
+					}
+					if modifiedLine {
+						modifiedJSON, _ := json.Marshal(meta)
+						line = append([]byte("data: "), modifiedJSON...)
 					}
 					usage := extractUsage(trimSSEDataPrefix(line))
 					if usage != nil {
@@ -1152,6 +1217,9 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	// "API returned an empty or malformed response (HTTP 200)" 错误
 	outResp = stripThinkingContentBlocks(outResp)
 
+	// 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
+	outResp = stripToolUseDescription(outResp)
+
 	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
 	// 上游（如 sensenova）可能返回 usage: null，需要补默认值
 	outResp = fixNullUsageInResponse(outResp)
@@ -1247,8 +1315,9 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
-		// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+		// 过滤 thinking + description + 修复 usage
 		respBody = stripThinkingContentBlocks(respBody)
+		respBody = stripToolUseDescription(respBody)
 		respBody = fixNullUsageInResponse(respBody)
 		effectiveModel := realModel
 		if aliasHit && aliasModel != "" {
@@ -1339,8 +1408,9 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 						sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
 						return
 					}
-					// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+					// 过滤 thinking + description + 修复 usage
 					respBody = stripThinkingContentBlocks(respBody)
+					respBody = stripToolUseDescription(respBody)
 					respBody = fixNullUsageInResponse(respBody)
 					effectiveModel := realModel
 					if aliasHit && aliasModel != "" {
@@ -1939,6 +2009,9 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 
 	// 过滤 thinking 内容块（同 handlePassthroughNonStream）
 	respBody = stripThinkingContentBlocks(respBody)
+
+	// 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
+	respBody = stripToolUseDescription(respBody)
 
 	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
 	respBody = fixNullUsageInResponse(respBody)
