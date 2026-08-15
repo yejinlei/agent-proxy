@@ -419,12 +419,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	// @AI_GUARD: STREAM_MODE_ROUTING - 透传路径路由，修改前必须理解完整的处理流水线
 	// @CONSTRAINT: 透传路径按 stream 字段自适应路由:
 	//   - stream=true: 自适应探测（首次非流式→SSE 包装，后台竞速决定后续策略）
-	//   - 无 stream 字段（Claude Code）: 伪装 SSE（非流式上游→SSE 包装）
+	//   - 无 stream 字段: 透传非流式 JSON（Anthropic API 标准：stream 默认 false）
 	//   - stream:false: 透传非流式
 	// @RELATED: handleStreamRequest, handleStreamRequestAsNonStream, handleNonStreamResponse,
 	//           handleNonStreamResponseAsSSE, handlePassthroughStreamWithBody,
 	//           handlePassthroughNonStream, handlePassthroughNonStreamAsSSE
 	// @REASON: 历史血泪教训 - 每修正一种模式可能破坏另一种模式的客户端（Claude Code / Kimi / Codex 行为不同）
+	// @REASON: 无 stream 字段改回 JSON - Claude Code /model 验证请求不带 stream，期望 JSON 响应；
+	//          包装为 SSE 会导致 "undefined is not an object (evaluating 'K.usage.input_tokens')" 错误
 	if normalizedIngress == providerType && realModel != "" {
 		if q.verboseLevel >= 2 {
 			log.Printf("[route] PASSTHROUGH: model=%s, ingress=%s, provider=%s", realModel, normalizedIngress, providerType)
@@ -454,23 +456,35 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				}
 				q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
 			} else {
-				if q.verboseLevel >= 2 {
-					log.Printf("[route] stream=true, prefer native stream")
+				// @AI_GUARD: LARGE_BODY_SKIP_STREAM - 大请求跳过原生流式
+				// @REASON: SenseNova 等上游对大请求（>100KB）的流式处理会立即失败（502 stream read failed），
+				//          probe 用小请求测得 SSE=345ms 选择了流式，但实际大请求流式需 12-18s 才失败。
+				//          客户端等不及断开连接（broken pipe），fallback 即使成功也写不回去。
+				//          阈值 100KB：超过此大小直接走非流式 SSE 包装，避免长等待。
+				const largeBodyThreshold = 100 * 1024 // 100KB
+				if len(body) > largeBodyThreshold {
+					if q.verboseLevel >= 2 {
+						log.Printf("[route] stream=true, large body (%d bytes > %d) → use non-stream→SSE", len(body), largeBodyThreshold)
+					}
+					q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+				} else {
+					if q.verboseLevel >= 2 {
+						log.Printf("[route] stream=true, prefer native stream")
+					}
+					q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 				}
-				q.handlePassthroughStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 			}
-			// 无 stream 字段（Claude Code）→ 期望 SSE，包装为非流式上游响应转 SSE
-			// 显式 stream:false → 期望 raw JSON
-		} else if quickStreamExplicitFalse(body) {
-			if q.verboseLevel >= 2 {
-				log.Printf("[route] stream=false, passthrough non-stream (raw JSON)")
-			}
-			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
+			// 无 stream 字段或显式 stream:false → 期望 raw JSON（Anthropic API 标准：stream 默认 false）
+			// Claude Code /model 验证请求不带 stream 字段，期望 JSON 响应
 		} else {
 			if q.verboseLevel >= 2 {
-				log.Printf("[route] no stream field, passthrough non-stream→SSE (Claude Code)")
+				if quickStreamExplicitFalse(body) {
+					log.Printf("[route] stream=false, passthrough non-stream (raw JSON)")
+				} else {
+					log.Printf("[route] no stream field, passthrough non-stream (raw JSON)")
+				}
 			}
-			q.handlePassthroughNonStreamAsSSE(p, ctx, w, r, realModel, originalModel, aliasHit, startTime, body)
+			q.handlePassthroughNonStream(p, ctx, w, r, realModel, originalModel, aliasHit, startTime)
 		}
 		return
 	}
@@ -803,8 +817,8 @@ func quickRemoveStreamFlag(body []byte) []byte {
 }
 
 // quickStreamExplicitFalse 检测请求体是否显式设置了 stream:false
-// Claude Code 的 Anthropic Messages 请求不带 stream 字段，仍期望 SSE。
-// 只有显式 false 才表示客户端期望 raw JSON；缺失或 true 都表示期望 SSE。
+// Anthropic API 标准：stream 默认 false。无 stream 字段或 stream:false → JSON；stream:true → SSE。
+// Claude Code /model 验证请求不带 stream 字段，期望 JSON 响应。
 func quickStreamExplicitFalse(body json.RawMessage) bool {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
@@ -866,14 +880,44 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
-		// @AI_GUARD: STREAM_ERROR_FORMAT - 流式错误必须用标准 Anthropic SSE error 格式
-		// @CONSTRAINT: 错误事件格式：event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n
-		//   - 必须发送 message_stop 终止 SSE 流
-		//   - 不能使用 _type/_status 内部字段
+		// @AI_GUARD: STREAM_FALLBACK_NONSTREAM - 流式失败降级为非流式 SSE 包装
+		// @CONSTRAINT: SSE 头已发送（WriteHeader(200)），不能改回 JSON，必须用 writeNonStreamAsSSE 包装
+		// @REASON: 上游（如 SenseNova）对大请求（>100KB）的流式处理可能立即失败（context canceled），
+		//          但非流式 Call 能正常返回。降级确保客户端仍收到完整 SSE 响应。
+		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v — fallback to non-stream→SSE",
+			aliasModel, realModel, q.proxyBaseURL, len(body), err)
 		if q.verboseLevel >= 2 {
-			log.Printf("[sse-error] passthrough-stream → CallStream failed: %v", err)
+			log.Printf("[passthrough] stream failed, fallback to non-stream→SSE")
 		}
-		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
+		// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - fallback 必须用独立 Background ctx，不能用请求 ctx
+		nsBody := quickRemoveStreamFlag(body)
+		hbCtx := ctx
+		if hbCtx.Err() != nil {
+			hbCtx = context.Background()
+		}
+		callDone2, callFinished2 := StartSSEHeartbeat(w, flusher, hbCtx, q.verboseLevel)
+		fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
+		respBody, _, err2 := p.Call(fbCtx, nsBody, callInfo)
+		fbCancel()
+		close(callDone2)
+		<-callFinished2
+		if err2 != nil {
+			log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
+			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
+			return
+		}
+		// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+		respBody = stripThinkingContentBlocks(respBody)
+		respBody = fixNullUsageInResponse(respBody)
+		effectiveModel := realModel
+		if aliasHit && aliasModel != "" {
+			effectiveModel = aliasModel
+		}
+		writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+		vctx.upstreamReq = nsBody
+		vctx.upstreamResp = respBody
+		q.logRequest(vctx, startTime, http.StatusOK, extractUsage(respBody), nil)
 		return
 	}
 
@@ -908,9 +952,44 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 				if meta["_type"] == "headers" {
 					// 已在上方透传，跳过
 				} else if meta["_type"] == "error" {
-					// 上游 provider 内部错误 → 转为标准 Anthropic SSE error 事件
+					// @AI_GUARD: STREAM_FALLBACK_NONSTREAM - 流式 channel 内部错误降级
+					// @REASON: CallStream 成功但 channel 首事件为 _type=error（SenseNova 大请求），
+					//          必须降级为非流式 Call + SSE 包装，而非直接报 SSE error
 					errData, _ := meta["data"].(string)
-					sendSSEErrorBody(w, flusher, "api_error", errData)
+					log.Printf("[passthrough] upstream stream error (in-channel): %s=%s url=%s body_len=%d err=%s — fallback to non-stream→SSE",
+						aliasModel, realModel, q.proxyBaseURL, len(body), errData)
+					if q.verboseLevel >= 2 {
+						log.Printf("[passthrough] in-channel stream failed, fallback to non-stream→SSE")
+					}
+					heartbeat.Stop()
+					// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - 与请求 ctx 解绑，避免链式取消
+					nsBody := quickRemoveStreamFlag(body)
+					hbCtx := ctx
+					if hbCtx.Err() != nil {
+						hbCtx = context.Background()
+					}
+					callDone2, callFinished2 := StartSSEHeartbeat(w, flusher, hbCtx, q.verboseLevel)
+					fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
+					respBody, _, err2 := p.Call(fbCtx, nsBody, callInfo)
+					fbCancel()
+					close(callDone2)
+					<-callFinished2
+					if err2 != nil {
+						log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
+						sendSSEErrorBody(w, flusher, "api_error", fmt.Sprintf("stream error: %s; fallback non-stream error: %v", errData, err2))
+						return
+					}
+					respBody = stripThinkingContentBlocks(respBody)
+					respBody = fixNullUsageInResponse(respBody)
+					effectiveModel := realModel
+					if aliasHit && aliasModel != "" {
+						effectiveModel = aliasModel
+					}
+					writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+					vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+					vctx.upstreamReq = nsBody
+					vctx.upstreamResp = respBody
+					q.logRequest(vctx, startTime, http.StatusOK, extractUsage(respBody), nil)
 					return
 				} else {
 					// 过滤非标准 thinking 内容块：SenseNova 的 DeepSeek 模型返回
@@ -939,7 +1018,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 							continue
 						}
 					}
-					usage := q.extractUsage(trimSSEDataPrefix(line))
+					usage := extractUsage(trimSSEDataPrefix(line))
 					if usage != nil {
 						lastUsage = usage
 					}
@@ -1087,7 +1166,7 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	vctx.upstreamReq = body
 	vctx.upstreamResp = resp
 	vctx.outgoingBody = outResp
-	q.logRequest(vctx, startTime, http.StatusOK, q.extractUsage(outResp), nil)
+	q.logRequest(vctx, startTime, http.StatusOK, extractUsage(outResp), nil)
 }
 
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
@@ -1139,10 +1218,47 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	<-callFinished  // 等待心跳 goroutine 退出，防止并发写
 
 	if err != nil {
-		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
-		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v",
+		// @AI_GUARD: STREAM_FALLBACK_NONSTREAM - 流式失败降级为非流式 SSE 包装
+		// @CONSTRAINT: SSE 头已发送（WriteHeader(200)），不能改回 JSON，必须用 writeNonStreamAsSSE 包装
+		// @REASON: 上游（如 SenseNova）对大请求（>100KB）的流式处理可能立即失败（context canceled），
+		//          但非流式 Call 能正常返回。降级确保客户端仍收到完整 SSE 响应。
+		log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d err=%v — fallback to non-stream→SSE",
 			aliasModel, realModel, q.proxyBaseURL, len(body), err)
-		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
+		if q.verboseLevel >= 2 {
+			log.Printf("[passthrough] stream failed, fallback to non-stream→SSE")
+		}
+		// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - fallback 必须用独立 Background ctx，不能用请求 ctx
+		// @REASON: 上游流式失败常伴随 callCtx 取消（"stream read failed: context canceled"），
+		//          callCtx 父链包含请求 ctx，若父链被取消 fallback Call 会立即失败。
+		//          改用 Background+timeout 做独立的 fallback 请求，与请求 ctx 取消解绑。
+		nsBody := quickRemoveStreamFlag(body)
+		hbCtx := ctx
+		if hbCtx.Err() != nil {
+			hbCtx = context.Background()
+		}
+		callDone2, callFinished2 := StartSSEHeartbeat(w, flusher, hbCtx, q.verboseLevel)
+		fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
+		respBody, _, err2 := p.Call(fbCtx, nsBody, callInfo)
+		fbCancel()
+		close(callDone2)
+		<-callFinished2
+		if err2 != nil {
+			log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
+			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
+			return
+		}
+		// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+		respBody = stripThinkingContentBlocks(respBody)
+		respBody = fixNullUsageInResponse(respBody)
+		effectiveModel := realModel
+		if aliasHit && aliasModel != "" {
+			effectiveModel = aliasModel
+		}
+		writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+		vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+		vctx.upstreamReq = nsBody
+		vctx.upstreamResp = respBody
+		q.logRequest(vctx, startTime, http.StatusOK, extractUsage(respBody), nil)
 		return
 	}
 
@@ -1180,41 +1296,66 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					continue
 				}
 				if meta["_type"] == "error" {
+					// @AI_GUARD: STREAM_FALLBACK_NONSTREAM - 流式 channel 内部错误降级
+					// @CONSTRAINT: CallStream 成功返回 channel，但 channel 中传了错误事件（_type=="error"）
+					//   必须同样降级为非流式 Call + SSE 包装，而不是直接报 SSE error。
+					// @REASON: SenseNova 对大请求流式处理，CallStream 立即成功（无 error），
+					//   但 channel 首条事件就是 {"_type":"error","_status":502,"data":"stream read failed: context canceled"}。
+					//   此时心跳 ticker 已启动，需先停止再做非流式 fallback。
 					status, _ := meta["_status"].(float64)
 					if status == 0 {
 						status = 502
 					}
 					errData, _ := meta["data"].(string)
-					log.Printf("[passthrough] upstream stream error: %s=%s url=%s body_len=%d status=%v err=%s",
+					log.Printf("[passthrough] upstream stream error (in-channel): %s=%s url=%s body_len=%d status=%v err=%s — fallback to non-stream→SSE",
 						aliasModel, realModel, q.proxyBaseURL, len(body), status, errData)
-					// 先发 message_start（Claude Code 解析器要求 SSE 流以 message_start 开头）
-					// id 和 model 不能为空，否则 Claude Code 报 "empty or malformed response"
-					msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-					echoModel := realModel
-					if aliasHit && aliasModel != "" {
-						echoModel = aliasModel
+					if q.verboseLevel >= 2 {
+						log.Printf("[passthrough] in-channel stream failed, fallback to non-stream→SSE")
 					}
-					w.Write([]byte(`event: message_start` + "\n" +
-						fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID, echoModel) + "\n\n"))
-					// SSE 流已开始后不能再修改 HTTP 状态码，写入标准 SSE 错误事件
-					errJSON, _ := json.Marshal(map[string]interface{}{
-						"type": "error",
-						"error": map[string]interface{}{
-							"type":    "api_error",
-							"message": errData,
-						},
-					})
-					w.Write([]byte("event: error\ndata: "))
-					w.Write(errJSON)
-					w.Write([]byte("\n\n"))
-					// 发送 message_stop 终止 SSE 流（带 event: 前缀）
-					w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
-					flusher.Flush()
+					// 停止当前的 stream 心跳（ticker 在 for 循环外层 defer）
+					heartbeat.Stop()
+					// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - 与请求 ctx 解绑，避免链式取消
+					nsBody := quickRemoveStreamFlag(body)
+					hbCtx := ctx
+					if hbCtx.Err() != nil {
+						hbCtx = context.Background()
+					}
+					callDone2, callFinished2 := StartSSEHeartbeat(w, flusher, hbCtx, q.verboseLevel)
+					fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(q.timeout)*time.Second)
+					respBody, _, err2 := p.Call(fbCtx, nsBody, callInfo)
+					fbCancel()
+					close(callDone2)
+					<-callFinished2
+					if err2 != nil {
+						log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
+						// Fallback 也失败，再发送 SSE error
+						msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+						echoModel := realModel
+						if aliasHit && aliasModel != "" {
+							echoModel = aliasModel
+						}
+						w.Write([]byte(`event: message_start` + "\n" +
+							fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID, echoModel) + "\n\n"))
+						sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
+						return
+					}
+					// 过滤 thinking + 修复 usage（同 handlePassthroughNonStreamAsSSE）
+					respBody = stripThinkingContentBlocks(respBody)
+					respBody = fixNullUsageInResponse(respBody)
+					effectiveModel := realModel
+					if aliasHit && aliasModel != "" {
+						effectiveModel = aliasModel
+					}
+					writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+					vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
+					vctx.upstreamReq = nsBody
+					vctx.upstreamResp = respBody
+					q.logRequest(vctx, startTime, http.StatusOK, extractUsage(respBody), nil)
 					return
 				}
 			}
 			// 累积 usage（用于 -v 日志）
-			usage := q.extractUsage(trimSSEDataPrefix(line))
+			usage := extractUsage(trimSSEDataPrefix(line))
 			if usage != nil {
 				lastUsage = usage
 			}
@@ -1442,8 +1583,8 @@ func (q *QuickGateway) probeStreamPrefer(p provider.Provider, callInfo *schema.P
 // writeNonStreamAsSSE 将非流式完整响应 JSON 拆解为对应协议的 SSE 多事件流写入 w。
 // 自动检测响应格式（Anthropic / OpenAI ChatCompletion / Gemini / OpenAI Responses），
 // 返回从响应中提取的 usage（用于日志）。
-func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody []byte, effectiveModel string) *schema.InternalUsage {
-	usage := q.extractUsage(respBody)
+func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody []byte, effectiveModel string) *schema.InternalUsage {
+	usage := extractUsage(respBody)
 
 	var respMap map[string]interface{}
 	if err := json.Unmarshal(respBody, &respMap); err != nil {
@@ -1452,9 +1593,12 @@ func (q *QuickGateway) writeNonStreamAsSSE(w http.ResponseWriter, flusher http.F
 			compactBuf.Reset()
 			compactBuf.Write(respBody)
 		}
-		w.Write([]byte("data: "))
-		w.Write(compactBuf.Bytes())
-		w.Write([]byte("\n\n"))
+		// 原子写入（避免心跳 goroutine 在 Write 间隙插入打断 SSE 事件）
+		buf := make([]byte, 0, len("data: ")+compactBuf.Len()+len("\n\n"))
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, compactBuf.Bytes()...)
+		buf = append(buf, '\n', '\n')
+		w.Write(buf)
 		flusher.Flush()
 		return usage
 	}
@@ -1799,7 +1943,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	// 修复 usage 为 null 的问题：Claude Code 解析 K.usage.input_tokens 时若为 null 会报 undefined
 	respBody = fixNullUsageInResponse(respBody)
 
-	usage := q.writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
+	usage := writeNonStreamAsSSE(w, flusher, respBody, effectiveModel)
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamReq = nsBody
@@ -2017,7 +2161,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 
 	// 将翻译后的入站协议响应拆解为 SSE 事件流
 	effectiveModel := internalResp.Model
-	usage := q.writeNonStreamAsSSE(w, flusher, outgoingResp, effectiveModel)
+	usage := writeNonStreamAsSSE(w, flusher, outgoingResp, effectiveModel)
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	vctx.upstreamResp = resp
@@ -2070,8 +2214,20 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 立即发送响应头，防止客户端在等待上游首个响应时超时断开
 
+	// ⚠️ Responses 协议完全禁用 SSE 心跳：Codex 客户端严格校验 event 类型，
+	//   event: ping 不属于 OpenAI Responses API 事件集，插入后会导致其解析器
+	//   状态机异常，报 "stream closed before response.completed"。
+	//   Responses API 通过流动的 SSE 数据事件保持连接，无需额外心跳。
+	isResponsesIngress := internalReq != nil && internalReq.Protocol == "responses"
+
 	// ── 阶段 1: CallStream 期间的心跳 ──
-	callDone1, callFinished1 := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
+	var callDone1 chan struct{}
+	var callFinished1 chan struct{}
+	if isResponsesIngress {
+		callDone1, callFinished1 = newDummyHeartbeat()
+	} else {
+		callDone1, callFinished1 = StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
+	}
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	defer cancel()
@@ -2100,7 +2256,13 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// ── 阶段 2: 流处理期间的心跳（保护等待上游数据到达的空窗期） ──
 	// 使用 MutexSSEWriter 防止心跳 goroutine 与 TranslateStream 回调并发写 w
 	mw := NewMutexSSEWriter(w, flusher)
-	callDone2, callFinished2 := StartSSEHeartbeat(mw, mw, ctx, q.verboseLevel)
+	var callDone2 chan struct{}
+	var callFinished2 chan struct{}
+	if isResponsesIngress {
+		callDone2, callFinished2 = newDummyHeartbeat()
+	} else {
+		callDone2, callFinished2 = StartSSEHeartbeat(mw, mw, ctx, q.verboseLevel)
+	}
 
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
@@ -2208,7 +2370,13 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				choice := ccChunk.Choices[0]
 				msg := schema.InternalMessage{Role: schema.RoleAssistant}
 				text := choice.Delta.Content
-				if text == "" {
+				// ⚠️ Responses 协议：绝不能把上游 reasoning/thinking 当 output_text 正文输出
+				//   Responses 有独立的 response.output_text.delta / thinking 事件体系，
+				//   混发 thinking → Codex 解析器把思考当正文造成后续逻辑错乱
+				//   （如 thinking 开头的"思考"被当作正式回答的一部分）。
+				//   仅在非 Responses 入站时（CC/Anthropic 等）允许 Reasoning 回退：
+				//   Anthropic 入站的 TranslateStream 会单独合成 thinking 块。
+				if text == "" && !isResponsesIngress {
 					text = choice.Delta.Reasoning
 				}
 				if text != "" {
@@ -2742,7 +2910,7 @@ func trimSSEDataPrefix(line []byte) []byte {
 //   - OpenAI/ChatCompletion: usage.prompt_tokens / completion_tokens
 //   - Anthropic: usage.input_tokens / output_tokens
 //   - Responses API: usage.input_tokens / output_tokens
-func (q *QuickGateway) extractUsage(resp []byte) *schema.InternalUsage {
+func extractUsage(resp []byte) *schema.InternalUsage {
 	var m map[string]any
 	if err := json.Unmarshal(resp, &m); err != nil {
 		return nil

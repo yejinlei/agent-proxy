@@ -41,6 +41,28 @@ func (m *MutexSSEWriter) Flush() {
 	m.f.Flush()
 }
 
+// newDummyHeartbeat 返回一个立即可关闭的心跳占位通道，对
+//
+//	Responses 协议等不需要心跳的场景，避免启用心跳 goroutine 但仍
+//	保持 close(callDone) → <-callFinished 的清理契约不变。
+//
+// 使用：
+//
+//	callDone, callFinished := newDummyHeartbeat()
+//	... // 执行无需心跳的上游调用
+//	close(callDone)   // 仍可安全关闭（已关闭的 channel close 会 panic，故本函数不 pre-close）
+//	<-callFinished    // 立即返回
+func newDummyHeartbeat() (callDone chan struct{}, callFinished chan struct{}) {
+	callDone = make(chan struct{})
+	callFinished = make(chan struct{})
+	// 启动一个 goroutine：要么等待 callDone 被关闭，要么立即返回 callFinished
+	go func() {
+		<-callDone
+		close(callFinished)
+	}()
+	return
+}
+
 // @AI_GUARD: SSE_HEARTBEAT_FACTORY - 统一心跳 goroutine 工厂，所有 handler 必须使用此函数
 // @CONSTRAINT: 调用方必须遵循 close(callDone) → <-callFinished 清理顺序（顺序不可颠倒）
 //   - callDone 关闭 → 心跳 goroutine 退出 → close(callFinished) → 主 goroutine 在 <-callFinished 解除阻塞

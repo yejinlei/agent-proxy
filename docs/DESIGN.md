@@ -238,7 +238,7 @@ sequenceDiagram
 
 ### 心跳机制
 
-`stream` 和 `auto`（流式偏好）路径中，每 500ms 发送 `data: {}` 心跳（空 JSON 对象），防止上游思考（cogitation）期间客户端超时断开。
+`stream` 和 `auto`（流式偏好）路径中，每 500ms 发送 `event: ping\ndata: {"type":"ping"}\n\n` 心跳（标准 Anthropic ping 事件），防止上游思考（cogitation）期间客户端超时断开。
 
 ```mermaid
 sequenceDiagram
@@ -250,7 +250,7 @@ sequenceDiagram
     P->>C: HTTP 200 + Content-Type: text/event-stream
     P->>U: POST 流式请求
     loop 每 500ms 直到上游有数据
-        P->>C: data: {}<br/><br/>(心跳)
+        P->>C: event: ping<br/>data: {"type":"ping"}<br/><br/>(心跳)
     end
     U-->>P: SSE 数据行
     P->>C: data: {...}<br/><br/>(上游数据)
@@ -259,9 +259,17 @@ sequenceDiagram
     P->>C: data: {...}<br/><br/>
 ```
 
-格式为 `data: {}` 而非空 data 行——保留 `data:` 前缀供 Claude Code 重置超时计时器，同时使用合法 JSON `{}` 避免严格客户端（Kimi / Anthropic SDK）对空字符串 `JSON.parse("")` 报 `Unexpected end of JSON input`。
+**心跳格式演进（血泪教训，不可回退）：**
 
-心跳仅在等待上游响应期间发送，响应到达后立即 `close(done)` 停止。
+| 格式 | 问题 | 状态 |
+| --- | --- | --- |
+| `data: \n\n` | Kimi 等严格客户端空 data 行 `JSON.parse("")` 报错 | ❌ 已废弃 |
+| `data: {}\n\n` | Claude Code 解析为 Anthropic 事件，缺少 `type` 字段 → 解析失败 | ❌ 已废弃 |
+| `: heartbeat\n\n` | SSE 注释，Claude Code 不识别为"内容活动"，不重置 HTTP 超时 → 长上游响应时客户端断开 | ❌ 已废弃 |
+| `data: {"type":"ping"}\n\n` | 缺少 `event:` 前缀，Claude Code 不识别为 ping 事件，不重置超时 → 仍报 empty response | ❌ 已废弃 |
+| `event: ping\ndata: {"type":"ping"}\n\n` | 完整 Anthropic SSE 格式，Claude Code 正确识别并重置超时 | ✅ 当前使用 |
+
+心跳仅在等待上游响应期间发送，响应到达后立即 `close(done)` 停止。详见 [quick.go](file:///f:/src/agent-proxy/internal/server/quick.go#L56-L66) 的 `heartbeatEvent` 变量与 `@AI_GUARD: SSE_HEARTBEAT_FORMAT` 标记。
 
 ### SSE 透传 `data:` 前缀规范化
 
@@ -269,17 +277,25 @@ sequenceDiagram
 
 ### Anthropic SSE 事件合规性
 
-`NonStreamAsSSE` 生成的 Anthropic 流式事件严格遵循 [Anthropic Messages API 规范](https://docs.anthropic.com/en/api/messages-streaming)：
+`NonStreamAsSSE` 与 `TranslateStream` 生成的 Anthropic 流式事件严格遵循 [Anthropic Messages API 规范](https://docs.anthropic.com/en/api/messages-streaming)：
 
 | 事件                    | 关键字段                                                   | 合规要点                                                                                                  |
 | --------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `message_start`       | `message.type`, `message.stop_reason`, `message.usage` | `type` 必填 `"message"`；`stop_reason` 初始为 `null`；`usage` 为 `{input_tokens, output_tokens:1}` 对象（非 null） |
-| `content_block_start` | `content_block.citations`                              | `text` 类型必须包含 `citations: []`                                                                         |
-| `content_block_delta` | `delta.type`, `delta.text`                             | `text_delta` / `thinking_delta` 区分                                                                    |
-| `content_block_stop`  | `index`                                                | —                                                                                                     |
-| `message_delta`       | `delta.stop_reason`, `delta.stop_sequence`, `usage`    | `stop_sequence` 必填（`null`）；`usage` 仅含 `output_tokens`（`input_tokens` 已在 `message_start` 给出）           |
+| `message_start`       | `message.type`, `message.id`, `message.stop_reason`, `message.usage` | `type` 必填 `"message"`；`id` 必填 `msg_<timestamp>`（不可为空，否则 Claude Code 报 empty/malformed response）；`stop_reason` 初始为 `null`；`usage` 为 `{input_tokens:0, output_tokens:0}` 对象（非 null，`output_tokens` 必须为 `0` 不可为 `1`） |
+| `content_block_start` | `content_block.citations`                              | `text` 类型必须包含 `citations: []`（不可省略，否则 Kimi 解析失败）；必须在第一个 `content_block_delta` 之前发送           |
+| `content_block_delta` | `delta.type`, `delta.text`                             | `text_delta` / `thinking_delta` / `input_json_delta` 区分                                              |
+| `content_block_stop`  | `index`                                                | 必须在 `message_delta` 之前发送；`ctx.Done()` 时也必须发送                                                          |
+| `message_delta`       | `delta.stop_reason`, `delta.stop_sequence`, `usage`    | `stop_sequence` 必填（`null`）；**必须始终发送**，即使 `usage` 为 `nil` 也需带默认 `output_tokens:0`（Claude Code 校验 `K.usage.input_tokens`） |
 | `message_stop`        | `type`                                                 | `{"type":"message_stop"}`                                                                             |
-| `error`               | `type`, `error.type`, `error.message`                  | 标准 `{"type":"error","error":{"type":"...","message":"..."}}`                                          |
+| `error`               | `type`, `error.type`, `error.message`                  | 标准 `event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n`                 |
+
+**完整事件序列（缺一不可）：**
+
+```
+message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop
+```
+
+详见 [anthropic/translator.go](file:///f:/src/agent-proxy/internal/protocol/anthropic/translator.go#L370-L391) 的 `@AI_GUARD: ANTHROPIC_TRANSLATE_STREAM` 标记。
 
 ### `NonStreamAsSSE` 响应格式检测
 
@@ -344,11 +360,11 @@ flowchart TD
     A1["Anthropic SSE<br/>event: content_block_delta"] --> IE[InternalStreamEvent]
     A2["OpenAI SSE<br/>data: choices..."] --> IE
     A3["Gemini SSE<br/>data: candidates..."] --> IE
-    A4["Responses SSE<br/>event: response.output_delta"] --> IE
+    A4["Responses SSE<br/>event: response.output_text.delta"] --> IE
     IE --> B1["Anthropic SSE<br/>event: content_block_delta"]
     IE --> B2["OpenAI SSE<br/>data: choices..."]
     IE --> B3["Gemini SSE<br/>data: candidates..."]
-    IE --> B4["Responses SSE<br/>event: response.output_delta"]
+    IE --> B4["Responses SSE<br/>event: response.output_text.delta"]
 ```
 
 > 左侧 4 种上游协议 SSE 经 `providerTranslator.TranslateStreamEvent()` 转为 `InternalStreamEvent`，再经 `ingressTranslator.TranslateStream()` 转回入站协议 SSE 输出。
@@ -360,9 +376,23 @@ flowchart TD
 | Anthropic      | `content_block_delta` / `message_start` / `message_delta` → `InternalStreamEvent` | `InternalStreamEvent` → 完整事件序列：`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop` |
 | ChatCompletion | CC delta chunk → `InternalStreamEvent`                                            | 直接透传 `data: {...}`                                     |
 | Gemini         | Gemini chunk → `InternalStreamEvent`                                              | `InternalStreamEvent` → Gemini SSE                     |
-| Responses      | Responses event → `InternalStreamEvent`                                           | `InternalStreamEvent` → Responses SSE                  |
+| Responses      | Responses event → `InternalStreamEvent`                                           | `InternalStreamEvent` → Responses SSE（完整事件序列见下表）       |
 
 > **Anthropic 输出路径 SSE 事件生命周期约束**：`TranslateStream` 通过 `blockStarted` 状态标记确保严格遵守 Anthropic 规范的完整事件序列。`message_start` 的 `message.content` 初始化为 `[]`（非 `null`），`content_block_start` 包含 `citations: []`，`content_block_stop` 在 `message_delta` 之前发送，`ctx.Done()` 时也安全关闭。详见 [AGENTS.md](../AGENTS.md) 的 Anthropic SSE 事件生命周期章节。
+
+> **Responses 输出路径 SSE 事件生命周期约束（Codex 兼容）**：`TranslateStream` 必须生成完整事件序列，Codex 严格校验每个事件的字段名与结构：
+>
+> ```
+> response.created → response.output_item.added → response.output_text.delta* → response.output_item.done → response.completed
+> ```
+>
+> 关键约束：
+> - `response.created` / `response.completed` 事件数据必须用 `response` 字段（非 `data`）
+> - `response.completed` 的 `response.output[]` 必须包含累积的完整内容
+> - channel 关闭或 `ctx.Done()` 时必须补发完整结束序列再发 `[DONE]`
+> - 不可只发 `[DONE]`（Codex 报 `stream closed before response.completed`）
+>
+> 详见 [responses/translator.go](file:///f:/src/agent-proxy/internal/protocol/responses/translator.go#L350-L363) 的 `@AI_GUARD: RESPONSES_TRANSLATE_STREAM` 标记。
 
 各协议 SSE 格式差异：
 
@@ -371,7 +401,7 @@ flowchart TD
 | CC / OpenAI | 纯 `data: {...}\n\n`，无 event 行，以 `data: [DONE]` 结尾                        |
 | Anthropic   | 每行带 `type` 字段（`message_start` / `content_block_delta` / `message_delta`） |
 | Gemini      | 每行是完整 `StreamChunk` 对象，带 `candidates` 数组                                 |
-| Responses   | 带 named events（`event: response.output_delta` 等）                         |
+| Responses   | 带 named events（`event: response.created` / `response.output_text.delta` / `response.completed` 等），以 `data: [DONE]` 结尾 |
 
 #### 场景 A：入站流式 → 上游流式 → 出站 SSE（`handleStreamRequest`）
 
@@ -571,9 +601,51 @@ Claude Code 使用 fable 原生模型时，agent-proxy 的完整请求处理流�
 | 问题                       | 决策                         | 原因                                                 |
 | ------------------------ | -------------------------- | -------------------------------------------------- |
 | 验证请求不带 `stream` 字段       | 走 `NonStreamAsSSE`（SSE 包装） | Claude Code 的 SSE 解析器期望流式事件，`stream:false` 才走 JSON |
-| 心跳格式                     | `data: {}`（不是 `: ping`）    | Claude Code 只统计 `data:` 行重置超时；`{}` 兼容 Kimi 等严格客户端  |
+| 心跳格式                     | `event: ping\ndata: {"type":"ping"}\n\n`（标准 Anthropic ping 事件） | Claude Code 只识别带 `event:` 前缀的 ping 事件并重置超时；其他格式（`data: {}`、`: heartbeat`、`data: {"type":"ping"}` 无 `event:`）均不识别或不合规 |
 | 首次流式请求                   | 仍走非流式上游                    | 用于探测基准，避免首次就 SSE 导致 ECONNRESET                     |
 | `streamPrefer` 按 baseURL | 独立存储                       | 多上游互不干扰                                            |
+
+### Claude Code 客户端校验约束（v0.2.67-v0.2.74 血泪教训）
+
+Claude Code 客户端对响应字段有严格校验，以下问题均会导致会话异常，已在代码中通过 `@AI_GUARD` 标记固化：
+
+| 问题症状 | 根因 | 修复版本 | 修复位置 |
+| --- | --- | --- | --- |
+| `API returned an empty or malformed response (HTTP 200)` | `message_start` 的 `id` 字段为空字符串 | v0.2.67 | [anthropic/translator.go](file:///f:/src/agent-proxy/internal/protocol/anthropic/translator.go#L421-L434) |
+| `undefined is not an object (evaluating 'K.usage.input_tokens')` | 上游不返回 `usage` 字段，Claude Code 校验 `usage.input_tokens` 时崩溃 | v0.2.68 | [quick.go](file:///f:/src/agent-proxy/internal/server/quick.go#L717-L785) `fixNullUsageInResponse` |
+| `API returned an empty or malformed response (HTTP 200)`（流式） | `message_start.usage.output_tokens` 硬编码为 `1`，且 `message_delta` 缺失 `usage` 字段 | v0.2.68 | [anthropic/translator.go](file:///f:/src/agent-proxy/internal/protocol/anthropic/translator.go#L427) `output_tokens:0` |
+| `Connection to the API was lost (ECONNRESET)` | 大请求（>100KB）流式处理 12-18s 才失败，客户端等不及断开；降级请求复用已取消的 ctx | v0.2.73-v0.2.74 | [quick.go](file:///f:/src/agent-proxy/internal/server/quick.go#L459-L475) 大请求阈值 + 独立 ctx 降级 |
+
+**关键修复函数：**
+- `fixNullUsageInResponse`: 透传响应中 `usage` 为 `null` 或缺失时补默认值，按响应格式（Anthropic `content[]` / CC `choices[]`）生成对应字段名
+- `extractUsage`: 修复全零值误判，仅当无任何可识别 token 数字时返回 `nil`
+- `writeNonStreamAsSSE` Anthropic 分支：`message_start` 中 `output_tokens` 必须为 `0`；`message_delta` 始终发送，`usage` 为 `nil` 时默认 `output_tokens:0`
+
+***
+
+## Codex 客户端特殊处理
+
+Codex CLI 使用 OpenAI Responses 协议（`/v1/responses`），对 SSE 事件生命周期有严格校验。
+
+### Codex 校验约束（v0.2.75 血泪教训）
+
+| 问题症状 | 根因 | 修复版本 | 修复位置 |
+| --- | --- | --- | --- |
+| `stream disconnected before completion: stream closed before response.completed` | `TranslateStream` 使用非标准 `data` 字段（应为 `response`）和非标准事件类型 `response.output_delta`（应为 `response.output_text.delta`），缺少 `response.output_item.added` / `response.output_item.done` 事件，`response.completed` 的 `output[]` 为空 | v0.2.75 | [responses/translator.go](file:///f:/src/agent-proxy/internal/protocol/responses/translator.go#L350-L363) `TranslateStream` 重写 |
+
+### Codex 要求的标准 Responses API SSE 事件序列
+
+```
+response.created → response.output_item.added → response.output_text.delta*
+→ response.output_item.done → response.completed → data: [DONE]
+```
+
+**关键约束：**
+- `response.created` / `response.completed` 事件数据必须用 `response` 字段（非 `data`）
+- `response.output_text.delta` 事件必须用 `delta` 字段（字符串），而非 `data.output_delta`
+- `response.output_item.added` / `response.output_item.done` 必须包含 `item` 字段（含 `id`、`type:"message"`、`role:"assistant"`、`content[]`）
+- `response.completed` 的 `response.output[]` 必须包含累积的完整内容（非空数组）
+- channel 关闭或 `ctx.Done()` 时必须补发完整结束序列再发 `[DONE]`
 
 ***
 

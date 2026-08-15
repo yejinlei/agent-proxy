@@ -381,6 +381,14 @@ func mapFinishReasonReverse(reason string) string {
 //
 // @RELATED: chatcompletion/translator.go TranslateStream (格式相同), anthropic/translator.go TranslateStream (格式不同)
 func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	// writeData 原子写入 SSE data 事件（避免心跳 goroutine 在 fn 间隙插入打断事件）
+	writeData := func(data []byte, isDone bool) {
+		buf := make([]byte, 0, len("data: ")+len(data)+2)
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, data...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, isDone)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -395,8 +403,7 @@ func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan sc
 			switch event.Type {
 			case "error":
 				errData := t.TranslateError(event.Error)
-				fn(append([]byte("data: "), errData...), false)
-				fn([]byte("\n\n"), false)
+				writeData(errData, false)
 				continue
 
 			case "delta":
@@ -440,8 +447,7 @@ func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan sc
 						UsageMetadata: usage,
 					}
 					raw, _ := json.Marshal(chunk)
-					fn(append([]byte("data: "), raw...), false)
-					fn([]byte("\n\n"), false)
+					writeData(raw, false)
 				}
 				continue
 
@@ -463,8 +469,7 @@ func (t *GeminiTranslator) TranslateStream(ctx context.Context, events <-chan sc
 					UsageMetadata: usage,
 				}
 				raw, _ := json.Marshal(chunk)
-				fn(append([]byte("data: "), raw...), false)
-				fn([]byte("\n\n"), false)
+				writeData(raw, false)
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
@@ -896,6 +901,14 @@ func (t *GeminiTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.Int
 }
 
 func (t *GeminiTranslator) TranslateStreamToCCSSE(ctx context.Context, events <-chan json.RawMessage, fn func(data []byte, isDone bool)) {
+	// writeData 原子写入 SSE data 事件（避免心跳 goroutine 在 fn 间隙插入打断事件）
+	writeData := func(data []byte, isDone bool) {
+		buf := make([]byte, 0, len("data: ")+len(data)+2)
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, data...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, isDone)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -918,8 +931,7 @@ func (t *GeminiTranslator) TranslateStreamToCCSSE(ctx context.Context, events <-
 			}
 
 			data := ToCCStreamChunk(event.Data)
-			fn(append([]byte("data: "), data...), false)
-			fn([]byte("\n\n"), false)
+			writeData(data, false)
 		}
 	}
 }

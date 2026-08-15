@@ -28,9 +28,17 @@ func (t *ChatCompletionTranslator) Protocol() string { return "chatcompletion" }
 //   - messages 逐条转换（role 映射、content 保持、tool_calls 保持）
 //   - stream 字段原样保留到 InternalRequest.Stream
 //   - 新增字段映射时必须同步修改 ChatCompletionRequest 结构体
+//   - ⚠️ stream_options: {include_usage: true} 必须注入到原始请求（Claude Code 依赖 usage 数据）
 //
-// @RELATED: anthropic/translator.go TranslateRequest, gemini/translator.go TranslateRequest
-// @REASON: 消息格式转换是整个网关的核心，字段映射错误会导致所有下游客户端崩溃
+// @RELATED: anthropic/translator.go TranslateRequest, gemini/translator.go TranslateRequest,
+//
+//	quick.go translateToProvider (注入 stream_options)
+//
+// @REASON: 消息格式转换是整个网关的核心，字段映射错误会导致所有下游客户端崩溃。
+//
+//	v0.2.68 修复：CC SSE 请求必须注入 stream_options:{include_usage:true}，确保上游返回 usage 数据，
+//	否则 Claude Code 无法获取 token 统计导致会话异常。
+//
 // TranslateRequest 将 ChatCompletionRequest 翻译为 InternalRequest
 func (t *ChatCompletionTranslator) TranslateRequest(ctx context.Context, rawReq json.RawMessage) (*schema.InternalRequest, error) {
 	var ccReq ChatCompletionRequest
@@ -212,10 +220,18 @@ func parseStopSequences(raw json.RawMessage) []string {
 
 // @AI_GUARD: CC_TRANSLATE_RESPONSE - InternalResponse → OpenAI ChatCompletion（Central Schema 出口）
 // @CONSTRAINT: 必须正确映射 InternalResponse 的 Choices/Usage/Model 到 CC 响应格式
-//   - finish_reason 映射必须正确（stop/length/tool_calls/content_filter）
-//   - usage 必须包含 prompt_tokens/completion_tokens/total_tokens
+//   - finish_reason 映射必须正确（stop/length/tool_calls/content_filter），透传未知值（如 cancelled/incomplete）
+//   - ⚠️ usage 必须为非空对象，不能为 nil — Claude Code 校验 usage 时会崩溃
+//   - thinking 块需通过 stripThinkingContentBlocks 过滤（非流式响应不含思考内容）
 //
-// @RELATED: anthropic/translator.go TranslateResponse, gemini/translator.go TranslateResponse
+// @RELATED: anthropic/translator.go TranslateResponse, gemini/translator.go TranslateResponse,
+//
+//	quick.go fixNullUsageInResponse (流式版本 usage 兜底)
+//
+// @REASON: v0.2.68 修复：usage 为 nil 时 Claude Code 报 "undefined is not an object"。
+//
+//	finish_reason 硬编码为 "stop" 导致 cancelled/tool_calls 场景客户端误判为正常结束。
+//
 // TranslateResponse 将 InternalResponse 翻译为 CC 响应
 func (t *ChatCompletionTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	ccResp := InternalToCCResponse(resp)

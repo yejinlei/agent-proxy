@@ -121,14 +121,15 @@ flowchart TD
 
 ### SSE 格式
 - 所有 SSE 数据行必须带 `data: ` 前缀
-- 心跳格式：`data: {"type":"ping"}\n\n`（Anthropic 标准 ping 事件）
+- 心跳格式：`event: ping\ndata: {"type":"ping"}\n\n`（完整 Anthropic 标准 ping 事件，必须带 `event: ping` 前缀）
   - 不可用 `data: {}\n\n`（Claude Code 解析为 Anthropic 事件，缺少 type 字段→失败）
   - 不可用 `data: \n\n`（Kimi 等严格客户端空 data 行 JSON.parse 报错）
   - 不可用 `: heartbeat\n\n`（SSE 注释，Claude Code 不识别为"内容活动"，不重置 HTTP 超时→长上游响应时客户端断开）
+  - 不可用 `data: {"type":"ping"}\n\n`（缺少 `event:` 前缀，Claude Code 不识别为 ping 事件，不重置超时→仍报 empty response）
 - 错误事件：`event: error\ndata: {"type":"error","error":{"type":"...","message":"..."}}\n\n`
 - Anthropic 事件字段合规性见 `docs/DESIGN.md`
 
-#### Anthropic SSE 事件生命周期
+#### Anthropic SSE 事件生命周期（Claude Code 兼容）
 
 **必须严格遵循 Anthropic 协议的完整事件序列：**
 
@@ -138,12 +139,44 @@ message_start → content_block_start → content_block_delta* → content_block
 
 关键约束：
 - `message_start` 的 `message.content` 必须序列化为 `[]`（空数组），不能为 `null`
+- `message_start` 的 `message.id` 必须为 `msg_<timestamp>` 格式，不能为空字符串（否则 Claude Code 报 `empty or malformed response`）
+- `message_start` 的 `message.usage.output_tokens` 必须为 `0`（不能为 `1`），最终 token 数在 `message_delta` 中写入
 - `content_block_start` 必须包含 `citations: []`（空数组），不能省略该字段
 - `content_block_start` 必须在第一个 `content_block_delta` 之前发送
 - `content_block_stop` 必须在 `message_delta` 之前发送
-- 流被取消（`ctx.Done()`）时也必须发送 `content_block_stop` 再结束
+- `message_delta` 必须始终发送，即使 `usage` 为 `nil` 也需带默认 `output_tokens:0`（Claude Code 校验 `K.usage.input_tokens`）
+- 流被取消（`ctx.Done()`）时也必须发送 `content_block_stop` + `message_delta` + `message_stop` 再结束
 
 这些约束在 [internal/protocol/anthropic/translator.go](internal/protocol/anthropic/translator.go) 的 `TranslateStream` 中通过 `blockStarted` 状态标记实现。
+
+#### Responses SSE 事件生命周期（Codex 兼容）
+
+**必须严格遵循 OpenAI Responses API 的完整事件序列：**
+
+```
+response.created → response.output_item.added → response.output_text.delta* → response.output_item.done → response.completed
+```
+
+关键约束（Codex 严格校验，违反任一项即报 `stream closed before response.completed`）：
+- `response.created` / `response.completed` 事件数据必须用 `response` 字段（**非 `data` 字段**）
+- `response.output_text.delta` 事件必须用 `delta` 字段（字符串），不能用非标准的 `response.output_delta` 事件类型
+- `response.output_item.added` / `response.output_item.done` 必须包含 `item` 字段（含 `id`、`type:"message"`、`role:"assistant"`、`content[]`）
+- `response.completed` 的 `response.output[]` 必须包含累积的完整内容（非空数组）
+- channel 关闭或 `ctx.Done()` 时必须补发完整结束序列（`output_item.done` + `response.completed`）再发 `[DONE]`
+- 不可只发 `[DONE]`（Codex 报 `stream closed before response.completed`）
+
+这些约束在 [internal/protocol/responses/translator.go](internal/protocol/responses/translator.go) 的 `TranslateStream` 中通过 `createdSent` / `itemAdded` 状态标记实现。
+
+#### Usage 字段兼容性（Claude Code 兼容）
+
+Claude Code 客户端校验 `usage.input_tokens` / `usage.output_tokens`，缺失或为 `null` 会报 `undefined is not an object`：
+
+- 透传响应中 `usage` 为 `null` 或缺失时，由 [quick.go](internal/server/quick.go) `fixNullUsageInResponse` 按响应格式补默认值：
+  - Anthropic 格式（`content[]`）：`{"input_tokens":0,"output_tokens":0}`
+  - CC 格式（`choices[]`）：`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`
+  - 未知格式：同时写入两种字段，安全兜底
+- 翻译路径的 `TranslateResponse` 中 `usage` 必须为非空对象
+- CC SSE 请求必须注入 `stream_options:{include_usage:true}`，确保上游返回 usage 数据
 
 ### HTTP 连接
 - 非流式请求使用独立 `http.Client`，与 SSE 连接池隔离
@@ -214,12 +247,12 @@ grep -rn "@REASON:" internal/
 | `INTERNAL_STREAM_EVENT` | schema/internal.go | 流式事件，所有流式翻译中转结构 |
 | **ChatCompletionTranslator** | | |
 | `CC_TRANSLATE_REQUEST` | chatcompletion/translator.go | CC → InternalRequest 消息格式转换 |
-| `CC_TRANSLATE_RESPONSE` | chatcompletion/translator.go | InternalResponse → CC 消息格式转换 |
-| `CC_TRANSLATE_STREAM` | chatcompletion/translator.go | CC SSE 流式出口 |
+| `CC_TRANSLATE_RESPONSE` | chatcompletion/translator.go | InternalResponse → CC 消息格式转换，usage 必须为非空对象，finish_reason 必须动态映射 |
+| `CC_TRANSLATE_STREAM` | chatcompletion/translator.go | CC SSE 流式出口，必须注入 stream_options:{include_usage:true} |
 | **AnthropicTranslator** | | |
 | `ANTHROPIC_TRANSLATE_REQUEST` | anthropic/translator.go | Anthropic → InternalRequest 消息格式转换 |
-| `ANTHROPIC_TRANSLATE_RESPONSE` | anthropic/translator.go | InternalResponse → Anthropic 消息格式转换 |
-| `ANTHROPIC_TRANSLATE_STREAM` | anthropic/translator.go | SSE 事件生命周期 |
+| `ANTHROPIC_TRANSLATE_RESPONSE` | anthropic/translator.go | InternalResponse → Anthropic 消息格式转换，usage 必须为非空对象（Claude Code 校验 K.usage.input_tokens） |
+| `ANTHROPIC_TRANSLATE_STREAM` | anthropic/translator.go | SSE 事件生命周期（Claude Code 兼容，message_start.id 必填、output_tokens 必须为 0、message_delta 必须始终发送） |
 | `MESSAGE_START_CONTENT` | anthropic/translator.go | Content 必须 `[]ContentBlock{}` |
 | `CONTENT_BLOCK_START_BEFORE_DELTA` | anthropic/translator.go | `citations: []` 必须存在 |
 | `TRANSLATE_STREAM_EVENT` | anthropic/translator.go | 上游 Anthropic SSE → InternalStreamEvent |
@@ -230,8 +263,8 @@ grep -rn "@REASON:" internal/
 | `GEMINI_TRANSLATE_STREAM_EVENT` | gemini/translator.go | 上游 Gemini SSE → InternalStreamEvent |
 | **ResponsesTranslator** | | |
 | `RESPONSES_TRANSLATE_REQUEST` | responses/translator.go | Responses → InternalRequest 消息格式转换 |
-| `RESPONSES_TRANSLATE_RESPONSE` | responses/translator.go | InternalResponse → Responses 消息格式转换 |
-| `RESPONSES_TRANSLATE_STREAM` | responses/translator.go | Responses SSE 流式出口 |
+| `RESPONSES_TRANSLATE_RESPONSE` | responses/translator.go | InternalResponse → Responses 消息格式转换，status 必须从 finish_reason 动态映射，usage 必须为非空对象 |
+| `RESPONSES_TRANSLATE_STREAM` | responses/translator.go | Responses SSE 流式出口（Codex 兼容，必须生成完整事件序列：response.created → output_item.added → output_text.delta → output_item.done → response.completed） |
 | `RESPONSES_TRANSLATE_STREAM_EVENT` | responses/translator.go | 上游 Responses SSE → InternalStreamEvent |
 | **模型别名** | | |
 | `ALIAS_RESOLVE` | db/aliasfile.go | 别名解析核心，三层优先级 |
@@ -249,7 +282,7 @@ grep -rn "@REASON:" internal/
 | `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
 | `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
-| `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`data: {"type":"ping"}`，不可改为注释格式） |
+| `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`event: ping\ndata: {"type":"ping"}\n\n`，必须带 `event:` 前缀） |
 | `SSE_HEARTBEAT_FACTORY` | sse_heartbeat.go | 统一心跳工厂函数，所有 handler 共用 |
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
