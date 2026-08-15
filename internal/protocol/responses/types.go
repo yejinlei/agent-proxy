@@ -6,17 +6,17 @@ import "encoding/json"
 
 // ResponseRequest Responses API 请求
 type ResponseRequest struct {
-	Model           string        `json:"model"`
-	Input           Input         `json:"input"`
-	Tools           []Tool        `json:"tools,omitempty"`
-	Stream          bool          `json:"stream,omitempty"`
-	Temperature     *float64      `json:"temperature,omitempty"`
-	TopP            *float64      `json:"top_p,omitempty"`
-	MaxOutputTokens int           `json:"max_output_tokens,omitempty"`
-	StopSequences   []string      `json:"stop_sequences,omitempty"`
+	Model           string          `json:"model"`
+	Input           Input           `json:"input"`
+	Tools           []Tool          `json:"tools,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            *float64        `json:"top_p,omitempty"`
+	MaxOutputTokens int             `json:"max_output_tokens,omitempty"`
+	StopSequences   []string        `json:"stop_sequences,omitempty"`
 	ResponseFormat  *ResponseFormat `json:"response_format,omitempty"`
-	Metadata        *Metadata     `json:"metadata,omitempty"`
-	Instructions    string        `json:"instructions,omitempty"` // 系统提示
+	Metadata        *Metadata       `json:"metadata,omitempty"`
+	Instructions    string          `json:"instructions,omitempty"` // 系统提示
 }
 
 // Input 兼容 Responses API 两种 input 形式：纯字符串（单消息）或 []InputItem 数组
@@ -57,18 +57,58 @@ func (r *ResponseRequest) UnmarshalJSON(data []byte) error {
 }
 
 type InputItem struct {
-	Type      string        `json:"type"`      // "message"
-	Role      string        `json:"role"`
-	Content   interface{}   `json:"content"`   // string | []ContentBlock
-	ToolCalls []ToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
-	Name      string        `json:"name,omitempty"`
+	Type       string      `json:"type"` // "message"
+	Role       string      `json:"role"`
+	Content    interface{} `json:"content"` // string | []ContentBlock
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Name       string      `json:"name,omitempty"`
 }
 
 type Tool struct {
 	Type       string                 `json:"type"` // "function"
 	Name       string                 `json:"name"`
 	Parameters map[string]interface{} `json:"parameters,omitempty"`
+}
+
+// UnmarshalJSON 兼容两种 tools 格式：
+// 1. Responses 原生格式: {"type":"function","name":"foo","parameters":{...}}
+// 2. CC 嵌套格式 (Codex 发送): {"type":"function","function":{"name":"foo","parameters":{...}}}
+// @REASON: Codex 对 /v1/responses 发送 CC 格式的 tools，function.name 嵌套在 function 字段内
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	// 先尝试 Responses 原生格式
+	type rawTool Tool
+	if err := json.Unmarshal(data, (*rawTool)(t)); err == nil && t.Name != "" {
+		return nil
+	}
+
+	// 回退：尝试 CC 嵌套格式 {type:"function", function:{name, parameters}}
+	type ccTool struct {
+		Type     string            `json:"type"`
+		Function *InternalFunction `json:"function"`
+	}
+	aux := struct {
+		*ccTool
+		Parameters map[string]interface{} `json:"parameters,omitempty"`
+	}{ccTool: (*ccTool)(new(ccTool))}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return json.Unmarshal(data, (*rawTool)(t))
+	}
+	if aux.Function != nil {
+		t.Type = aux.Type
+		t.Name = aux.Function.Name
+		t.Parameters = aux.Function.Parameters
+	} else {
+		t.Type = aux.Type
+		t.Parameters = aux.Parameters
+	}
+	return nil
+}
+
+type InternalFunction struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
 }
 
 type ToolCall struct {
@@ -89,25 +129,25 @@ type Metadata struct {
 
 // Response Responses API 响应
 type Response struct {
-	ID         string     `json:"id"`
-	Object     string     `json:"object"`   // "response"
-	Status     string     `json:"status"`   // "completed"
-	Model      string     `json:"model"`
+	ID         string       `json:"id"`
+	Object     string       `json:"object"` // "response"
+	Status     string       `json:"status"` // "completed"
+	Model      string       `json:"model"`
 	Output     []OutputItem `json:"output"`
-	Usage      *Usage     `json:"usage,omitempty"`
-	StopReason string     `json:"stop_reason,omitempty"`
+	Usage      *Usage       `json:"usage,omitempty"`
+	StopReason string       `json:"stop_reason,omitempty"`
 }
 
 type OutputItem struct {
-	Type     string       `json:"type"` // "message"
-	ID       string       `json:"id"`
-	Role     string       `json:"role"`
-	Content  []ContentBlock `json:"content"`
-	ToolCalls []ToolCall    `json:"tool_calls,omitempty"`
+	Type      string         `json:"type"` // "message"
+	ID        string         `json:"id"`
+	Role      string         `json:"role"`
+	Content   []ContentBlock `json:"content"`
+	ToolCalls []ToolCall     `json:"tool_calls,omitempty"`
 }
 
 type ContentBlock struct {
-	Type      string                 `json:"type"`  // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text" | "input_image"
+	Type      string                 `json:"type"` // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text" | "input_image"
 	Text      string                 `json:"text"`
 	ID        string                 `json:"id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
@@ -117,11 +157,11 @@ type ContentBlock struct {
 }
 
 type Usage struct {
-	InputTokens       int `json:"input_tokens"`
-	OutputTokens      int `json:"output_tokens"`
-	TotalTokens       int `json:"total_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	TotalTokens         int `json:"total_tokens"`
 	CacheCreationTokens int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadTokens   int `json:"cache_read_input_tokens,omitempty"`
+	CacheReadTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // StreamEvent Responses API 流式事件
@@ -143,9 +183,9 @@ type EventData struct {
 }
 
 type OutputDelta struct {
-	Type      string        `json:"type"`
-	Role      string        `json:"role"`
-	Content   []ContentDelta `json:"content"`
+	Type      string          `json:"type"`
+	Role      string          `json:"role"`
+	Content   []ContentDelta  `json:"content"`
 	ToolCalls []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
