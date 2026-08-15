@@ -357,18 +357,24 @@ func mapResponsesStatus(status string, stopReason string) string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // @AI_GUARD: RESPONSES_TRANSLATE_STREAM - InternalStreamEvent → OpenAI Responses SSE（流式出口）
-// @CONSTRAINT: Codex 严格要求极简 Responses API 事件序列 + stream closed 完成信号：
-//   - 纯文本最简序列（对齐 codex-app-server-proxy Golden Transcript）：
-//     response.created → response.output_text.delta* → response.output_text.done →
-//     response.completed → event: done + data: [DONE]
-//   - 函数调用独立序列：response.output_item.added (output_index=1..N, type=function_call) →
-//     response.function_call_arguments.delta* → response.function_call_arguments.done
+// @CONSTRAINT: Codex 严格要求 Responses API 事件序列 + stream closed 完成信号：
+//   - 纯文本最简序列：
+//     response.created → response.output_item.added(msg, output_index=0) →
+//     response.output_text.delta* → response.output_text.done →
+//     response.output_item.done(msg) → response.completed → event: done + data: [DONE]
+//   - 函数调用事件（output_index=1..N）：
+//     response.output_item.added(func, output_index=1) →
+//     response.function_call_arguments.delta* →
+//     response.function_call_arguments.done
 //   - ⚠️ 禁止发送 response.in_progress / response.content_part.added/done /
-//     response.output_item.done / sequence_number 等中间事件或字段，Codex 解析器报序列异常
+//     sequence_number 等中间事件或字段，Codex 解析器报序列异常
 //   - ⚠️ Responses 出口必须尾部发送 event: done\ndata: [DONE]\n\n 作为"流关闭"信号
 //     （response.completed 仅标识 response 对象完成，不等价于 SSE 流结束）
 //   - response.created/completed 事件数据必须用 "response" 字段（非 "data" 字段）
 //   - response.completed 的 response.output[] 必须包含累积完整内容（message + function_call items）
+//   - ⚠️ output_item.added 必须在 delta 之前（紧跟 response.created），确保 item 已注册
+//   - ⚠️ output_item.done 必须携带最终完整 content（非空 content 数组）
+//   - ⚠️ output_text.done 必须包含 text 字段（完整累积文本）
 //   - channel 关闭或 ctx.Done() 时必须补发完整结束序列再发 event:done/[DONE]
 //   - ⚠️ 所有 SSE 事件必须单字节切片原子写入 fn()，心跳已在 quick.go/gateway.go 中针对
 //     Responses 协议通过 newDummyHeartbeat 全程禁用（ping 事件破坏 Codex 解析状态机）
@@ -382,6 +388,7 @@ func mapResponsesStatus(status string, stopReason string) string {
 //  2. 多余中间事件 in_progress/content_part/output_item.done + sequence_number → 序列异常
 //  3. 心跳 ping 事件插入 → Codex 解析状态机崩 → stream closed before response.completed
 //  4. 缺 event: done + data: [DONE] 尾部 → Codex 认为 stream 未正常闭合
+//  5. v0.2.79 遗漏 message 类型 output_item.added/done 事件对 → stream closed before response.completed
 func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
 	now := time.Now().UnixNano()
 	responseID := fmt.Sprintf("resp_%d", now)
@@ -389,7 +396,9 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	var lastModel string
 	var lastUsage *Usage
 	createdSent := false
+	itemAdded := false
 	textDoneSent := false
+	messageID := fmt.Sprintf("msg_%d", now)
 
 	type funcCallState struct {
 		ID         string
@@ -442,6 +451,24 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		fn(buf, true)
 	}
 
+	sendOutputItemAddedMsg := func() {
+		if itemAdded {
+			return
+		}
+		itemAdded = true
+		sendSSE("response.output_item.added", map[string]interface{}{
+			"type":         "response.output_item.added",
+			"output_index": 0,
+			"item": map[string]interface{}{
+				"id":      messageID,
+				"type":    "message",
+				"role":    "assistant",
+				"status":  "in_progress",
+				"content": []interface{}{},
+			},
+		})
+	}
+
 	sendCreated := func() {
 		if createdSent {
 			return
@@ -454,12 +481,19 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"status": "in_progress",
 			},
 		})
+		// 紧跟 response.created 发送 message 类型的 output_item.added，
+		// 确保 item 在任何内容到达之前已注册（Codex 状态机要求）
+		sendOutputItemAddedMsg()
 	}
 
 	sendTextDelta := func(text string) {
+		sendOutputItemAddedMsg()
 		sendSSE("response.output_text.delta", map[string]interface{}{
-			"type":  "response.output_text.delta",
-			"delta": text,
+			"type":          "response.output_text.delta",
+			"item_id":       messageID,
+			"output_index":  0,
+			"content_index": 0,
+			"delta":         text,
 		})
 	}
 
@@ -499,16 +533,38 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 		finalText := accumulatedText.String()
 
+		// 确保 message 类型的 output_item.added 已发送
+		sendOutputItemAddedMsg()
+
 		if !textDoneSent {
 			textDoneSent = true
-			donePayload := map[string]interface{}{
-				"type": "response.output_text.done",
-			}
-			if finalText != "" {
-				donePayload["text"] = finalText
-			}
-			sendSSE("response.output_text.done", donePayload)
+			sendSSE("response.output_text.done", map[string]interface{}{
+				"type":          "response.output_text.done",
+				"item_id":       messageID,
+				"output_index":  0,
+				"content_index": 0,
+				"text":          finalText,
+			})
 		}
+
+		// 发送 message 类型的 output_item.done
+		finalMsgItem := map[string]interface{}{
+			"id":     messageID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "output_text",
+					"text": finalText,
+				},
+			},
+		}
+		sendSSE("response.output_item.done", map[string]interface{}{
+			"type":         "response.output_item.done",
+			"output_index": 0,
+			"item":         finalMsgItem,
+		})
 
 		for _, key := range funcCallOrder {
 			fc := funcCalls[key]
@@ -529,26 +585,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		}
 
 		output := make([]interface{}, 0, 1+len(funcCallOrder))
-
-		msgContent := make([]interface{}, 0)
-		if finalText != "" {
-			msgContent = append(msgContent, map[string]interface{}{
-				"type": "output_text",
-				"text": finalText,
-			})
-		}
-		messageItem := map[string]interface{}{
-			"id":     fmt.Sprintf("msg_%s", responseID[5:]),
-			"type":   "message",
-			"role":   "assistant",
-			"status": "completed",
-		}
-		if len(msgContent) > 0 {
-			messageItem["content"] = msgContent
-		} else {
-			messageItem["content"] = []interface{}{}
-		}
-		output = append(output, messageItem)
+		output = append(output, finalMsgItem)
 
 		for _, key := range funcCallOrder {
 			fc := funcCalls[key]
