@@ -3,6 +3,9 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
@@ -222,10 +225,19 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 
 // @AI_GUARD: RESPONSES_TRANSLATE_RESPONSE - InternalResponse → OpenAI Response（Central Schema 出口）
 // @CONSTRAINT: 必须正确映射 InternalResponse 到 OpenAI Responses 原生响应格式
-//   - ContentBlocks 转换为 output 数组
-//   - status 映射：completed → completed, 其他 → incomplete
+//   - ContentBlocks 转换为 output 数组（ContentBlock type 必须为 "output_text"/"output_image"，不能用 "text"/"image"）
+//   - ⚠️ status 必须从 finish_reason 动态映射，不能硬编码为 "completed" —
+//     例如 cancelled/tool_calls 等非 stop 原因需要映射为对应 status，否则 Codex 显示异常
+//   - output[] 必须为数组，含 type:"message" 的 OutputItem
+//   - ⚠️ usage 必须为非空对象（InputTokens/OutputTokens/TotalTokens），不能为 nil — Codex 客户端会校验
 //
-// @RELATED: chatcompletion/translator.go TranslateResponse, anthropic/translator.go TranslateResponse
+// @RELATED: chatcompletion/translator.go TranslateResponse, anthropic/translator.go TranslateResponse,
+//
+//	quick.go fixNullUsageInResponse (流式版本 usage 兜底)
+//
+// @REASON: 历史血泪教训 - v0.2.68 修复：response status 硬编码导致非 stop 场景状态错误，
+//
+//	影响 Codex 工具调用与中断场景的正确处理
 func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var contentBlocks []ContentBlock
 
@@ -345,104 +357,306 @@ func mapResponsesStatus(status string, stopReason string) string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // @AI_GUARD: RESPONSES_TRANSLATE_STREAM - InternalStreamEvent → OpenAI Responses SSE（流式出口）
-// @CONSTRAINT: OpenAI Responses SSE 格式为 "data: <json>\n\n"，结束标记为 "data: [DONE]\n\n"
-//   - channel 关闭或 ctx.Done() 时必须补发 response.completed 再发 [DONE]
-//   - 不可只发 [DONE]（Codex 报 "stream closed before response.completed"）
+// @CONSTRAINT: Codex 严格要求极简 Responses API 事件序列 + stream closed 完成信号：
+//   - 纯文本最简序列（对齐 codex-app-server-proxy Golden Transcript）：
+//     response.created → response.output_text.delta* → response.output_text.done →
+//     response.completed → event: done + data: [DONE]
+//   - 函数调用独立序列：response.output_item.added (output_index=1..N, type=function_call) →
+//     response.function_call_arguments.delta* → response.function_call_arguments.done
+//   - ⚠️ 禁止发送 response.in_progress / response.content_part.added/done /
+//     response.output_item.done / sequence_number 等中间事件或字段，Codex 解析器报序列异常
+//   - ⚠️ Responses 出口必须尾部发送 event: done\ndata: [DONE]\n\n 作为"流关闭"信号
+//     （response.completed 仅标识 response 对象完成，不等价于 SSE 流结束）
+//   - response.created/completed 事件数据必须用 "response" 字段（非 "data" 字段）
+//   - response.completed 的 response.output[] 必须包含累积完整内容（message + function_call items）
+//   - channel 关闭或 ctx.Done() 时必须补发完整结束序列再发 event:done/[DONE]
+//   - ⚠️ 所有 SSE 事件必须单字节切片原子写入 fn()，心跳已在 quick.go/gateway.go 中针对
+//     Responses 协议通过 newDummyHeartbeat 全程禁用（ping 事件破坏 Codex 解析状态机）
 //
-// @RELATED: chatcompletion/translator.go TranslateStream (格式相同), anthropic/translator.go TranslateStream (格式不同)
+// @RELATED: chatcompletion/translator.go TranslateStream, anthropic/translator.go TranslateStream,
+//
+//	quick.go handleStreamRequest（禁用心跳）, sse_heartbeat.go newDummyHeartbeat
+//
+// @REASON: 历史血泪教训 - v0.2.78 之前版本：
+//  1. 非标准事件 response.output_delta / 缺少 response.completed → Codex 静默丢弃 → 超时
+//  2. 多余中间事件 in_progress/content_part/output_item.done + sequence_number → 序列异常
+//  3. 心跳 ping 事件插入 → Codex 解析状态机崩 → stream closed before response.completed
+//  4. 缺 event: done + data: [DONE] 尾部 → Codex 认为 stream 未正常闭合
 func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	now := time.Now().UnixNano()
+	responseID := fmt.Sprintf("resp_%d", now)
+	var accumulatedText strings.Builder
+	var lastModel string
+	var lastUsage *Usage
+	createdSent := false
+	textDoneSent := false
+
+	type funcCallState struct {
+		ID         string
+		Name       string
+		CallID     string
+		OutputIdx  int
+		argsBuffer strings.Builder
+		addedSent  bool
+	}
+	funcCalls := make(map[string]*funcCallState)
+	funcCallOrder := make([]string, 0)
+	nextFuncOutputIdx := 1
+
+	getFC := func(tc schema.InternalToolCall, tcIndexInDelta int) *funcCallState {
+		key := tc.ID
+		if key == "" {
+			key = fmt.Sprintf("synth-%d-%d", tcIndexInDelta, nextFuncOutputIdx)
+		}
+		fc, ok := funcCalls[key]
+		if !ok {
+			name := tc.Function.Name
+			callID := tc.ID
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d_%s", nextFuncOutputIdx, responseID[5:])
+			}
+			fc = &funcCallState{
+				ID:        key,
+				Name:      name,
+				CallID:    callID,
+				OutputIdx: nextFuncOutputIdx,
+			}
+			nextFuncOutputIdx++
+			funcCalls[key] = fc
+			funcCallOrder = append(funcCallOrder, key)
+		}
+		return fc
+	}
+
+	sendSSE := func(eventType string, data interface{}) {
+		raw, _ := json.Marshal(data)
+		buf := make([]byte, 0, len("event: \ndata: ")+len(raw)+len("\n\n"))
+		buf = append(buf, []byte("event: "+eventType+"\ndata: ")...)
+		buf = append(buf, raw...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, false)
+	}
+
+	sendDoneSSE := func() {
+		buf := []byte("event: done\ndata: [DONE]\n\n")
+		fn(buf, true)
+	}
+
+	sendCreated := func() {
+		if createdSent {
+			return
+		}
+		createdSent = true
+		sendSSE("response.created", map[string]interface{}{
+			"type": "response.created",
+			"response": map[string]interface{}{
+				"id":     responseID,
+				"status": "in_progress",
+			},
+		})
+	}
+
+	sendTextDelta := func(text string) {
+		sendSSE("response.output_text.delta", map[string]interface{}{
+			"type":  "response.output_text.delta",
+			"delta": text,
+		})
+	}
+
+	sendOutputItemAddedFunc := func(fc *funcCallState) {
+		if fc.addedSent {
+			return
+		}
+		fc.addedSent = true
+		sendSSE("response.output_item.added", map[string]interface{}{
+			"type":         "response.output_item.added",
+			"output_index": fc.OutputIdx,
+			"item": map[string]interface{}{
+				"id":        fc.CallID,
+				"type":      "function_call",
+				"call_id":   fc.CallID,
+				"name":      fc.Name,
+				"status":    "in_progress",
+				"arguments": map[string]interface{}{},
+			},
+		})
+	}
+
+	sendFuncArgsDelta := func(fc *funcCallState, delta string) {
+		if delta == "" {
+			return
+		}
+		sendSSE("response.function_call_arguments.delta", map[string]interface{}{
+			"type":         "response.function_call_arguments.delta",
+			"item_id":      fc.CallID,
+			"output_index": fc.OutputIdx,
+			"delta":        delta,
+		})
+	}
+
+	sendCompleted := func() {
+		sendCreated()
+
+		finalText := accumulatedText.String()
+
+		if !textDoneSent {
+			textDoneSent = true
+			donePayload := map[string]interface{}{
+				"type": "response.output_text.done",
+			}
+			if finalText != "" {
+				donePayload["text"] = finalText
+			}
+			sendSSE("response.output_text.done", donePayload)
+		}
+
+		for _, key := range funcCallOrder {
+			fc := funcCalls[key]
+			if !fc.addedSent {
+				sendOutputItemAddedFunc(fc)
+			}
+			finalArgs := fc.argsBuffer.String()
+			if finalArgs == "" {
+				finalArgs = "{}"
+			}
+			sendSSE("response.function_call_arguments.done", map[string]interface{}{
+				"type":         "response.function_call_arguments.done",
+				"item_id":      fc.CallID,
+				"output_index": fc.OutputIdx,
+				"name":         fc.Name,
+				"arguments":    finalArgs,
+			})
+		}
+
+		output := make([]interface{}, 0, 1+len(funcCallOrder))
+
+		msgContent := make([]interface{}, 0)
+		if finalText != "" {
+			msgContent = append(msgContent, map[string]interface{}{
+				"type": "output_text",
+				"text": finalText,
+			})
+		}
+		messageItem := map[string]interface{}{
+			"id":     fmt.Sprintf("msg_%s", responseID[5:]),
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+		}
+		if len(msgContent) > 0 {
+			messageItem["content"] = msgContent
+		} else {
+			messageItem["content"] = []interface{}{}
+		}
+		output = append(output, messageItem)
+
+		for _, key := range funcCallOrder {
+			fc := funcCalls[key]
+			var argsObj interface{} = map[string]interface{}{}
+			raw := fc.argsBuffer.String()
+			if raw != "" {
+				_ = json.Unmarshal([]byte(raw), &argsObj)
+			}
+			output = append(output, map[string]interface{}{
+				"id":        fc.CallID,
+				"type":      "function_call",
+				"call_id":   fc.CallID,
+				"name":      fc.Name,
+				"status":    "completed",
+				"arguments": argsObj,
+			})
+		}
+
+		respPayload := map[string]interface{}{
+			"id":     responseID,
+			"status": "completed",
+			"output": output,
+		}
+		if lastModel != "" {
+			respPayload["model"] = lastModel
+		}
+		if lastUsage != nil {
+			respPayload["usage"] = lastUsage
+		} else {
+			respPayload["usage"] = &Usage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
+		}
+		sendSSE("response.completed", map[string]interface{}{
+			"type":     "response.completed",
+			"response": respPayload,
+		})
+
+		sendDoneSSE()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			// ctx 取消时也补发 response.completed，确保客户端收到完整事件序列
-			raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &EventData{Type: "response"}})
-			fn(append([]byte("event: response.completed\ndata: "), raw...), false)
-			fn([]byte("\n\n"), false)
-			fn([]byte("data: [DONE]\n\n"), true)
+			sendCompleted()
 			return
 		case event, ok := <-events:
 			if !ok {
-				// channel 关闭但未收到 done 事件（上游 [DONE] 无 FinishReason）→ 补发 response.completed
-				raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &EventData{Type: "response"}})
-				fn(append([]byte("event: response.completed\ndata: "), raw...), false)
-				fn([]byte("\n\n"), false)
-				fn([]byte("data: [DONE]\n\n"), true)
+				sendCompleted()
 				return
 			}
 
 			switch event.Type {
 			case "error":
+				sendCreated()
 				errData := t.TranslateError(event.Error)
-				fn(append([]byte("event: response.failed\ndata: "), errData...), false)
-				fn([]byte("\n\n"), false)
+				buf := make([]byte, 0, len("event: response.failed\ndata: ")+len(errData)+len("\n\n"))
+				buf = append(buf, []byte("event: response.failed\ndata: ")...)
+				buf = append(buf, errData...)
+				buf = append(buf, '\n', '\n')
+				fn(buf, false)
+				sendDoneSSE()
 				continue
 
 			case "start":
-				// start 事件始终发送 response.created（即使 ID 为空），
-				// 否则 Codex 报 "stream closed before response.completed"
-				eventData := EventData{Type: "response"}
-				if event.Data != nil && event.Data.ID != "" {
-					eventData.ID = event.Data.ID
+				if event.Data != nil && event.Data.Model != "" {
+					lastModel = event.Data.Model
 				}
-				raw, _ := json.Marshal(StreamEvent{Type: "response.created", Data: &eventData})
-				fn(append([]byte("event: response.created\ndata: "), raw...), false)
-				fn([]byte("\n\n"), false)
+				sendCreated()
 				continue
 
 			case "delta":
+				sendCreated()
 				if event.Data != nil && len(event.Data.Choices) > 0 {
 					choice := event.Data.Choices[0]
-					eventData := EventData{OutputIndex: choice.Index}
 
 					if choice.Message.Content != nil {
 						var text string
 						json.Unmarshal(choice.Message.Content, &text)
 						if text != "" {
-							eventData.OutputDelta = &OutputDelta{
-								Type:    "message",
-								Role:    "assistant",
-								Content: []ContentDelta{{Type: "delta", Text: text}},
-							}
+							sendTextDelta(text)
+							accumulatedText.WriteString(text)
 						}
 					}
 
-					for _, tc := range choice.Message.ToolCalls {
-						eventData.OutputDelta = &OutputDelta{
-							Type: "message",
-							ToolCalls: []ToolCallDelta{{
-								ID:   tc.ID,
-								Type: "function",
-								Name: tc.Function.Name,
-								Input: func() map[string]interface{} {
-									m := make(map[string]interface{})
-									json.Unmarshal(tc.Function.RawArguments, &m)
-									return m
-								}(),
-							}},
+					for i, tc := range choice.Message.ToolCalls {
+						fc := getFC(tc, i)
+						sendOutputItemAddedFunc(fc)
+						if tc.Function.Arguments != "" {
+							sendFuncArgsDelta(fc, tc.Function.Arguments)
+							fc.argsBuffer.WriteString(tc.Function.Arguments)
 						}
-					}
-
-					if eventData.OutputDelta != nil {
-						raw, _ := json.Marshal(StreamEvent{Type: "response.output_delta", Data: &eventData})
-						fn(append([]byte("event: response.output_delta\ndata: "), raw...), false)
-						fn([]byte("\n\n"), false)
 					}
 				}
 				continue
 
 			case "done":
-				eventData := EventData{Type: "response"}
-				if event.Data != nil && event.Data.Usage != nil {
-					eventData.Usage = &Usage{
-						InputTokens:  event.Data.Usage.PromptTokens,
-						OutputTokens: event.Data.Usage.CompletionTokens,
-						TotalTokens:  event.Data.Usage.TotalTokens,
+				if event.Data != nil {
+					if event.Data.Model != "" {
+						lastModel = event.Data.Model
+					}
+					if event.Data.Usage != nil {
+						lastUsage = &Usage{
+							InputTokens:  event.Data.Usage.PromptTokens,
+							OutputTokens: event.Data.Usage.CompletionTokens,
+							TotalTokens:  event.Data.Usage.TotalTokens,
+						}
 					}
 				}
-				raw, _ := json.Marshal(StreamEvent{Type: "response.completed", Data: &eventData})
-				fn(append([]byte("event: response.completed\ndata: "), raw...), false)
-				fn([]byte("\n\n"), false)
-				fn([]byte("data: [DONE]\n\n"), true)
+				sendCompleted()
 				return
 			}
 		}
@@ -896,6 +1110,14 @@ func (t *ResponsesTranslator) translateOutputDelta(data *EventData) *schema.Inte
 
 // TranslateStreamToCCSSE 将 Responses 流式输出翻译为 CC 格式 SSE
 func (t *ResponsesTranslator) TranslateStreamToCCSSE(ctx context.Context, events <-chan *StreamEvent, fn func(data []byte, isDone bool)) {
+	// writeData 原子写入 SSE data 事件（避免心跳 goroutine 在 fn 间隙插入打断事件）
+	writeData := func(data []byte, isDone bool) {
+		buf := make([]byte, 0, len("data: ")+len(data)+2)
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, data...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, isDone)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -919,14 +1141,12 @@ func (t *ResponsesTranslator) TranslateStreamToCCSSE(ctx context.Context, events
 
 			if internalEvent.Type == "error" {
 				errData, _ := json.Marshal(internalEvent.Error)
-				fn(append([]byte("data: {\"error\":"), errData...), false)
-				fn([]byte("}\n\n"), false)
+				writeData(append([]byte("{\"error\":"), errData...), false)
 				continue
 			}
 
 			data := ToCCStreamChunk(internalEvent.Data)
-			fn(append([]byte("data: "), data...), false)
-			fn([]byte("\n\n"), false)
+			writeData(data, false)
 		}
 	}
 }

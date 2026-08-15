@@ -256,8 +256,16 @@ func userIDFromMetadata(m *Metadata) string {
 //   - thinking 块必须包含 signature 字段
 //   - stop_reason 映射必须正确（end_turn/max_tokens/tool_use/stop_sequence）
 //   - usage 必须包含 input_tokens/output_tokens
+//   - ⚠️ usage 必须为非空对象，不能为 nil — Claude Code 访问 K.usage.input_tokens 时若为 null 会报 "undefined is not an object"
 //
-// @RELATED: chatcompletion/translator.go TranslateResponse, gemini/translator.go TranslateResponse
+// @RELATED: chatcompletion/translator.go TranslateResponse, gemini/translator.go TranslateResponse,
+//
+//	quick.go fixNullUsageInResponse (对应流式版本的 usage 兜底)
+//
+// @REASON: 历史血泪教训 - v0.2.68 修复：上游模型 sensenova-6.7-flash-lite 等不返回 usage，
+//
+//	Claude Code /model 命令验证模型时报 "undefined is not an object (evaluating 'K.usage.input_tokens')"
+//
 // TranslateResponse 将 InternalResponse 翻译为 Anthropic 原生响应
 func (t *AnthropicTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var contentBlocks []ContentBlock
@@ -370,44 +378,66 @@ func mapStopReasonReverse(reason string) string {
 //	- content_block_stop 必须在 message_delta 之前发送
 //	- ctx.Done() 时也必须发送 content_block_stop + message_delta + message_stop
 //	- 所有事件后必须跟 \n\n 双换行
+//	- ⚠️ message_start.usage.output_tokens 必须为 0（而非 1），最终 token 数在 message_delta 中写入
+//	- ⚠️ message_delta 必须始终发送，即使 usage 为 nil 也需带默认 output_tokens:0
+//	- ⚠️ message_start 中 ID 字段不能为空，需使用 msg_<timestamp> 格式
 //
 // @RELATED: quick.go handleStreamRequest (调用方), quick.go writeNonStreamAsSSE (非流式 SSE 包装)
-// @REASON: 历史血泪教训 - 事件序列/字段缺失导致 Kimi/Claude Code 解析失败，修复 N 次才稳定
+//
+//	gateway.go handleStreamRequest (双模式同步)
+//
+// @REASON: 历史血泪教训：
+//   - v0.2.67: message_start ID 为空导致 Claude Code 报 "API returned an empty or malformed response (HTTP 200)"
+//   - v0.2.68: message_start output_tokens=1 + message_delta usage 缺失导致
+//     "undefined is not an object (evaluating 'K.usage.input_tokens')"
+//   - 事件序列/字段缺失导致 Kimi/Claude Code 解析失败，修复 N 次才稳定
 func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan schema.InternalStreamEvent, fn func(eventData []byte, isDone bool)) {
+	// writeData 原子写入 SSE data 事件（避免心跳 goroutine 在 fn 间隙插入打断事件）
+	// @AI_GUARD: SSE_ATOMIC_WRITE - 必须将 data: + 内容 + \n\n 组装为单个 byte slice 一次性写入
+	// @CONSTRAINT: 不可拆分为多次 fn 调用（fn 每次触发 Flush，心跳 goroutine 会在间隙插入，
+	//   导致 data: 行和 \n\n 之间出现 event: ping，破坏 SSE 事件完整性）
+	// @RELATED: sse_heartbeat.go MutexSSEWriter, quick.go handleStreamRequest
+	writeData := func(data []byte, isDone bool) {
+		buf := make([]byte, 0, len("data: ")+len(data)+2)
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, data...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, isDone)
+	}
 	blockStarted := false // 当前内容块是否已发送 content_block_start
 	for {
 		select {
 		case <-ctx.Done():
 			if blockStarted {
 				raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
-				fn(append([]byte("data: "), raw...), false)
-				fn([]byte("\n\n"), false)
+				writeData(raw, false)
 			}
 			// 补全 message_delta + message_stop，符合 Anthropic 协议事件序列
 			raw, _ := json.Marshal(StreamEvent{
 				Type:         "message_delta",
 				MessageDelta: &MessageDelta{StopReason: "end_turn"},
 			})
-			fn(append([]byte("data: "), raw...), false)
-			fn([]byte("\n\n"), false)
+			writeData(raw, false)
 			raw, _ = json.Marshal(map[string]string{"type": "message_stop"})
-			fn(append([]byte("data: "), raw...), false)
-			fn([]byte("\n\n"), true)
+			writeData(raw, true)
 			return
 		case event, ok := <-events:
 			if !ok {
 				// channel 关闭 → 发送 message_stop 结束
 				raw, _ := json.Marshal(map[string]string{"type": "message_stop"})
-				fn(append([]byte("data: "), raw...), false)
-				fn([]byte("\n\n"), true)
+				writeData(raw, true)
 				return
 			}
 
 			switch event.Type {
 			case "error":
 				errData := t.TranslateError(event.Error)
-				fn(append([]byte("event: error\ndata: "), errData...), false)
-				fn([]byte("\n\n"), false)
+				// 原子写入错误事件（避免心跳插入打断）
+				errBuf := make([]byte, 0, len("event: error\ndata: ")+len(errData)+len("\n\n"))
+				errBuf = append(errBuf, []byte("event: error\ndata: ")...)
+				errBuf = append(errBuf, errData...)
+				errBuf = append(errBuf, '\n', '\n')
+				fn(errBuf, false)
 				continue
 
 			case "start":
@@ -430,8 +460,7 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 						msg.Model = event.Data.Model
 					}
 					raw, _ := json.Marshal(StreamEvent{Type: "message_start", Message: &msg})
-					fn(append([]byte("data: "), raw...), false)
-					fn([]byte("\n\n"), false)
+					writeData(raw, false)
 				}
 				continue
 
@@ -461,16 +490,14 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 								Index:        choice.Index,
 								ContentBlock: &ContentBlock{Type: "text", Text: "", Citations: []interface{}{}},
 							})
-							fn(append([]byte("data: "), raw...), false)
-							fn([]byte("\n\n"), false)
+							writeData(raw, false)
 						}
 						raw, _ := json.Marshal(StreamEvent{
 							Type:  "content_block_delta",
 							Index: choice.Index,
 							Delta: delta,
 						})
-						fn(append([]byte("data: "), raw...), false)
-						fn([]byte("\n\n"), false)
+						writeData(raw, false)
 					}
 				}
 				continue
@@ -480,8 +507,7 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 				if blockStarted {
 					blockStarted = false
 					raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
-					fn(append([]byte("data: "), raw...), false)
-					fn([]byte("\n\n"), false)
+					writeData(raw, false)
 				}
 				stopReason := "end_turn"
 				if event.Data != nil && len(event.Data.Choices) > 0 {
@@ -499,8 +525,7 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 					Type:         "message_delta",
 					MessageDelta: &MessageDelta{StopReason: stopReason},
 				})
-				fn(append([]byte("data: "), raw...), false)
-				fn([]byte("\n\n"), false)
+				writeData(raw, false)
 
 				// 最后发送 usage 行
 				if usage != nil {
@@ -508,8 +533,7 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 						"type":  "message_stop",
 						"usage": usage,
 					})
-					fn(append([]byte("data: "), usageRaw...), false)
-					fn([]byte("\n\n"), false)
+					writeData(usageRaw, false)
 				}
 				// Anthropic 协议以 message_stop 结束，不发送 [DONE]
 				fn(nil, true)
@@ -931,6 +955,14 @@ func (t *AnthropicTranslator) TranslateStreamEvent(raw json.RawMessage) *schema.
 }
 
 func (t *AnthropicTranslator) TranslateStreamToCCSSE(ctx context.Context, events <-chan json.RawMessage, fn func(data []byte, isDone bool)) {
+	// writeData 原子写入 SSE data 事件（避免心跳 goroutine 在 fn 间隙插入打断事件）
+	writeData := func(data []byte, isDone bool) {
+		buf := make([]byte, 0, len("data: ")+len(data)+2)
+		buf = append(buf, []byte("data: ")...)
+		buf = append(buf, data...)
+		buf = append(buf, '\n', '\n')
+		fn(buf, isDone)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -951,16 +983,14 @@ func (t *AnthropicTranslator) TranslateStreamToCCSSE(ctx context.Context, events
 				// 发送 usage chunk（如果有）再发送 [DONE]
 				if event.Data != nil && event.Data.Usage != nil {
 					chunk := ToCCStreamChunk(event.Data)
-					fn(append([]byte("data: "), chunk...), false)
-					fn([]byte("\n\n"), false)
+					writeData(chunk, false)
 				}
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
 
 			data := ToCCStreamChunk(event.Data)
-			fn(append([]byte("data: "), data...), false)
-			fn([]byte("\n\n"), false)
+			writeData(data, false)
 		}
 	}
 }
