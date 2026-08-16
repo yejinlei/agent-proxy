@@ -942,12 +942,17 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	defer cancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
+
+	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
+	body = stripGuidedGrammarFromRequest(body)
+	if q.verboseLevel > 0 {
+		hasGG := strings.Contains(string(body), "guided_grammar")
+		log.Printf("[strip] after stripGuidedGrammarFromRequest body_len=%d stillHasGuidedGrammar=%v", len(body), hasGG)
+	}
+
 	if aliasHit && aliasModel != "" {
 		body = quickReplaceModelInBody(body, aliasModel, realModel)
 	}
-
-	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
-	body = stripGuidedGrammarFromRequest(body)
 
 	upstreamStart := time.Now()
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
@@ -969,6 +974,9 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 		}
 		// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - fallback 必须用独立 Background ctx，不能用请求 ctx
 		nsBody := quickRemoveStreamFlag(body)
+		// 移除 guided_grammar：原 body 已 strip，nsBody 由 quickRemoveStreamFlag 产出，
+		// 但以防别名改写后产生非法 JSON，在此再 strip 一次确保生效
+		nsBody = stripGuidedGrammarFromRequest(nsBody)
 		hbCtx := ctx
 		if hbCtx.Err() != nil {
 			hbCtx = context.Background()
@@ -1195,6 +1203,10 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
 		return
 	}
+	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
+	// （quickReplaceModelInBody 产出的是 JSON 片段，json.Unmarshal 会失败）
+	body = stripGuidedGrammarFromRequest(body)
+
 	// 命中别名映射时，同步改写请求体中的 model 字段（URL 中已用 realModel，body 也要改）
 	if aliasHit && aliasModel != "" {
 		bodyBefore := string(body)
@@ -1302,6 +1314,9 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		sendSSEErrorBody(w, flusher, "invalid_request_error", fmt.Sprintf("read body: %v", err))
 		return
 	}
+	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
+	body = stripGuidedGrammarFromRequest(body)
+
 	// 命中别名映射时，同步改写请求体中的 model 字段
 	if aliasHit && aliasModel != "" {
 		body = quickReplaceModelInBody(body, aliasModel, realModel)
@@ -1990,12 +2005,15 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 
 	// 去掉 stream 标记
 	nsBody := quickRemoveStreamFlag(body)
+
+	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
+	// 必须在 alias 字符串替换之前处理，因为 quickReplaceModelInBody 产出的是 JSON 片段，
+	// json.Unmarshal 会失败，导致 strip 函数返回原 body 不生效。
+	nsBody = stripGuidedGrammarFromRequest(nsBody)
+
 	if aliasHit && aliasModel != "" {
 		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
 	}
-
-	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
-	nsBody = stripGuidedGrammarFromRequest(nsBody)
 
 	// 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
 	flusher, ok := w.(http.Flusher)
