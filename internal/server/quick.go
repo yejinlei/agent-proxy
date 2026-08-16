@@ -714,6 +714,33 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 	return json.RawMessage(out)
 }
 
+// stripGuidedGrammarFromRequest 移除透传请求中的 guided_grammar 字段
+// @REASON: Claude Code 客户端在 Anthropic API 请求中携带 guided_grammar（JSON schema 约束），
+//
+//	上游 sensenova 缺少 xgrammar 模块，不支持该功能，返回 HTTP 400:
+//	"guided_grammar '...' has compile_grammar_error: No module named 'xgrammar'"
+//	透传路径原样转发请求体，必须在发送前移除该字段。
+//
+// @AI_GUARD: PASSTHROUGH_REQUEST_FILTER - 所有透传入口点必须调用此函数
+func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
+	if len(body) == 0 {
+		return body
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+	if _, exists := raw["guided_grammar"]; exists {
+		delete(raw, "guided_grammar")
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
+	return json.RawMessage(out)
+}
+
 // stripToolUseDescription 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
 // @REASON: Fable 5 在 Anthropic tool_use 的 input 中额外添加 description 字段，
 //
@@ -918,6 +945,9 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 	if aliasHit && aliasModel != "" {
 		body = quickReplaceModelInBody(body, aliasModel, realModel)
 	}
+
+	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
+	body = stripGuidedGrammarFromRequest(body)
 
 	upstreamStart := time.Now()
 	lines, headers, err := p.CallStream(callCtx, body, callInfo)
@@ -1963,6 +1993,9 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	if aliasHit && aliasModel != "" {
 		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
 	}
+
+	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
+	nsBody = stripGuidedGrammarFromRequest(nsBody)
 
 	// 先设 SSE 头 + WriteHeader(200) + Flush()，确保心跳可写
 	flusher, ok := w.(http.Flusher)
