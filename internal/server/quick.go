@@ -727,18 +727,128 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 		return body
 	}
 
+	beforeLen := len(body)
+	hasGG := strings.Contains(string(body), "guided_grammar")
+	log.Printf("[strip] body_len=%d hasGuidedGrammar=%v", beforeLen, hasGG)
+
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return body
+		log.Printf("[strip] json.Unmarshal FAILED: %v, trying fallback string replace", err)
+		s := string(body)
+		// 简单策略：找到 "guided_grammar": ... 到下一个顶级字段结束
+		// 尝试用正则式替换：去除 "guided_grammar": <json_value>,
+		for {
+			idx := strings.Index(s, `"guided_grammar"`)
+			if idx < 0 {
+				break
+			}
+			colonIdx := strings.Index(s[idx:], ":")
+			if colonIdx < 0 {
+				break
+			}
+			valStart := idx + colonIdx + 1
+			// 跳过空白
+			for valStart < len(s) && (s[valStart] == ' ' || s[valStart] == '\t' || s[valStart] == '\n' || s[valStart] == '\r') {
+				valStart++
+			}
+			if valStart >= len(s) {
+				break
+			}
+			open := s[valStart]
+			var endIdx int
+			switch open {
+			case '{':
+				endIdx = matchBraces(s, valStart, '{', '}')
+			case '[':
+				endIdx = matchBraces(s, valStart, '[', ']')
+			case '"':
+				endIdx = matchString(s, valStart)
+			default:
+				// 简单字面量 (true/false/null/number)
+				endIdx = valStart
+				for endIdx < len(s) && s[endIdx] != ',' && s[endIdx] != '}' && s[endIdx] != ']' {
+					endIdx++
+				}
+			}
+			if endIdx < 0 {
+				break
+			}
+			trailEnd := endIdx + 1
+			for trailEnd < len(s) && s[trailEnd] == ' ' {
+				trailEnd++
+			}
+			if trailEnd < len(s) && s[trailEnd] == ',' {
+				trailEnd++
+			}
+			s = s[:idx] + s[trailEnd:]
+		}
+		log.Printf("[strip] fallback done, body_len=%d→%d", beforeLen, len(s))
+		return json.RawMessage(s)
 	}
 	if _, exists := raw["guided_grammar"]; exists {
 		delete(raw, "guided_grammar")
+		out, err := json.Marshal(raw)
+		if err != nil {
+			return body
+		}
+		log.Printf("[strip] structured strip done, body_len=%d→%d", beforeLen, len(out))
+		return json.RawMessage(out)
 	}
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return body
+	log.Printf("[strip] no guided_grammar key found")
+	return body
+}
+
+// matchBraces 返回匹配配对括号后的下一个字符索引（或 -1 表示未匹配）
+func matchBraces(s string, start int, open, close rune) int {
+	if start >= len(s) {
+		return -1
 	}
-	return json.RawMessage(out)
+	r := rune(s[start])
+	if r != open {
+		return -1
+	}
+	depth := 0
+	inStr := false
+	escape := false
+	for i := start; i < len(s); i++ {
+		c := rune(s[i])
+		if inStr {
+			if escape {
+				escape = false
+			} else if c == '\\' {
+				escape = true
+			} else if c == '"' {
+				inStr = false
+			}
+		} else {
+			if c == '"' {
+				inStr = true
+			} else if c == open {
+				depth++
+			} else if c == close {
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// matchString 返回字符串字面量结束的下一个字符索引（或 -1）
+func matchString(s string, start int) int {
+	if start >= len(s) || rune(s[start]) != '"' {
+		return -1
+	}
+	for i := start + 1; i < len(s); i++ {
+		if rune(s[i]) == '\\' {
+			i++
+		} else if rune(s[i]) == '"' {
+			return i + 1
+		}
+	}
+	return -1
 }
 
 // stripToolUseDescription 过滤 tool_use.input 中 Claude Code 不接受的多余 description 字段
