@@ -20,7 +20,7 @@ import (
 )
 
 // version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
-var version = "v0.2.89"
+var version = "v0.2.90"
 
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
@@ -51,7 +51,32 @@ func main() {
 			os.Exit(1)
 		}
 	case "check", "c":
-		if err := cmd.RunDBCheck(); err != nil {
+		var checkID *int
+		if len(args) > 1 {
+			if args[1] == "all" {
+				zero := 0
+				checkID = &zero
+			} else {
+				id, _ := strconv.Atoi(args[1])
+				checkID = &id
+			}
+		}
+		if err := cmd.RunDBCheck(checkID); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "update", "u":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy update <id|all>\n")
+			os.Exit(1)
+		}
+		var updateID int
+		if args[1] == "all" {
+			updateID = 0
+		} else {
+			updateID, _ = strconv.Atoi(args[1])
+		}
+		if err := cmd.RunDBUpdate(updateID); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
 		}
@@ -113,7 +138,32 @@ func runDBCommand(args []string) {
 			}
 		}
 	case "check", "c":
-		if err := cmd.RunDBCheck(); err != nil {
+		var checkID *int
+		if len(args) > 0 {
+			if args[0] == "all" {
+				zero := 0
+				checkID = &zero
+			} else {
+				id, _ := strconv.Atoi(args[0])
+				checkID = &id
+			}
+		}
+		if err := cmd.RunDBCheck(checkID); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+	case "update", "u":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "用法: agent-proxy db update <id|all>\n")
+			os.Exit(1)
+		}
+		var updateID int
+		if args[0] == "all" {
+			updateID = 0
+		} else {
+			updateID, _ = strconv.Atoi(args[0])
+		}
+		if err := cmd.RunDBUpdate(updateID); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
 		}
