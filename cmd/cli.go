@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/db"
+	"github.com/agent-proxy/agent-proxy/internal/server"
 )
 
 // openDB 打开默认 SQLite 数据库
@@ -130,6 +131,9 @@ func RunDBAdd(name, url, key string) error {
 		return fmt.Errorf("init db: %w", err)
 	}
 
+	// 检测上游类型（用于请求字段自适应过滤）
+	upstreamType := server.DetectUpstreamType(url)
+
 	// 多协议嗅探
 	result := sniffAll(url, key)
 
@@ -146,7 +150,7 @@ func RunDBAdd(name, url, key string) error {
 	}
 
 	// 打印嗅探摘要
-	fmt.Printf("🔎 探测到 %d 个协议，%d 个模型：\n", len(result.Capabilities), totalModels)
+	fmt.Printf("🔎 探测到 %d 个协议，%d 个模型（上游类型: %s）：\n", len(result.Capabilities), totalModels, upstreamType)
 	for _, proto := range result.Capabilities {
 		models := result.ModelsMap[proto]
 		fmt.Printf("  · %s (%d 个模型)\n", proto, len(models))
@@ -183,6 +187,7 @@ func RunDBAdd(name, url, key string) error {
 		ModelCount:       totalModels,
 		CapabilitiesJSON: string(capsJSON),
 		ModelsMapJSON:    string(modelsMapJSON),
+		UpstreamType:     upstreamType,
 		Weight:           100,
 		CreatedAt:        time.Now(),
 	})

@@ -511,8 +511,8 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 
 	callInfo := makePassthroughInfo(info, realModel)
 
-	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
-	body := stripGuidedGrammarFromRequest(rawBody)
+	// 上游类型自适应字段过滤：必须在发送上游前处理
+	body := applyUpstreamStrip(info.BaseURL, rawBody)
 
 	upstreamStart := time.Now()
 	lines, headers, err := client.CallStream(ctx, body, callInfo)
@@ -535,7 +535,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		}
 		// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - fallback 必须用独立 Background ctx，不能用请求 ctx
 		nsBody := quickRemoveStreamFlag(rawBody)
-		nsBody = stripGuidedGrammarFromRequest(nsBody)
+		nsBody = applyUpstreamStrip(info.BaseURL, nsBody)
 		hbCtx := ctx
 		if hbCtx.Err() != nil {
 			hbCtx = context.Background()
@@ -625,7 +625,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 					streamHeartbeat.Stop()
 					// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - 与请求 ctx 解绑，避免链式取消
 					nsBody := quickRemoveStreamFlag(rawBody)
-					nsBody = stripGuidedGrammarFromRequest(nsBody)
+					nsBody = applyUpstreamStrip(info.BaseURL, nsBody)
 					hbCtx := ctx
 					if hbCtx.Err() != nil {
 						hbCtx = context.Background()

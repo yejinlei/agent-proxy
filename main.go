@@ -20,7 +20,7 @@ import (
 )
 
 // version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
-var version = "v0.2.85"
+var version = "v0.2.87"
 
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
@@ -377,7 +377,7 @@ func startQuickMode(dbID int, clientKey string, clientKeyEnabled bool, aliasPath
 		baseURL = normalizeBaseURL(baseURL)
 	}
 
-	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), timeout, clientKey, clientKeyEnabled, verboseLevel)
+	quick := server.NewQuickGateway(record.Name, baseURL, record.Key, record.Capabilities(), record.ModelsMap(), record.UpstreamType, timeout, clientKey, clientKeyEnabled, verboseLevel)
 	if aliasPath != "" {
 		af, err := db.LoadAliasFile(aliasPath)
 		if err != nil {

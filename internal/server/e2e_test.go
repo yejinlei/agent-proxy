@@ -378,6 +378,7 @@ func setupMockGateway(t *testing.T) *mockGateway {
 		"mock-key",
 		[]string{"openai"},
 		nil,
+		"",
 		30,
 		"", false, 0,
 	)
@@ -453,6 +454,7 @@ func TestTimingLogsSlowUpstream(t *testing.T) {
 		"mock-key",
 		[]string{"openai"},
 		nil,
+		"",
 		30,
 		"", false, 2,
 	)
@@ -587,6 +589,7 @@ func TestHeartbeatDuringLongUpstreamCall(t *testing.T) {
 		"mock-key",
 		[]string{"openai"},
 		nil,
+		"",
 		30,
 		"", false, 2, // verboseLevel=2
 	)

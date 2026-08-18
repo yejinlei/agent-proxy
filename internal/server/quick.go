@@ -50,6 +50,8 @@ type QuickGateway struct {
 	// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
 	streamPreferMu sync.RWMutex
 	streamPrefer   map[string]bool // baseURL -> true=非流式更快, false=SSE 更快; key 不存在=未探测
+	// 请求体过滤：透传前移除上游不支持的字段（按上游类型自适应）
+	requestStripper func(json.RawMessage) json.RawMessage
 }
 
 // 心跳格式：Anthropic 标准 ping 事件（必须包含 event: ping 前缀）
@@ -65,16 +67,78 @@ type QuickGateway struct {
 // @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n、: heartbeat\n\n、data: {"type":"ping"}，各有问题
 var heartbeatEvent = []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
+// applyRequestStripper 应用上游类型自适应的请求字段过滤（未配置 stripper 时原样返回）
+// @AI_GUARD: PASSTHROUGH_REQUEST_FILTER - 所有透传入口点必须调用此方法
+func (q *QuickGateway) applyRequestStripper(body json.RawMessage) json.RawMessage {
+	if q.requestStripper == nil {
+		return body
+	}
+	return q.requestStripper(body)
+}
+
+// applyUpstreamStrip 按上游地址类型应用请求字段过滤（复杂模式 gateway.go 使用，多 provider 按请求判定）
+// @AI_GUARD: PASSTHROUGH_REQUEST_FILTER - 与 applyRequestStripper 同等约束
+func applyUpstreamStrip(baseURL string, body json.RawMessage) json.RawMessage {
+	if fn := newRequestStripper(DetectUpstreamType(baseURL)); fn != nil {
+		return fn(body)
+	}
+	return body
+}
+
+// DetectUpstreamType 根据 base URL 域名推断上游类型，用于自动加载请求字段过滤规则
+// @REASON: 不同上游对 Anthropic/CC 协议的兼容程度不同，某些字段（guided_grammar/cache_control/effort=xhigh）
+//
+//	在部分上游会触发 HTTP 400。透传路径不能硬编码特定上游，必须按上游类型自适应。
+//	db add 时调用并保存到 DB（upstream_type 列），运行时优先用 DB 值，缺失时回退到域名检测。
+func DetectUpstreamType(baseURL string) string {
+	host := strings.TrimPrefix(baseURL, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.Split(host, "/")[0]
+	host = strings.TrimSuffix(host, "/")
+	// 商汤 SenseNova
+	if strings.Contains(host, "sensenova") {
+		return "sensenova"
+	}
+	return "default"
+}
+
+// newRequestStripper 根据上游类型返回对应的请求体过滤函数
+// 新增加场只需在此处添加 case
+func newRequestStripper(upstreamType string) func(json.RawMessage) json.RawMessage {
+	switch upstreamType {
+	case "sensenova":
+		// 商汤 SenseNova 不支持:
+		// - guided_grammar (无 xgrammar 模块)
+		// - cache_control (无缓存功能)
+		// - output_config.effort="xhigh" (仅支持 low/medium/high)
+		return stripSensenovaRequestFields
+	case "default":
+		return nil
+	default:
+		return nil
+	}
+}
+
 // NewQuickGateway 从 DB 记录创建一个超简易网关
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
 // modelsMap: 协议→模型列表映射，如 {"openai":["gpt-4"],"anthropic":["claude-3"]}
-func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
+// upstreamType: db add 时保存的上游类型（如 "sensenova"），为空时按域名自动检测
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, upstreamType string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
 	registry.Register(anthropic.NewAnthropicTranslator("2023-06-01"))
 	registry.Register(gemini.NewGeminiTranslator())
 	registry.Register(responses.NewResponsesTranslator())
+
+	proxyBaseURL := strings.TrimSuffix(strings.TrimSuffix(baseURL, "/"), "/v1")
+	if upstreamType == "" {
+		upstreamType = DetectUpstreamType(proxyBaseURL)
+	}
+	stripper := newRequestStripper(upstreamType)
+	if stripper != nil {
+		log.Printf("[gateway] upstream=%s type=%s, request filter enabled", proxyBaseURL, upstreamType)
+	}
 
 	return &QuickGateway{
 		proxyName: name,
@@ -89,11 +153,13 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, models
 		capabilities:       capabilities,
 		modelsMap:          modelsMap,
 		translatorRegistry: registry,
-		proxyBaseURL:       strings.TrimSuffix(strings.TrimSuffix(baseURL, "/"), "/v1"),
+		proxyBaseURL:       proxyBaseURL,
 		proxyKey:           apiKey,
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
 		verboseLevel:       verboseLevel,
+		requestStripper:    stripper,
+		streamPrefer:       make(map[string]bool),
 	}
 }
 
@@ -718,15 +784,15 @@ func stripThinkingContentBlocks(resp json.RawMessage) json.RawMessage {
 	return json.RawMessage(out)
 }
 
-// stripGuidedGrammarFromRequest 移除透传请求中的 guided_grammar 字段
-// @REASON: Claude Code 客户端在 Anthropic API 请求中携带 guided_grammar（JSON schema 约束），
-//
-//	上游 sensenova 缺少 xgrammar 模块，不支持该功能，返回 HTTP 400:
-//	"guided_grammar '...' has compile_grammar_error: No module named 'xgrammar'"
-//	透传路径原样转发请求体，必须在发送前移除该字段。
+// stripGuidedGrammarFromRequest 移除透传请求中 sensenova 不支持的字段
+// @REASON: Claude Code 客户端在 Anthropic API 请求中携带 sensenova 不兼容的字段：
+//   - guided_grammar: sensenova 缺少 xgrammar 模块，返回 HTTP 400
+//   - cache_control: sensenova 不支持缓存控制
+//   - output_config.effort="xhigh": sensenova 仅支持 low/medium/high
+//     透传路径原样转发请求体，必须在发送前处理这些字段。
 //
 // @AI_GUARD: PASSTHROUGH_REQUEST_FILTER - 所有透传入口点必须调用此函数
-func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
+func stripSensenovaRequestFields(body json.RawMessage) json.RawMessage {
 	if len(body) == 0 {
 		return body
 	}
@@ -740,7 +806,6 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 		log.Printf("[strip] json.Unmarshal FAILED: %v, trying fallback string replace", err)
 		s := string(body)
 		// 简单策略：找到 "guided_grammar": ... 到下一个顶级字段结束
-		// 尝试用正则式替换：去除 "guided_grammar": <json_value>,
 		for {
 			idx := strings.Index(s, `"guided_grammar"`)
 			if idx < 0 {
@@ -751,7 +816,6 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 				break
 			}
 			valStart := idx + colonIdx + 1
-			// 跳过空白
 			for valStart < len(s) && (s[valStart] == ' ' || s[valStart] == '\t' || s[valStart] == '\n' || s[valStart] == '\r') {
 				valStart++
 			}
@@ -768,7 +832,6 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 			case '"':
 				endIdx = matchString(s, valStart)
 			default:
-				// 简单字面量 (true/false/null/number)
 				endIdx = valStart
 				for endIdx < len(s) && s[endIdx] != ',' && s[endIdx] != '}' && s[endIdx] != ']' {
 					endIdx++
@@ -789,8 +852,8 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 		log.Printf("[strip] fallback done, body_len=%d→%d", beforeLen, len(s))
 		return json.RawMessage(s)
 	}
-	// 递归删除所有层级的 guided_grammar（可能是嵌套字段）
-	pruned := removeGuidedGrammarRecursive(raw)
+	// 递归删除所有层级的不兼容字段 + 修正 output_config.effort
+	pruned := stripSensenovaIncompatible(raw)
 	out, err := json.Marshal(pruned)
 	if err != nil {
 		log.Printf("[strip] marshal after prune FAILED: %v", err)
@@ -800,23 +863,41 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 	return json.RawMessage(out)
 }
 
-// removeGuidedGrammarRecursive 递归删除 map 中所有层级的 guided_grammar 键
-func removeGuidedGrammarRecursive(v interface{}) interface{} {
+// stripSensenovaIncompatible 递归处理 sensenova 不兼容字段
+// 1. 删除所有层级的 guided_grammar
+// 2. 删除所有层级的 cache_control
+// 3. output_config.effort="xhigh" → "high"
+func stripSensenovaIncompatible(v interface{}) interface{} {
 	switch m := v.(type) {
 	case map[string]interface{}:
+		// 删除 guided_grammar 和 cache_control
 		delete(m, "guided_grammar")
+		delete(m, "cache_control")
+		// 修正 output_config.effort
+		if oc, ok := m["output_config"].(map[string]interface{}); ok {
+			if effort, ok := oc["effort"].(string); ok && effort == "xhigh" {
+				oc["effort"] = "high"
+				log.Printf("[strip] output_config.effort xhigh→high")
+			}
+		}
 		for k, val := range m {
-			m[k] = removeGuidedGrammarRecursive(val)
+			m[k] = stripSensenovaIncompatible(val)
 		}
 		return m
 	case []interface{}:
 		for i, val := range m {
-			m[i] = removeGuidedGrammarRecursive(val)
+			m[i] = stripSensenovaIncompatible(val)
 		}
 		return m
 	default:
 		return v
 	}
+}
+
+// removeGuidedGrammarRecursive 递归删除 map 中所有层级的 guided_grammar 键
+// @deprecated: 已由 stripSensenovaIncompatible 替代，保留以兼容旧调用点
+func removeGuidedGrammarRecursive(v interface{}) interface{} {
+	return stripSensenovaIncompatible(v)
 }
 
 // matchBraces 返回匹配配对括号后的下一个字符索引（或 -1 表示未匹配）
@@ -1074,12 +1155,8 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
 
-	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
-	body = stripGuidedGrammarFromRequest(body)
-	if q.verboseLevel > 0 {
-		hasGG := strings.Contains(string(body), "guided_grammar")
-		log.Printf("[strip] after stripGuidedGrammarFromRequest body_len=%d stillHasGuidedGrammar=%v", len(body), hasGG)
-	}
+	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
+	body = q.applyRequestStripper(body)
 
 	if aliasHit && aliasModel != "" {
 		body = quickReplaceModelInBody(body, aliasModel, realModel)
@@ -1105,9 +1182,8 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 		}
 		// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - fallback 必须用独立 Background ctx，不能用请求 ctx
 		nsBody := quickRemoveStreamFlag(body)
-		// 移除 guided_grammar：原 body 已 strip，nsBody 由 quickRemoveStreamFlag 产出，
-		// 但以防别名改写后产生非法 JSON，在此再 strip 一次确保生效
-		nsBody = stripGuidedGrammarFromRequest(nsBody)
+		// 上游类型自适应字段过滤（fallback 路径再过滤一次确保生效）
+		nsBody = q.applyRequestStripper(nsBody)
 		hbCtx := ctx
 		if hbCtx.Err() != nil {
 			hbCtx = context.Background()
@@ -1334,9 +1410,8 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
 		return
 	}
-	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
-	// （quickReplaceModelInBody 产出的是 JSON 片段，json.Unmarshal 会失败）
-	body = stripGuidedGrammarFromRequest(body)
+	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
+	body = q.applyRequestStripper(body)
 
 	// 命中别名映射时，同步改写请求体中的 model 字段（URL 中已用 realModel，body 也要改）
 	if aliasHit && aliasModel != "" {
@@ -1445,8 +1520,8 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		sendSSEErrorBody(w, flusher, "invalid_request_error", fmt.Sprintf("read body: %v", err))
 		return
 	}
-	// 移除 guided_grammar：必须在 alias 字符串替换之前处理
-	body = stripGuidedGrammarFromRequest(body)
+	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
+	body = q.applyRequestStripper(body)
 
 	// 命中别名映射时，同步改写请求体中的 model 字段
 	if aliasHit && aliasModel != "" {
@@ -2137,10 +2212,8 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	// 去掉 stream 标记
 	nsBody := quickRemoveStreamFlag(body)
 
-	// 移除 guided_grammar：上游 sensenova 不支持，透传必须过滤
-	// 必须在 alias 字符串替换之前处理，因为 quickReplaceModelInBody 产出的是 JSON 片段，
-	// json.Unmarshal 会失败，导致 strip 函数返回原 body 不生效。
-	nsBody = stripGuidedGrammarFromRequest(nsBody)
+	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
+	nsBody = q.applyRequestStripper(nsBody)
 
 	if aliasHit && aliasModel != "" {
 		nsBody = quickReplaceModelInBody(nsBody, aliasModel, realModel)
