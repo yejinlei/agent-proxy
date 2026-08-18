@@ -785,17 +785,34 @@ func stripGuidedGrammarFromRequest(body json.RawMessage) json.RawMessage {
 		log.Printf("[strip] fallback done, body_len=%d→%d", beforeLen, len(s))
 		return json.RawMessage(s)
 	}
-	if _, exists := raw["guided_grammar"]; exists {
-		delete(raw, "guided_grammar")
-		out, err := json.Marshal(raw)
-		if err != nil {
-			return body
-		}
-		log.Printf("[strip] structured strip done, body_len=%d→%d", beforeLen, len(out))
-		return json.RawMessage(out)
+	// 递归删除所有层级的 guided_grammar（可能是嵌套字段）
+	pruned := removeGuidedGrammarRecursive(raw)
+	out, err := json.Marshal(pruned)
+	if err != nil {
+		log.Printf("[strip] marshal after prune FAILED: %v", err)
+		return body
 	}
-	log.Printf("[strip] no guided_grammar key found")
-	return body
+	log.Printf("[strip] structured strip done, body_len=%d→%d", beforeLen, len(out))
+	return json.RawMessage(out)
+}
+
+// removeGuidedGrammarRecursive 递归删除 map 中所有层级的 guided_grammar 键
+func removeGuidedGrammarRecursive(v interface{}) interface{} {
+	switch m := v.(type) {
+	case map[string]interface{}:
+		delete(m, "guided_grammar")
+		for k, val := range m {
+			m[k] = removeGuidedGrammarRecursive(val)
+		}
+		return m
+	case []interface{}:
+		for i, val := range m {
+			m[i] = removeGuidedGrammarRecursive(val)
+		}
+		return m
+	default:
+		return v
+	}
 }
 
 // matchBraces 返回匹配配对括号后的下一个字符索引（或 -1 表示未匹配）

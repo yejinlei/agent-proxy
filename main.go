@@ -20,7 +20,7 @@ import (
 )
 
 // version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
-var version = "v0.2.84"
+var version = "v0.2.85"
 
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
