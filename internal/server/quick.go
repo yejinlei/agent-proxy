@@ -435,12 +435,14 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		stream := quickDetectStream(body)
 
 		if stream {
-			// 流式偏好：按上游地址，首次直接走非流式（安全默认），响应后后台竞速 SSE
-			q.streamPreferMu.RLock()
+			// 流式偏好：按上游地址，首次请求并行竞速 SSE vs 非流式，后续直接用胜出方式
+			// 必须用写锁防止并发请求同时看到 tested=false 而重复启动 probe（竞态条件）
+			q.streamPreferMu.Lock()
 			preferNonStream, tested := q.streamPrefer[q.proxyBaseURL]
-			q.streamPreferMu.RUnlock()
 			if !tested {
-				// 首次请求：非流式响应，记录耗时，完成后后台探测 SSE 速度
+				// 立即标记为已探测（默认非流式），防止并发重复启动 probe
+				q.streamPrefer[q.proxyBaseURL] = true
+				q.streamPreferMu.Unlock()
 				if q.verboseLevel >= 2 {
 					log.Printf("[route] stream=true, auto-probe (first request for %s)", q.proxyBaseURL)
 				}
@@ -450,7 +452,9 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				callInfo.Name = realModel
 				go q.probeStreamPrefer(p, callInfo, realModel, time.Since(nsStart))
 				return
-			} else if preferNonStream {
+			}
+			q.streamPreferMu.Unlock()
+			if preferNonStream {
 				if q.verboseLevel >= 2 {
 					log.Printf("[route] stream=true, prefer non-stream→SSE")
 				}
