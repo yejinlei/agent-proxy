@@ -275,7 +275,7 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 					log.Printf("[route] passthrough stream=true")
 				}
 			}
-			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, realModel, ingressProtocol, startTime)
+			g.handlePassthroughStream(ctx, w, r, providerClient, info, body, realModel, originalModel, aliasHit, ingressProtocol, startTime)
 		} else {
 			if g.verboseLevel >= 2 {
 				log.Printf("[route] passthrough stream=false")
@@ -408,14 +408,33 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 	}
 
 	callInfo := makePassthroughInfo(info, realModel)
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(info.TimeoutSec)*time.Second)
+	defer cancel()
+
+	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
+	body := applyUpstreamStrip(info.BaseURL, rawBody)
+
+	// 命中别名映射时，同步改写请求体中的 model 字段（URL 中已用 realModel，body 也要改）
+	if aliasHit && aliasModel != "" {
+		body = quickReplaceModelInBody(body, aliasModel, realModel)
+	}
+
 	upstreamStart := time.Now()
-	resp, headers, err := client.Call(ctx, rawBody, callInfo)
+	resp, headers, err := client.Call(callCtx, body, callInfo)
 	if g.verboseLevel >= 2 {
 		log.Printf("[upstream] Call %s → %v", realModel, time.Since(upstreamStart))
 	}
 	if err != nil {
 		if g.verboseLevel >= 2 {
 			log.Printf("[error] gateway-passthrough-nonstream → Call failed: model=%s, err=%v", realModel, err)
+		}
+		if httpStatus, bodyData := parseCallError(err); httpStatus > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(httpStatus)
+			w.Write([]byte(bodyData))
+			latency := time.Since(startTime).Milliseconds()
+			g.recordRequest(r, startTime, info.Name, httpStatus, latency, "")
+			return
 		}
 		latency := time.Since(startTime).Milliseconds()
 		g.recordRequest(r, startTime, info.Name, http.StatusInternalServerError, latency, err.Error())
@@ -473,7 +492,7 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 // handlePassthroughStream 透传流式：下游 SSE 过滤元数据后原样转发
 func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	client provider.Provider, info *schema.ProviderInfo, rawBody json.RawMessage,
-	realModel string, ingressProtocol string, startTime time.Time) {
+	realModel string, aliasModel string, aliasHit bool, ingressProtocol string, startTime time.Time) {
 
 	if g.verboseLevel >= 2 {
 		handlerStart := time.Now()
@@ -558,7 +577,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
-		// 过滤 thinking + 修复 usage（同 quick.go handlePassthroughNonStreamAsSSE）
+		// 过滤 thinking + description + 修复 usage
 		respBody = stripThinkingContentBlocks(respBody)
 		respBody = stripToolUseDescription(respBody)
 		respBody = fixNullUsageInResponse(respBody)
@@ -705,6 +724,11 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 				}
 			}
 
+			// 别名回显：将流式 SSE 行中的 model 字段替换为客户端原始模型名
+			if aliasHit && aliasModel != "" {
+				echoLine := echoAliasInStreamLine([]byte(lineStr), aliasModel)
+				lineStr = string(echoLine)
+			}
 			w.Write([]byte(lineStr))
 			w.Write([]byte("\n\n"))
 			flusher.Flush()
@@ -718,6 +742,10 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		}
 	}
 streamDone:
+	if !isPTResponses {
+		w.Write([]byte("event: done\ndata: {}\n\n"))
+		flusher.Flush()
+	}
 
 	g.recordRequest(r, startTime, "", http.StatusOK, time.Since(startTime).Milliseconds(), "")
 }
