@@ -1958,11 +1958,26 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 					blockType = bt
 				}
 
-				// content_block_start（按 Anthropic 标准补 citations:[]）
+				// content_block_start（按 Anthropic 标准补全各块类型必填字段）
+				// @AI_GUARD: NONSTREAM_AS_SSE_TOOL_USE - tool_use 块的 id/name 必填，否则
+				// Claude Code 报 "The model's tool call could not be parsed"
 				blockStartMap := map[string]interface{}{"type": blockType}
-				if blockType == "text" {
+				switch blockType {
+				case "text":
 					blockStartMap["text"] = ""
 					blockStartMap["citations"] = []interface{}{}
+				case "tool_use":
+					toolID, _ := blockMap["id"].(string)
+					if toolID == "" {
+						toolID = fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+					}
+					blockStartMap["id"] = toolID
+					if name, ok := blockMap["name"].(string); ok {
+						blockStartMap["name"] = name
+					}
+					blockStartMap["input"] = map[string]interface{}{}
+				case "thinking":
+					blockStartMap["thinking"] = ""
 				}
 				blockStart := map[string]interface{}{
 					"type":          "content_block_start",
@@ -2004,6 +2019,24 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 							"delta": map[string]interface{}{
 								"type":     "thinking_delta",
 								"thinking": thinking,
+							},
+						})
+					case "tool_use":
+						// tool_use 的 input 通过 input_json_delta 以 JSON 字符串发送
+						inputRaw := blockMap["input"]
+						if inputRaw == nil {
+							inputRaw = map[string]interface{}{}
+						}
+						inputJSON, ierr := json.Marshal(inputRaw)
+						if ierr != nil {
+							return nil, nil
+						}
+						return json.Marshal(map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type":         "input_json_delta",
+								"partial_json": string(inputJSON),
 							},
 						})
 					default:
