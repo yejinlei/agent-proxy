@@ -14,22 +14,24 @@ import (
 
 // ProxyRecord 数据库中保存的代理配置
 type ProxyRecord struct {
-	ID             int       `db:"id"`
-	Name           string    `db:"name"`
-	URL            string    `db:"url"`
-	Key            string    `db:"key"`
-	ProviderType   string    `db:"provider_type"`   // "openai" | "anthropic" | "gemini"
-	DetectedFormat string    `db:"detected_format"` // 检测到的协议格式
-	OpenAICap      bool      `db:"openai_cap"`
-	AnthropicCap   bool      `db:"anthropic_cap"`
-	ModelCount     int       `db:"model_count"`
-	ModelsJSON     string    `db:"models_json"`
+	ID             int    `db:"id"`
+	Name           string `db:"name"`
+	URL            string `db:"url"`
+	Key            string `db:"key"`
+	ProviderType   string `db:"provider_type"`   // "openai" | "anthropic" | "gemini"
+	DetectedFormat string `db:"detected_format"` // 检测到的协议格式
+	OpenAICap      bool   `db:"openai_cap"`
+	AnthropicCap   bool   `db:"anthropic_cap"`
+	ModelCount     int    `db:"model_count"`
+	ModelsJSON     string `db:"models_json"`
 	// 多协议支持：存储嗅探出的所有协议能力和每协议模型列表
-	CapabilitiesJSON string  `db:"capabilities_json"` // JSON: ["openai","anthropic","gemini","responses"]
-	ModelsMapJSON    string  `db:"models_map_json"`   // JSON: {"openai":["gpt-4"],"anthropic":["claude-3"]}
-	Weight         int       `db:"weight"`
+	CapabilitiesJSON string `db:"capabilities_json"` // JSON: ["openai","anthropic","gemini","responses"]
+	ModelsMapJSON    string `db:"models_map_json"`   // JSON: {"openai":["gpt-4"],"anthropic":["claude-3"]}
+	// 上游类型：db add 时探测并保存，用于请求字段自适应过滤（如 sensenova）
+	UpstreamType string `db:"upstream_type"`
+	Weight       int    `db:"weight"`
 
-	CreatedAt      time.Time `db:"created_at"`
+	CreatedAt time.Time `db:"created_at"`
 }
 
 // Models 解析 models_json 为字符串切片
@@ -89,6 +91,7 @@ func (r *ProxyRecord) ModelsMap() map[string][]string {
 	}
 	return m
 }
+
 // 返回所有协议下检测到的模型总数
 func (r *ProxyRecord) TotalModelCount() int {
 	if r.ModelsMapJSON != "" {
@@ -170,6 +173,9 @@ func (d *DB) Init() error {
 	if !d.columnExists("proxies", "models_map_json") {
 		_, _ = d.db.Exec("ALTER TABLE proxies ADD COLUMN models_map_json TEXT")
 	}
+	if !d.columnExists("proxies", "upstream_type") {
+		_, _ = d.db.Exec("ALTER TABLE proxies ADD COLUMN upstream_type TEXT")
+	}
 	return nil
 }
 
@@ -206,11 +212,11 @@ func (d *DB) Add(record *ProxyRecord) error {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
 	result, err := d.db.Exec(`
-		INSERT INTO proxies (name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO proxies (name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, record.Name, record.URL, record.Key, record.ProviderType, record.DetectedFormat,
 		boolInt(record.OpenAICap), boolInt(record.AnthropicCap), record.ModelCount,
-		string(modelsJSON), string(capsJSON), record.ModelsMapJSON,
+		string(modelsJSON), string(capsJSON), record.ModelsMapJSON, record.UpstreamType,
 		record.Weight, record.CreatedAt.Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("insert proxy: %w", err)
@@ -223,13 +229,14 @@ func (d *DB) Add(record *ProxyRecord) error {
 func scanRecord(rows *sql.Rows, r *ProxyRecord) error {
 	var oaiCap, antCap int64
 	var ts string
-	var ns1, ns2, ns3 sql.NullString
-	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &r.Weight, &ts); err != nil {
+	var ns1, ns2, ns3, ns4 sql.NullString
+	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &r.Weight, &ts); err != nil {
 		return err
 	}
 	r.ModelsJSON = ns1.String
 	r.CapabilitiesJSON = ns2.String
 	r.ModelsMapJSON = ns3.String
+	r.UpstreamType = ns4.String
 	r.OpenAICap = oaiCap != 0
 	r.AnthropicCap = antCap != 0
 	if t, err := time.Parse(time.RFC3339, ts); err == nil {
@@ -241,7 +248,7 @@ func scanRecord(rows *sql.Rows, r *ProxyRecord) error {
 // List 列出所有代理记录
 func (d *DB) List() ([]ProxyRecord, error) {
 	rows, err := d.db.Query(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at
 		FROM proxies
 		ORDER BY id
 	`)
@@ -265,17 +272,18 @@ func (d *DB) GetByID(id int) (*ProxyRecord, error) {
 	var r ProxyRecord
 	var oaiCap, antCap int64
 	var ts string
-	var ns1, ns2, ns3 sql.NullString
+	var ns1, ns2, ns3, ns4 sql.NullString
 	err := d.db.QueryRow(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at
 		FROM proxies WHERE id = ?
-	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &r.Weight, &ts)
+	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &r.Weight, &ts)
 	if err != nil {
 		return nil, err
 	}
 	r.ModelsJSON = ns1.String
 	r.CapabilitiesJSON = ns2.String
 	r.ModelsMapJSON = ns3.String
+	r.UpstreamType = ns4.String
 	r.OpenAICap = oaiCap != 0
 	r.AnthropicCap = antCap != 0
 	if t, err := time.Parse(time.RFC3339, ts); err == nil {
