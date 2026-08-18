@@ -1636,6 +1636,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 					heartbeat.Stop()
 					// @AI_GUARD: FALLBACK_DETACHED_CONTEXT - 与请求 ctx 解绑，避免链式取消
 					nsBody := quickRemoveStreamFlag(body)
+					nsBody = q.applyRequestStripper(nsBody)
 					hbCtx := ctx
 					if hbCtx.Err() != nil {
 						hbCtx = context.Background()

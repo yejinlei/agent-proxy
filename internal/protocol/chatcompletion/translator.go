@@ -271,6 +271,16 @@ func (t *ChatCompletionTranslator) TranslateStream(ctx context.Context, events <
 				return
 			}
 			if event.Type == "done" {
+				// 发送 usage chunk（如果有）再发送 [DONE]
+				if event.Data != nil && event.Data.Usage != nil {
+					chunk := buildCCStreamChunk(event.Data)
+					// 确保 usage 被设置
+					if chunk.Usage == nil {
+						chunk.Usage = &Usage{}
+					}
+					chunkData, _ := json.Marshal(chunk)
+					fn(append([]byte("data: "), append(chunkData, '\n', '\n')...), false)
+				}
 				fn([]byte("data: [DONE]\n\n"), true)
 				return
 			}
