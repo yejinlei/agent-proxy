@@ -326,6 +326,16 @@ func (d *DB) ExistsByURL(url string) bool {
 	return count > 0
 }
 
+// Update 更新记录的模型/协议信息（重嗅探后刷新）
+func (d *DB) Update(record *ProxyRecord) error {
+	_, err := d.db.Exec(`
+		UPDATE proxies
+		SET model_count = ?, models_json = ?, capabilities_json = ?, models_map_json = ?, upstream_type = ?
+		WHERE id = ?
+	`, record.ModelCount, record.ModelsJSON, record.CapabilitiesJSON, record.ModelsMapJSON, record.UpstreamType, record.ID)
+	return err
+}
+
 // Search 按 LIKE 关键词搜索记录（匹配 name / url / capabilities_json / models_map_json）
 func (d *DB) Search(query string) ([]ProxyRecord, error) {
 	like := "%" + query + "%"

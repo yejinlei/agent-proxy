@@ -14,10 +14,17 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/server"
 )
 
-// openDB 打开默认 SQLite 数据库
+// openDB 打开 SQLite 数据库（可通过 dbPathOverride 覆盖路径）
 func openDB() (*db.DB, error) {
-	return db.New("")
+	path := ""
+	if dbPathOverride != nil {
+		path = *dbPathOverride
+	}
+	return db.New(path)
 }
+
+// dbPathOverride 用于测试中覆盖默认 DB 路径
+var dbPathOverride *string
 
 // RunDBQuery 查询代理（无 id 列出全部，有 id 显示详情）
 func RunDBQuery(id *int) error {
@@ -135,7 +142,7 @@ func RunDBAdd(name, url, key string) error {
 	upstreamType := server.DetectUpstreamType(url)
 
 	// 多协议嗅探
-	result := sniffAll(url, key)
+	result := sniffAllFn(url, key)
 
 	// 计算总模型数
 	totalModels := 0
@@ -248,8 +255,9 @@ func RunDBRm(id int) error {
 	return nil
 }
 
-// RunDBCheck 核对所有代理配置（重新嗅探，提示删除无效记录）
-func RunDBCheck() error {
+// RunDBCheck 核对代理配置（重新嗅探，提示更新/删除）
+// id nil=全部, id=0=all 显式, id>0=指定 ID
+func RunDBCheck(id *int) error {
 	store, err := openDB()
 	if err != nil {
 		return err
@@ -268,21 +276,34 @@ func RunDBCheck() error {
 		return nil
 	}
 
+	// 如果指定了 ID，过滤
+	if id != nil && *id > 0 {
+		targets := make([]db.ProxyRecord, 0)
+		for _, r := range records {
+			if r.ID == *id {
+				targets = append(targets, r)
+			}
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("未找到 ID=%d 的代理配置", *id)
+		}
+		records = targets
+	}
+
 	fmt.Printf("🔍 正在核对 %d 条代理配置，请稍候...\n\n", len(records))
 
 	type checkResult struct {
-		id         int
-		name       string
-		url        string
-		caps       string
-		modelCount int
-		valid      bool
+		id, prevCount, modelCount int
+		name, url, caps, prevCaps string
+		valid, changed            bool
 	}
 	results := make([]checkResult, 0, len(records))
-	var invalid []int
+	var invalid, changedIDs []int
 
 	for _, r := range records {
-		result := sniffAll(r.URL, r.Key)
+		prevCaps := strings.Join(r.Capabilities(), " / ")
+		prevCount := r.TotalModelCount()
+		result := sniffAllFn(r.URL, r.Key)
 		totalModels := 0
 		for _, ms := range result.ModelsMap {
 			totalModels += len(ms)
@@ -293,57 +314,169 @@ func RunDBCheck() error {
 			caps = "—"
 		}
 		cr := checkResult{
-			id:         r.ID,
-			name:       r.Name,
-			url:        r.URL,
-			caps:       caps,
-			modelCount: totalModels,
-			valid:      valid,
+			id: r.ID, name: r.Name, url: r.URL, caps: caps,
+			modelCount: totalModels, prevCount: prevCount, prevCaps: prevCaps,
+			valid: valid, changed: (totalModels != prevCount) || (caps != prevCaps),
 		}
 		results = append(results, cr)
 		if !valid {
 			invalid = append(invalid, r.ID)
+		} else if cr.changed {
+			changedIDs = append(changedIDs, r.ID)
 		}
 	}
 
 	// 打印汇总表
-	fmt.Println(strings.Repeat("─", 110))
-	fmt.Printf("  %-4s  %-16s  %-48s  %-18s  %-8s  %s\n", "ID", "Name", "URL", "协议", "模型数", "状态")
-	fmt.Println(strings.Repeat("─", 110))
-
+	fmt.Println(strings.Repeat("─", 120))
+	fmt.Printf("  %-4s  %-16s  %-42s  %-18s  %-12s  %s\n", "ID", "Name", "URL", "协议/模型", "变化", "状态")
+	fmt.Println(strings.Repeat("─", 120))
 	for _, cr := range results {
 		status := "✅ 有效"
 		if !cr.valid {
 			status = "❌ 无效"
 		}
-		fmt.Printf("  %-4d  %-16s  %-48s  %-18s  %-8d  %s\n",
-			cr.id, cr.name, cr.url, cr.caps, cr.modelCount, status)
+		modelStr, changeStr := fmt.Sprintf("%d  (%s)", cr.modelCount, cr.caps), "—"
+		if cr.changed {
+			changeStr = fmt.Sprintf("%d→%d", cr.prevCount, cr.modelCount)
+			modelStr = fmt.Sprintf("%d  (%s→%s)", cr.modelCount, cr.prevCaps, cr.caps)
+		}
+		fmt.Printf("  %-4d  %-16s  %-42s  %-18s  %-12s  %s\n",
+			cr.id, cr.name, cr.url, modelStr, changeStr, status)
 	}
-	fmt.Println(strings.Repeat("─", 110))
+	fmt.Println(strings.Repeat("─", 120))
 
-	if len(invalid) == 0 {
-		fmt.Printf("\n✅ 全部 %d 条记录有效，无需操作。\n\n", len(records))
-		return nil
-	}
-
-	fmt.Printf("\n⚠️  发现 %d/%d 条无效记录（ID: %v）\n", len(invalid), len(records), invalid)
-	fmt.Print("  是否删除无效记录？(yes/no): ")
-	reader := bufio.NewReader(os.Stdin)
-	answer, _ := reader.ReadString('\n')
-	answer = strings.TrimSpace(strings.ToLower(answer))
-	if answer != "yes" && answer != "y" {
-		fmt.Println("已取消。")
-		return nil
-	}
-
-	for _, id := range invalid {
-		if err := store.Delete(id); err != nil {
-			fmt.Printf("  ❌ 删除 ID=%d 失败: %v\n", id, err)
-		} else {
-			fmt.Printf("  ✅ 已删除 ID=%d\n", id)
+	// 无效记录：提示删除
+	if len(invalid) > 0 {
+		fmt.Printf("\n⚠️  发现 %d 条无效记录（ID: %v），上游已无法访问\n", len(invalid), invalid)
+		fmt.Print("  是否删除无效记录？(yes/no): ")
+		answer := readYesNo(os.Stdin)
+		if answer {
+			for _, id := range invalid {
+				if err := store.Delete(id); err != nil {
+					fmt.Printf("  ❌ 删除 ID=%d 失败: %v\n", id, err)
+				} else {
+					fmt.Printf("  ✅ 已删除 ID=%d\n", id)
+				}
+			}
 		}
 	}
-	fmt.Printf("\n✅ 已删除 %d 条无效记录。\n", len(invalid))
+
+	// 有变化：提示更新
+	if len(changedIDs) > 0 {
+		fmt.Printf("\n📡 发现 %d 条记录模型信息有变化（ID: %v），上游模型列表已更新\n", len(changedIDs), changedIDs)
+		fmt.Print("  是否更新这些记录？(yes/no): ")
+		answer := readYesNo(os.Stdin)
+		if answer {
+			updated := 0
+			for _, cr := range results {
+				if !cr.changed || !cr.valid {
+					continue
+				}
+				r, err := store.GetByID(cr.id)
+				if err != nil {
+					fmt.Printf("  ❌ 读取 ID=%d 失败: %v\n", cr.id, err)
+					continue
+				}
+				sniffResult := sniffAllFn(r.URL, r.Key)
+				totalModels := 0
+				for _, ms := range sniffResult.ModelsMap {
+					totalModels += len(ms)
+				}
+				capsJSON, _ := json.Marshal(sniffResult.Capabilities)
+				modelsMapJSON, _ := json.Marshal(sniffResult.ModelsMap)
+				r.ModelCount = totalModels
+				r.CapabilitiesJSON = string(capsJSON)
+				r.ModelsMapJSON = string(modelsMapJSON)
+				r.UpstreamType = server.DetectUpstreamType(r.URL)
+				if err := store.Update(r); err != nil {
+					fmt.Printf("  ❌ 更新 ID=%d 失败: %v\n", r.ID, err)
+					continue
+				}
+				fmt.Printf("  ✅ 已更新 ID=%d: %s (%d 模型)\n", r.ID, r.Name, totalModels)
+				updated++
+			}
+			fmt.Printf("\n✅ 已更新 %d 条记录。\n", updated)
+		}
+	}
+
+	if len(invalid) == 0 && len(changedIDs) == 0 {
+		fmt.Printf("\n✅ 全部 %d 条记录有效且无变化，无需操作。\n\n", len(records))
+	}
+	return nil
+}
+
+// readYesNo 从标准输入读取 yes/no 确认
+func readYesNo(r *os.File) bool {
+	reader := bufio.NewReader(r)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "yes" || answer == "y"
+}
+
+// RunDBUpdate 更新代理配置的模型/协议信息（重新嗅探后刷新）
+// id>0 指定记录, id=0 全部
+func RunDBUpdate(id int) error {
+	store, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		return fmt.Errorf("init db: %w", err)
+	}
+
+	var targets []db.ProxyRecord
+	if id == 0 {
+		records, err := store.List()
+		if err != nil {
+			return err
+		}
+		targets = records
+	} else {
+		r, err := store.GetByID(id)
+		if err != nil {
+			return fmt.Errorf("未找到 ID=%d 的代理配置", id)
+		}
+		targets = []db.ProxyRecord{*r}
+	}
+
+	if len(targets) == 0 {
+		fmt.Println("数据库为空，无需更新。")
+		return nil
+	}
+
+	fmt.Printf("🔄 正在更新 %d 条代理配置的模型信息，请稍候...\n\n", len(targets))
+
+	updated := 0
+	invalid := 0
+	for i, r := range targets {
+		fmt.Printf("  [%d/%d] %s (%s) ... ", i+1, len(targets), r.Name, r.URL)
+		result := sniffAllFn(r.URL, r.Key)
+		totalModels := 0
+		for _, ms := range result.ModelsMap {
+			totalModels += len(ms)
+		}
+		if totalModels == 0 {
+			fmt.Println("❌ 无效")
+			invalid++
+			continue
+		}
+		capsJSON, _ := json.Marshal(result.Capabilities)
+		modelsMapJSON, _ := json.Marshal(result.ModelsMap)
+		r.ModelCount = totalModels
+		r.CapabilitiesJSON = string(capsJSON)
+		r.ModelsMapJSON = string(modelsMapJSON)
+		r.UpstreamType = server.DetectUpstreamType(r.URL)
+		if err := store.Update(&r); err != nil {
+			fmt.Printf("❌ 更新失败: %v\n", err)
+			continue
+		}
+		caps := strings.Join(result.Capabilities, " / ")
+		fmt.Printf("✅ %s (%d 模型)\n", caps, totalModels)
+		updated++
+	}
+
+	fmt.Printf("\n✅ 更新完成：%d 条成功，%d 条无效\n", updated, invalid)
 	return nil
 }
 
@@ -356,6 +489,9 @@ type SniffResult struct {
 func (s *SniffResult) hasProto(p string) bool {
 	return slices.Contains(s.Capabilities, p)
 }
+
+// sniffAllFn 嗅探函数（可被测试覆盖）
+var sniffAllFn = sniffAll
 
 // sniffAll 对上游进行多协议嗅探
 func sniffAll(url, key string) *SniffResult {
