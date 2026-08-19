@@ -3058,7 +3058,8 @@ func (q *QuickGateway) sendError(w http.ResponseWriter, code int, typ, msg strin
 // 返回 true 表示应该被过滤（不向下游透传）
 func isConnectionManagementHeader(header string) bool {
 	switch strings.ToLower(header) {
-	case "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection", "trailer":
+	case "connection", "keep-alive", "transfer-encoding", "upgrade",
+		"proxy-connection", "trailer", "content-length":
 		return true
 	default:
 		return false
