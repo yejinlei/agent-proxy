@@ -1445,8 +1445,14 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: PASSTHROUGH_RESPONSE_HEADERS - 必须过滤 Connection/Keep-Alive 等连接管理 header
+	// @REASON: 上游（如 SenseNova）返回的 Connection: close / Keep-Alive header 会干扰
+	//          Claude Code 的连接复用，导致 "socket connection was closed unexpectedly"
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -3047,24 +3053,64 @@ func (q *QuickGateway) sendError(w http.ResponseWriter, code int, typ, msg strin
 	w.Write(data)
 }
 
+// isConnectionManagementHeader 判断是否为连接管理 header
+// 这些 header 由 HTTP 层管理，透传会干扰下游客户端（如 Claude Code）的连接复用
+// 返回 true 表示应该被过滤（不向下游透传）
+func isConnectionManagementHeader(header string) bool {
+	switch strings.ToLower(header) {
+	case "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection", "trailer":
+		return true
+	default:
+		return false
+	}
+}
+
 // handleModels 透传上游 /v1/models，实时获取模型列表
+// @AI_GUARD: MODELS_UPSTREAM_TIMEOUT - 必须使用带超时的专用客户端
+// @REASON: Claude Code 在 /model 命令切换模型时会调用 GET /v1/models 验证模型；
+//
+//	若上游（如 SenseNova）响应慢，http.DefaultClient（无超时）导致代理无限等待，
+//	客户端超时断开 → "socket connection was closed unexpectedly"
+//
+// @REASON: 透传上游 Connection header 会干扰 Claude Code 连接复用；
+//
+//	必须过滤 Connection / Keep-Alive / Transfer-Encoding / Upgrade 等连接管理 header
 func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	modelsURL := q.proxyBaseURL + "/v1/models"
-	req, err := http.NewRequest("GET", modelsURL, nil)
+	req, err := http.NewRequestWithContext(r.Context(), "GET", modelsURL, nil)
 	if err != nil {
 		q.sendError(w, http.StatusInternalServerError, "proxy_error", err.Error())
 		return
 	}
-	// 上游请求始终使用 proxyKey
 	req.Header.Set("Authorization", "Bearer "+q.proxyKey)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	// 使用带超时的专用客户端，避免上游慢响应导致代理无限等待
+	modelsClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+	resp, err := modelsClient.Do(req)
 	if err != nil {
 		q.sendError(w, http.StatusBadGateway, "upstream_unreachable", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+
+	// 透传上游 Content-Type 和状态码相关的响应头，但过滤连接管理 header
+	// 避免上游 Connection: close / Keep-Alive 等干扰下游 Claude Code 连接复用
+	for k, v := range resp.Header {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
+		for _, val := range v {
+			w.Header().Add(k, val)
+		}
+	}
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
