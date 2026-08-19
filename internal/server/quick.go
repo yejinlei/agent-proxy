@@ -852,6 +852,34 @@ func stripSensenovaRequestFields(body json.RawMessage) json.RawMessage {
 		log.Printf("[strip] fallback done, body_len=%d→%d", beforeLen, len(s))
 		return json.RawMessage(s)
 	}
+	// 将顶层 system 合并到 messages[0]（role: system）
+	// @REASON: SenseNova /v1/messages 端点收到顶层 system 字段会 hang（永不返回），
+	//          必须降级为 messages 数组中的 system role 消息。
+	if sysVal, hasSystem := raw["system"]; hasSystem {
+		msgs, ok := raw["messages"].([]interface{})
+		if ok && len(msgs) > 0 {
+			hasSysMsg := false
+			for _, msg := range msgs {
+				if m, ok := msg.(map[string]interface{}); ok {
+					if role, ok := m["role"].(string); ok && role == "system" {
+						hasSysMsg = true
+						break
+					}
+				}
+			}
+			if !hasSysMsg {
+				contentVal := sysVal
+				// Anthropic 标准：content 用 text block 数组；若 sysVal 已是字符串则包裹一层
+				if str, isStr := sysVal.(string); isStr {
+					contentVal = []interface{}{map[string]interface{}{"type": "text", "text": str}}
+				}
+				raw["messages"] = append([]interface{}{map[string]interface{}{"role": "system", "content": contentVal}}, msgs...)
+				log.Printf("[strip] system merged into messages[0]")
+			}
+		}
+		delete(raw, "system")
+	}
+
 	// 递归删除所有层级的不兼容字段 + 修正 output_config.effort
 	pruned := stripSensenovaIncompatible(raw)
 	out, err := json.Marshal(pruned)
