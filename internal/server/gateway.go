@@ -585,8 +585,11 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -894,8 +897,11 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
