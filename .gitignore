@@ -58,3 +58,7 @@ test-stream.json
 
 # Runtime logs
 *.log
+# visual-check diagnostics — not needed on the live site
+docs/*.visual-check.png
+docs/*.visual-check.json
+docs/*.visual-check.html

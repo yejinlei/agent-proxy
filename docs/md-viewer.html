@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title id="title">Agent-Proxy Docs</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.0/dist/mermaid.min.js"></script>
+<style>
+  :root { color-scheme: light; --fg:#24292f; --bg:#ffffff; --muted:#656d76; --border:#d0d7de; --code-bg:#0d1117; --link:#0969da; --nav-bg:#f6f8fa; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height:1.6; }
+  nav { position:sticky; top:0; z-index:10; background:var(--nav-bg); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  nav a { color:var(--link); text-decoration:none; font-weight:500; }
+  nav .sep { color:var(--muted); }
+  nav .brand { font-weight:600; color:var(--fg); }
+  main { max-width:980px; margin:0 auto; padding:32px 24px 80px; }
+  h1 { font-size:1.85em; margin-bottom:0.2em; }
+  h2 { font-size:1.4em; margin-top:1.6em; margin-bottom:0.4em; border-bottom:1px solid var(--border); padding-bottom:0.2em; }
+  h3 { font-size:1.2em; margin-top:1.4em; margin-bottom:0.3em; }
+  h4 { margin-top:1.2em; margin-bottom:0.3em; }
+  p { margin:0.7em 0; }
+  p > code, li > code { background:#f0f4f7; padding:2px 6px; border-radius:4px; font-size:0.9em; }
+  pre { background:var(--code-bg); color:#e6edf3; padding:16px; border-radius:6px; overflow-x:auto; margin:1em 0; font-size:0.9em; line-height:1.45; }
+  pre code { background:transparent; color:inherit; padding:0; }
+  code { font-family:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:0.9em; }
+  th, td { border:1px solid var(--border); padding:6px 10px; text-align:left; vertical-align:top; }
+  th { background:#f6f8fa; font-weight:600; }
+  tr:nth-child(even) td { background:#fbfcfd; }
+  blockquote { border-left:4px solid var(--border); margin:1em 0; padding:0.2em 1em; color:var(--muted); }
+  hr { border:none; border-top:1px solid var(--border); margin:2em 0; }
+  ul, ol { padding-left:2em; margin:0.7em 0; }
+  li { margin:0.2em 0; }
+  a { color:var(--link); }
+  .mermaid { text-align:center; margin:1.5em 0; }
+  #content img { max-width:100%; }
+  footer { margin-top:3em; padding-top:1em; border-top:1px solid var(--border); color:var(--muted); font-size:0.85em; text-align:center; }
+  @media (prefers-color-scheme: dark) {
+    :root { color-scheme:dark; --fg:#e6edf3; --bg:#0d1117; --muted:#8b949e; --border:#30363d; --code-bg:#161b22; --link:#58a6ff; --nav-bg:#161b22; }
+    th { background:#161b22; }
+    tr:nth-child(even) td { background:#0d1117; }
+    p > code, li > code { background:#1f242c; }
+  }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">Agent-Proxy</span>
+  <span class="sep">/</span>
+  <a href="index.html">Docs Home</a>
+  <span class="sep">/</span>
+  <span id="nav-title">—</span>
+</nav>
+<main id="content"><p>Loading…</p></main>
+<footer><a href="https://github.com/yejinlei/agent-proxy">github.com/yejinlei/agent-proxy</a></footer>
+<script>
+  const url = new URL(location.href);
+  const file = url.searchParams.get('file');
+  if (!file) {
+    document.getElementById('content').innerHTML = '<h1>Missing <code>file</code> parameter</h1><p>Usage: <code>md-viewer.html?file=&lt;name&gt;.md</code></p>';
+  } else {
+    fetch(file).then(r => { if (!r.ok) throw new Error(r.status + ' ' + r.statusText); return r.text(); })
+      .then(render).catch(e => { document.getElementById('content').innerHTML = '<h1>Error loading markdown</h1><p>' + e + '</p>'; });
+  }
+  function render(md) {
+    const m = md.match(/^#\s+(.+)$/m);
+    if (m) {
+      const t = m[1].trim();
+      document.getElementById('title').textContent = t + ' — Agent-Proxy Docs';
+      document.getElementById('nav-title').textContent = t;
+    }
+    document.getElementById('content').innerHTML = marked.parse(md);
+    document.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    renderMermaid(md);
+  }
+  async function renderMermaid(md) {
+    const blocks = [...md.matchAll(/~~~\s*mermaid\s*\n([\s\S]*?)~~~\n/g)].concat([...md.matchAll(/```\s*mermaid\s*\n([\s\S]*?)```/g)]);
+    if (!blocks.length) return;
+    mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+    for (let i = 0; i < blocks.length; i++) {
+      const div = document.createElement('div');
+      div.className = 'mermaid'; div.textContent = blocks[i][1];
+      document.getElementById('content').append(div);
+      try {
+        const { svg } = await mermaid.render('m' + i, div.textContent);
+        div.innerHTML = svg;
+      } catch { div.innerHTML = '<pre>' + div.textContent + '</pre>'; }
+    }
+  }
+</script>
+</body>
+</html>

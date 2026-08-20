@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent-Proxy — Documentation</title>
+<style>
+  :root { color-scheme: light; --fg:#24292f; --bg:#ffffff; --muted:#656d76; --border:#d0d7de; --link:#0969da; --card-bg:#f6f8fa; --card-accent:#d0d7de; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height:1.6; }
+  header { background:linear-gradient(135deg,#0d419d 0%,#2d7dd2 100%); color:#fff; padding:56px 24px 44px; }
+  header .wrap { max-width:980px; margin:0 auto; }
+  header h1 { font-size:2.1em; letter-spacing:-0.02em; }
+  header p { color:#dfe9f7; margin-top:8px; font-size:1.05em; }
+  header .meta { margin-top:16px; display:flex; gap:12px; flex-wrap:wrap; }
+  header .meta a { color:#fff; text-decoration:none; padding:6px 12px; border:1px solid rgba(255,255,255,0.4); border-radius:6px; font-size:0.9em; }
+  main { max-width:980px; margin:0 auto; padding:36px 24px 80px; }
+  .section { margin-bottom:32px; }
+  .section h2 { font-size:1.25em; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:6px; color:var(--fg); }
+  .section h2 .eyebrow { color:var(--muted); font-weight:400; font-size:0.75em; margin-left:8px; letter-spacing:0.08em; text-transform:uppercase; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:16px; }
+  .card { background:var(--card-bg); border:1px solid var(--card-accent); border-radius:8px; padding:18px 20px; display:flex; flex-direction:column; gap:6px; transition:border-color 0.15s, background 0.15s; }
+  .card:hover { border-color:var(--link); }
+  .card .k { display:flex; align-items:center; gap:8px; font-weight:600; }
+  .card .k .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .card .desc { color:var(--muted); font-size:0.92em; }
+  .card .meta { color:var(--muted); font-size:0.8em; margin-top:6px; display:flex; gap:14px; flex-wrap:wrap; }
+  .card .meta a { color:var(--link); text-decoration:none; }
+  .card .meta a:hover { text-decoration:underline; }
+  footer { margin-top:36px; padding-top:14px; border-top:1px solid var(--border); color:var(--muted); font-size:0.85em; text-align:center; }
+  @media (prefers-color-scheme: dark) {
+    :root { color-scheme:dark; --fg:#e6edf3; --bg:#0d1117; --muted:#8b949e; --border:#30363d; --link:#58a6ff; --card-bg:#161b22; --card-accent:#30363d; }
+    header { background:linear-gradient(135deg,#0b3578 0%,#1a5fa0 100%); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Agent-Proxy</h1>
+    <p>4×4 AI 协议网关 — OpenAI · Anthropic · Gemini · Responses 协议互转</p>
+    <div class="meta">
+      <a href="https://github.com/yejinlei/agent-proxy">GitHub</a>
+      <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>
+      <a href="DESIGN.md">DESIGN.md</a>
+      <a href="https://github.com/yejinlei/agent-proxy/blob/master/MANUAL.md">MANUAL.md</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="section">
+    <h2>Interactive diagrams <span class="eyebrow">Archify · SVG</span></h2>
+    <div class="grid">
+      <a class="card" href="interactive/architecture.html">
+        <div class="k"><span class="dot" style="background:#10b981"></span>System architecture</div>
+        <div class="desc">Central Schema 路由：入口检测 → 翻译注册表 → ModelRouter → Provider → 上游</div>
+        <div class="meta"><span>architecture</span><span>route detection · registry · providers</span></div>
+      </a>
+      <a class="card" href="interactive/translate-path.html">
+        <div class="k"><span class="dot" style="background:#06b6d4"></span>Translate path</div>
+        <div class="desc">Central Schema 往返：TranslateRequest → InternalRequest → TranslateToProvider → TranslateStreamEvent</div>
+        <div class="meta"><span>sequence</span><span>message_format · sse_lifecycle · passthrough</span></div>
+      </a>
+      <a class="card" href="interactive/openai-path.html">
+        <div class="k"><span class="dot" style="background:#8b5cf6"></span>OpenAIPath propagation</div>
+        <div class="desc">从 sniffAll 探测到 provider.BuildURL 的 /v1beta/openai 前缀传递链</div>
+        <div class="meta"><span>dataflow</span><span>sniff → DB → QuickGateway/Gateway → provider</span></div>
+      </a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Reference docs <span class="eyebrow">Markdown</span></h2>
+    <div class="grid">
+      <a class="card" href="ARCHITECTURE.md">
+        <div class="k"><span class="dot" style="background:#f59e0b"></span>ARCHITECTURE</div>
+        <div class="desc">设计原则、关键机制、路由决策、双模式同步</div>
+      </a>
+      <a class="card" href="REQUEST_LIFECYCLE.md">
+        <div class="k"><span class="dot" style="background:#f59e0b"></span>REQUEST LIFECYCLE</div>
+        <div class="desc">SSE 事件生命周期、透传 / 翻译路径、心跳格式</div>
+      </a>
+      <a class="card" href="PROTOCOL_COMPARISON.md">
+        <div class="k"><span class="dot" style="background:#f59e0b"></span>PROTOCOL COMPARISON</div>
+        <div class="desc">四种协议字段级对照：端点、系统提示词、多模态、工具调用、usage、SSE</div>
+      </a>
+      <a class="card" href="OPENAIPATH_CHAIN.md">
+        <div class="k"><span class="dot" style="background:#f59e0b"></span>OPENAIPATH CHAIN</div>
+        <div class="desc">Google Gemini /v1beta/openai 前缀的端到端传递与 DB 持久化</div>
+      </a>
+      <a class="card" href="DESIGN.md">
+        <div class="k"><span class="dot" style="background:#f59e0b"></span>DESIGN</div>
+        <div class="desc">底层机制、协议处理流、消息转换图、扩展开发</div>
+      </a>
+    </div>
+  </section>
+
+  <footer>
+    Agent-Proxy v0.2.94 · <a href="https://github.com/yejinlei/agent-proxy">github.com/yejinlei/agent-proxy</a>
+  </footer>
+</main>
+</body>
+</html>
