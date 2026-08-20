@@ -32,12 +32,33 @@ type OpenAIClient openaiClient
 //   - 修改任一 Provider 的连接池配置，必须同步修改其他 3 个
 //   - 非流式请求使用独立 http.Client，与 SSE 连接池隔离
 // @RELATED: NewAnthropicClient, NewGeminiClient, NewResponsesClient (必须同步)
-// @REASON: 历史血泪教训 - 连接池不一致导致部分协议请求失败
+//
+// @AI_GUARD: OPENAI_ENDPOINT_PREFIX - endpointPrefix 必须透传给 BuildURL
+//   - 默认 "/v1"（标准 OpenAI / vLLM / SGLang 等）
+//   - Google Gemini openai 兼容端点需要 "/v1beta/openai"
 func NewOpenAIClient(name, baseURL string, timeout int) *OpenAIClient {
+	return newOpenAIClient(name, baseURL, timeout, "/v1")
+}
+
+// NewOpenAIClientWithPath 支持指定 endpoint prefix（如 "/v1beta/openai"）
+// pathPrefix 为空时回退到默认的 "/v1"
+func NewOpenAIClientWithPath(name, baseURL string, timeout int, pathPrefix string) *OpenAIClient {
+	if pathPrefix == "" {
+		pathPrefix = "/v1"
+	}
+	return newOpenAIClient(name, baseURL, timeout, pathPrefix)
+}
+
+// newOpenAIClient 支持指定 endpointPrefix（如 "/v1beta/openai"）
+func newOpenAIClient(name, baseURL string, timeout int, endpointPrefix string) *OpenAIClient {
+	endpoint := endpointPrefix + "/chat/completions"
+	if endpointPrefix == "" {
+		endpoint = "/v1/chat/completions"
+	}
 	return &OpenAIClient{
 		name:     name,
 		baseURL:  strings.TrimRight(baseURL, "/"),
-		endpoint: "/v1/chat/completions",
+		endpoint: endpoint,
 		client: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
 			Transport: &http.Transport{

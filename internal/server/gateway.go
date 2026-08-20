@@ -81,7 +81,7 @@ func NewGateway(cfg *config.Config, verboseLevel int) *Gateway {
 	for name, pc := range cfg.Providers {
 		switch pc.ProviderType {
 		case "openai", "sensenova":
-			providerRegistry.Register(provider.NewOpenAIClient(name, pc.BaseURL, pc.TimeoutSec))
+			providerRegistry.Register(provider.NewOpenAIClientWithPath(name, pc.BaseURL, pc.TimeoutSec, pc.OpenAIPath))
 		case "anthropic":
 			providerRegistry.Register(provider.NewAnthropicClient(name, pc.BaseURL, pc.APIToken, pc.APIVersion, pc.TimeoutSec))
 		case "gemini":

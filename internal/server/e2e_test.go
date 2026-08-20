@@ -455,6 +455,7 @@ func TestTimingLogsSlowUpstream(t *testing.T) {
 		[]string{"openai"},
 		nil,
 		"",
+		"",
 		30,
 		"", false, 2,
 	)
@@ -589,6 +590,7 @@ func TestHeartbeatDuringLongUpstreamCall(t *testing.T) {
 		"mock-key",
 		[]string{"openai"},
 		nil,
+		"",
 		"",
 		30,
 		"", false, 2, // verboseLevel=2
