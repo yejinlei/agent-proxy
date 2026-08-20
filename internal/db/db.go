@@ -28,7 +28,8 @@ type ProxyRecord struct {
 	CapabilitiesJSON string `db:"capabilities_json"` // JSON: ["openai","anthropic","gemini","responses"]
 	ModelsMapJSON    string `db:"models_map_json"`   // JSON: {"openai":["gpt-4"],"anthropic":["claude-3"]}
 	// 上游类型：db add 时探测并保存，用于请求字段自适应过滤（如 sensenova）
-	UpstreamType string `db:"upstream_type"`
+	UpstreamType string `db:"upstream_type"` // sniffed upstream type (e.g. sensenova)
+	OpenAIPath   string `db:"openai_path"`   // detected openai endpoint prefix, e.g. /v1 or /v1beta/openai
 	Weight       int    `db:"weight"`
 
 	CreatedAt time.Time `db:"created_at"`
@@ -176,6 +177,9 @@ func (d *DB) Init() error {
 	if !d.columnExists("proxies", "upstream_type") {
 		_, _ = d.db.Exec("ALTER TABLE proxies ADD COLUMN upstream_type TEXT")
 	}
+	if !d.columnExists("proxies", "openai_path") {
+		_, _ = d.db.Exec("ALTER TABLE proxies ADD COLUMN openai_path TEXT")
+	}
 	return nil
 }
 
@@ -212,11 +216,11 @@ func (d *DB) Add(record *ProxyRecord) error {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
 	result, err := d.db.Exec(`
-		INSERT INTO proxies (name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO proxies (name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, openai_path, weight, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, record.Name, record.URL, record.Key, record.ProviderType, record.DetectedFormat,
 		boolInt(record.OpenAICap), boolInt(record.AnthropicCap), record.ModelCount,
-		string(modelsJSON), string(capsJSON), record.ModelsMapJSON, record.UpstreamType,
+		string(modelsJSON), string(capsJSON), record.ModelsMapJSON, record.UpstreamType, record.OpenAIPath,
 		record.Weight, record.CreatedAt.Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("insert proxy: %w", err)
@@ -229,14 +233,15 @@ func (d *DB) Add(record *ProxyRecord) error {
 func scanRecord(rows *sql.Rows, r *ProxyRecord) error {
 	var oaiCap, antCap int64
 	var ts string
-	var ns1, ns2, ns3, ns4 sql.NullString
-	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &r.Weight, &ts); err != nil {
+	var ns1, ns2, ns3, ns4, ns5 sql.NullString
+	if err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &ns5, &r.Weight, &ts); err != nil {
 		return err
 	}
 	r.ModelsJSON = ns1.String
 	r.CapabilitiesJSON = ns2.String
 	r.ModelsMapJSON = ns3.String
 	r.UpstreamType = ns4.String
+	r.OpenAIPath = ns5.String
 	r.OpenAICap = oaiCap != 0
 	r.AnthropicCap = antCap != 0
 	if t, err := time.Parse(time.RFC3339, ts); err == nil {
@@ -248,7 +253,7 @@ func scanRecord(rows *sql.Rows, r *ProxyRecord) error {
 // List 列出所有代理记录
 func (d *DB) List() ([]ProxyRecord, error) {
 	rows, err := d.db.Query(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, openai_path, weight, created_at
 		FROM proxies
 		ORDER BY id
 	`)
@@ -272,11 +277,11 @@ func (d *DB) GetByID(id int) (*ProxyRecord, error) {
 	var r ProxyRecord
 	var oaiCap, antCap int64
 	var ts string
-	var ns1, ns2, ns3, ns4 sql.NullString
+	var ns1, ns2, ns3, ns4, ns5 sql.NullString
 	err := d.db.QueryRow(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, openai_path, weight, created_at
 		FROM proxies WHERE id = ?
-	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &r.Weight, &ts)
+	`, id).Scan(&r.ID, &r.Name, &r.URL, &r.Key, &r.ProviderType, &r.DetectedFormat, &oaiCap, &antCap, &r.ModelCount, &ns1, &ns2, &ns3, &ns4, &ns5, &r.Weight, &ts)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +289,7 @@ func (d *DB) GetByID(id int) (*ProxyRecord, error) {
 	r.CapabilitiesJSON = ns2.String
 	r.ModelsMapJSON = ns3.String
 	r.UpstreamType = ns4.String
+	r.OpenAIPath = ns5.String
 	r.OpenAICap = oaiCap != 0
 	r.AnthropicCap = antCap != 0
 	if t, err := time.Parse(time.RFC3339, ts); err == nil {
@@ -330,9 +336,9 @@ func (d *DB) ExistsByURL(url string) bool {
 func (d *DB) Update(record *ProxyRecord) error {
 	_, err := d.db.Exec(`
 		UPDATE proxies
-		SET model_count = ?, models_json = ?, capabilities_json = ?, models_map_json = ?, upstream_type = ?
+		SET model_count = ?, models_json = ?, capabilities_json = ?, models_map_json = ?, upstream_type = ?, openai_path = ?
 		WHERE id = ?
-	`, record.ModelCount, record.ModelsJSON, record.CapabilitiesJSON, record.ModelsMapJSON, record.UpstreamType, record.ID)
+	`, record.ModelCount, record.ModelsJSON, record.CapabilitiesJSON, record.ModelsMapJSON, record.UpstreamType, record.OpenAIPath, record.ID)
 	return err
 }
 
@@ -340,7 +346,7 @@ func (d *DB) Update(record *ProxyRecord) error {
 func (d *DB) Search(query string) ([]ProxyRecord, error) {
 	like := "%" + query + "%"
 	rows, err := d.db.Query(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, openai_path, weight, created_at
 		FROM proxies
 		WHERE name LIKE ? OR url LIKE ? OR capabilities_json LIKE ? OR models_map_json LIKE ?
 		ORDER BY id
@@ -369,7 +375,7 @@ func (d *DB) First() (*ProxyRecord, error) {
 // FirstRecord 返回 ID 最小的记录
 func (d *DB) FirstRecord() (*ProxyRecord, error) {
 	rows, err := d.db.Query(`
-		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, weight, created_at
+		SELECT id, name, url, key, provider_type, detected_format, openai_cap, anthropic_cap, model_count, models_json, capabilities_json, models_map_json, upstream_type, openai_path, weight, created_at
 		FROM proxies ORDER BY id LIMIT 1
 	`)
 	if err != nil {

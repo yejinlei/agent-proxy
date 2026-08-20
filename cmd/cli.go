@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"slices"
@@ -195,6 +196,7 @@ func RunDBAdd(name, url, key string) error {
 		CapabilitiesJSON: string(capsJSON),
 		ModelsMapJSON:    string(modelsMapJSON),
 		UpstreamType:     upstreamType,
+		OpenAIPath:       result.OpenAIPath,
 		Weight:           100,
 		CreatedAt:        time.Now(),
 	})
@@ -388,6 +390,7 @@ func RunDBCheck(id *int) error {
 				r.CapabilitiesJSON = string(capsJSON)
 				r.ModelsMapJSON = string(modelsMapJSON)
 				r.UpstreamType = server.DetectUpstreamType(r.URL)
+				r.OpenAIPath = sniffResult.OpenAIPath
 				if err := store.Update(r); err != nil {
 					fmt.Printf("  ❌ 更新 ID=%d 失败: %v\n", r.ID, err)
 					continue
@@ -467,6 +470,7 @@ func RunDBUpdate(id int) error {
 		r.CapabilitiesJSON = string(capsJSON)
 		r.ModelsMapJSON = string(modelsMapJSON)
 		r.UpstreamType = server.DetectUpstreamType(r.URL)
+		r.OpenAIPath = result.OpenAIPath
 		if err := store.Update(&r); err != nil {
 			fmt.Printf("❌ 更新失败: %v\n", err)
 			continue
@@ -482,8 +486,9 @@ func RunDBUpdate(id int) error {
 
 // SniffResult 多协议嗅探结果
 type SniffResult struct {
-	Capabilities []string            // ["openai", "anthropic", "gemini", "responses"]
-	ModelsMap    map[string][]string // {"openai": ["gpt-4"], "anthropic": ["claude-3"]}
+	Capabilities []string              // ["openai", "anthropic", "gemini", "responses"]
+	ModelsMap    map[string][]string   // {"openai": ["gpt-4"], "anthropic": ["claude-3"]}
+	OpenAIPath   string                // 检测到的 openai 端点路径前缀，如 "/v1" 或 "/v1beta/openai"
 }
 
 func (s *SniffResult) hasProto(p string) bool {
@@ -505,20 +510,33 @@ func sniffAll(url, key string) *SniffResult {
 	base = strings.TrimSuffix(base, "/v1")
 	base = strings.TrimSuffix(base, "/v1/")
 
-	// ── Step 1: OpenAI ──────────────────────────────────
-	openaiURL := base + "/v1/models"
-	req, err := http.NewRequest("GET", openaiURL, nil)
-	if err == nil {
+	// ── Step 1: OpenAI / models endpoint
+	// 遍历多个路径，选模型数最多的那个。只探测真正的 OpenAI 兼容端点：
+	//   - /v1/models          → 标准 OpenAI 端点
+	//   - /v1beta/openai/models → Google Gemini 的 OpenAI 兼容端点（注意：/v1beta/models 是 Google 原生端点，不算 openai 能力）
+	openaiPaths := []string{"/v1/models", "/v1beta/openai/models"}
+	bestOpenaiModels := []string{}
+	bestOpenaiPath := "/v1" // 默认标准路径，供 openai passthrough 构造正确 URL
+	for _, p := range openaiPaths {
+		openaiURL := base + p
+		req, err := http.NewRequest("GET", openaiURL, nil)
+		if err != nil {
+			continue
+		}
 		req.Header.Set("Authorization", "Bearer "+key)
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
-		if err == nil {
+		if err != nil {
+			continue
+		}
+		models := []string{}
+		if resp.StatusCode == 200 {
 			defer resp.Body.Close()
-			if resp.StatusCode == 200 {
-				models := parseOpenAIModels(resp.Body)
-				result.ModelsMap["openai"] = models
-				result.Capabilities = append(result.Capabilities, "openai")
-			} else if resp.StatusCode == 401 {
+			models = parseOpenAIModels(resp.Body)
+		} else {
+			// Bearer 失败或 404：回退到 ?key= 查询参数
+			defer resp.Body.Close()
+			if resp.StatusCode == 401 || resp.StatusCode == 404 {
 				openaiByQuery := openaiURL + "?key=" + key
 				req2, err := http.NewRequest("GET", openaiByQuery, nil)
 				if err == nil {
@@ -527,14 +545,23 @@ func sniffAll(url, key string) *SniffResult {
 					if err == nil {
 						defer resp2.Body.Close()
 						if resp2.StatusCode == 200 {
-							models := parseOpenAIModels(resp2.Body)
-							result.ModelsMap["openai"] = models
-							result.Capabilities = append(result.Capabilities, "openai")
+							models = parseOpenAIModels(resp2.Body)
 						}
 					}
 				}
 			}
 		}
+		// 保留模型数最多的路径
+		if len(models) > len(bestOpenaiModels) {
+			bestOpenaiModels = models
+			bestOpenaiPath = strings.TrimSuffix(p, "/models") // /v1beta/openai/models → /v1beta/openai
+		}
+	}
+	if len(bestOpenaiModels) > 0 {
+		result.ModelsMap["openai"] = bestOpenaiModels
+		result.Capabilities = append(result.Capabilities, "openai")
+		result.OpenAIPath = bestOpenaiPath
+	}
 
 		// ── Step 1b: OpenAI Responses（独立探测 /v1/responses 端点） ──
 		// OpenAI Responses 是 /v1/responses，与 /v1/chat/completions 是不同的端点；
@@ -565,8 +592,6 @@ func sniffAll(url, key string) *SniffResult {
 				}
 			}
 		}
-	}
-
 	// ── Step 2: Anthropic ────────────────────────────────
 	anthropicURL := base + "/v1/messages"
 	msgBody := map[string]any{
@@ -578,7 +603,7 @@ func sniffAll(url, key string) *SniffResult {
 		},
 	}
 	msgBodyJSON, _ := json.Marshal(msgBody)
-	req, err = http.NewRequest("POST", anthropicURL, strings.NewReader(string(msgBodyJSON)))
+	req, err := http.NewRequest("POST", anthropicURL, strings.NewReader(string(msgBodyJSON)))
 	if err == nil {
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -609,16 +634,35 @@ func sniffAll(url, key string) *SniffResult {
 	}
 
 	// ── Step 3: Gemini ──────────────────────────────────
-	geminiModel := "gemini-2.5-flash"
+	// 构造候选列表：优先已知的稳定模型，再补 openai 模型列表里找到的 gemini-* 模型
+	geminiPreferred := []string{"gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash-latest"}
+	geminiCandidates := make([]string, 0)
+	for _, m := range geminiPreferred {
+		geminiCandidates = append(geminiCandidates, m)
+	}
 	if len(result.ModelsMap["openai"]) > 0 {
 		for _, m := range result.ModelsMap["openai"] {
 			if strings.HasPrefix(m, "gemini-") {
-				geminiModel = m
-				break
+				// 去重
+				dup := false
+				for _, existing := range geminiCandidates {
+					if m == existing {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					geminiCandidates = append(geminiCandidates, m)
+				}
 			}
 		}
 	}
-	geminiURL := base + "/v1/models/" + geminiModel + ":generateContent"
+	// 最多试 15 个候选，防探测过慢
+	const maxGeminiCandidates = 15
+	if len(geminiCandidates) > maxGeminiCandidates {
+		geminiCandidates = geminiCandidates[:maxGeminiCandidates]
+	}
+
 	geminiBody := map[string]any{
 		"contents": []any{
 			map[string]any{
@@ -631,35 +675,34 @@ func sniffAll(url, key string) *SniffResult {
 	}
 	geminiBodyJSON, _ := json.Marshal(geminiBody)
 	geminiProbed := false
-	req, err = http.NewRequest("POST", geminiURL, strings.NewReader(string(geminiBodyJSON)))
-	if err == nil {
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("content-type", "application/json")
-		req.Header.Set("Accept", "application/json")
-		shortClient := &http.Client{Timeout: 10 * time.Second}
-		resp, err := shortClient.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode < 300 {
-				result.ModelsMap["gemini"] = nil
-				result.Capabilities = append(result.Capabilities, "gemini")
-				geminiProbed = true
-			}
+	shortClient := &http.Client{Timeout: 5 * time.Second}
+
+	for _, geminiModel := range geminiCandidates {
+		if geminiProbed {
+			break
 		}
-		// Bearer 失败时回退到 ?key= 查询参数
-		if !geminiProbed {
-			req2, err := http.NewRequest("POST", geminiURL+"?key="+key, strings.NewReader(string(geminiBodyJSON)))
+		geminiURL := base + "/v1/models/" + geminiModel + ":generateContent"
+
+		req, err = http.NewRequest("POST", geminiURL+"?key="+key, strings.NewReader(string(geminiBodyJSON)))
+		if err == nil {
+			req.Header.Set("content-type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			resp2, err := shortClient.Do(req)
 			if err == nil {
-				req2.Header.Set("content-type", "application/json")
-				req2.Header.Set("Accept", "application/json")
-				resp2, err := shortClient.Do(req2)
-				if err == nil {
-					defer resp2.Body.Close()
-					if resp2.StatusCode < 300 {
-						result.ModelsMap["gemini"] = nil
-						result.Capabilities = append(result.Capabilities, "gemini")
+				defer resp2.Body.Close()
+				if resp2.StatusCode < 300 {
+					// gemini 能力确认，用 openai 模型列表里的 gemini-* 模型填充
+					geminiModels := make([]string, 0)
+					for _, m := range result.ModelsMap["openai"] {
+						if strings.HasPrefix(m, "gemini-") {
+							geminiModels = append(geminiModels, m)
+						}
 					}
+					result.ModelsMap["gemini"] = geminiModels
+					result.Capabilities = append(result.Capabilities, "gemini")
+					geminiProbed = true
 				}
+				// 404/NOT_FOUND：这个模型不可用，试下一个
 			}
 		}
 	}
@@ -667,21 +710,47 @@ func sniffAll(url, key string) *SniffResult {
 	return result
 }
 
-// parseOpenAIModels 从 OpenAI /v1/models 响应解析模型 ID 列表
+// parseOpenAIModels 从 /v1/models 响应解析模型 ID 列表
+// 兼容两种格式：OpenAI {"data":[{"id":"..."}]} 和 Google {"models":[{"name":"models/..."}]}
 func parseOpenAIModels(body ioReader) []string {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil
+	}
+
 	var bodyMap map[string]interface{}
-	if err := json.NewDecoder(body).Decode(&bodyMap); err != nil {
+	if err := json.Unmarshal(bodyBytes, &bodyMap); err != nil {
 		return nil
 	}
-	data, ok := bodyMap["data"].([]interface{})
-	if !ok {
-		return nil
+
+	keys := []string{}
+	for k := range bodyMap {
+		keys = append(keys, k)
 	}
+
 	var models []string
-	for _, item := range data {
-		if m, ok := item.(map[string]interface{}); ok {
-			if id, ok := m["id"].(string); ok {
-				models = append(models, id)
+	// 格式 1: OpenAI — data[].id
+	if data, ok := bodyMap["data"].([]interface{}); ok {
+		for _, item := range data {
+			if m, ok := item.(map[string]interface{}); ok {
+				if id, ok := m["id"].(string); ok && id != "" {
+					models = append(models, id)
+				}
+			}
+		}
+	}
+	// 格式 2: Google Gemini — models[].name（如 "models/gemini-2.5-flash"）
+	if len(models) == 0 {
+		if gmodels, ok := bodyMap["models"].([]interface{}); ok {
+			for _, item := range gmodels {
+				if m, ok := item.(map[string]interface{}); ok {
+					if name, ok := m["name"].(string); ok && name != "" {
+						id := strings.TrimPrefix(name, "models/")
+						models = append(models, id)
+					} else {
+					}
+				} else {
+				}
 			}
 		}
 	}

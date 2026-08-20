@@ -62,6 +62,7 @@ type ProviderConfig struct {
 	ProviderType string   `json:"provider_type" yaml:"provider_type"`
 	APIVersion   string   `json:"api_version" yaml:"api_version"`
 	Models       []string `json:"models" yaml:"models"`
+	OpenAIPath   string   `json:"openai_path" yaml:"openai_path"` // OpenAI 兼容端点 prefix（如 "/v1beta/openai"），空串回退 "/v1"
 	Weight       int      `json:"weight" yaml:"weight"`
 	TimeoutSec   int      `json:"timeout_sec" yaml:"timeout_sec"`
 	RateLimit    int      `json:"rate_limit" yaml:"rate_limit"`

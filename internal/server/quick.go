@@ -38,6 +38,8 @@ type QuickGateway struct {
 	// 透传上游 /v1/models 用的
 	proxyBaseURL string // 上游 base URL（已去除末尾 /v1）
 	proxyKey     string
+	// OpenAI 兼容端点 prefix（如 Google Gemini 为 "/v1beta/openai"）
+	openAIPath string
 	// 客户端认证
 	clientKey        string
 	clientKeyEnabled bool
@@ -123,7 +125,8 @@ func newRequestStripper(upstreamType string) func(json.RawMessage) json.RawMessa
 // capabilities: 嗅探到的上游协议列表，如 ["openai", "anthropic", "gemini", "responses"]
 // modelsMap: 协议→模型列表映射，如 {"openai":["gpt-4"],"anthropic":["claude-3"]}
 // upstreamType: db add 时保存的上游类型（如 "sensenova"），为空时按域名自动检测
-func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, upstreamType string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
+// openAIPath: OpenAI 兼容端点 prefix（如 Google Gemini 的 "/v1beta/openai"），为空时回退到 "/v1"
+func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, modelsMap map[string][]string, upstreamType string, openAIPath string, timeout int, clientKey string, clientKeyEnabled bool, verboseLevel int) *QuickGateway {
 	// 注册 4 个协议翻译器
 	registry := translator.NewTranslatorRegistry()
 	registry.Register(&chatcompletion.ChatCompletionTranslator{})
@@ -155,6 +158,7 @@ func NewQuickGateway(name, baseURL, apiKey string, capabilities []string, models
 		translatorRegistry: registry,
 		proxyBaseURL:       proxyBaseURL,
 		proxyKey:           apiKey,
+		openAIPath:         openAIPath,
 		clientKey:          clientKey,
 		clientKeyEnabled:   clientKeyEnabled,
 		verboseLevel:       verboseLevel,
@@ -310,13 +314,22 @@ func (q *QuickGateway) normalizeIngress(p string) string {
 }
 
 // selectProtocol 根据入站协议选择匹配的上游协议
-// 策略：归一化后，若该协议在 capabilities 中则使用它（透传）；否则回退到 openai（翻译转换）
+// 策略：归一化后，若该协议在 capabilities 中则使用它（透传）；否则回退到最合适的翻译路径
+//   - 出站 chat 协议优先走 openai chat（有 openai 能力则 openai 翻译，无则 gemini 翻译）
+//   - 其他协议同理：优先 openai，其次 gemini
 func (q *QuickGateway) selectProtocol(ingressProtocol string) string {
 	normalized := q.normalizeIngress(ingressProtocol)
 	if slices.Contains(q.capabilities, normalized) {
 		return normalized
 	}
-	// 回退：上游不支持该协议 → 翻译到 openai 协议转换
+	// 回退：上游不支持该协议 → 翻译路径
+	// 出站 chat 优先走 openai chat
+	if slices.Contains(q.capabilities, "openai") {
+		return "openai"
+	}
+	if slices.Contains(q.capabilities, "gemini") {
+		return "gemini"
+	}
 	return "openai"
 }
 
@@ -335,7 +348,7 @@ func (q *QuickGateway) getProvider(protocolType string) provider.Provider {
 	case "responses":
 		p = provider.NewResponsesClient(q.proxyName, q.proxyBaseURL, q.timeout)
 	default:
-		p = provider.NewOpenAIClient(q.proxyName, q.proxyBaseURL, q.timeout)
+		p = provider.NewOpenAIClientWithPath(q.proxyName, q.proxyBaseURL, q.timeout, q.openAIPath)
 	}
 
 	if val, loaded := q.providerCache.LoadOrStore(protocolType, p); loaded {
