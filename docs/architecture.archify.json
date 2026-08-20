@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Agent-Proxy System Architecture",
+    "output": "docs/architecture.html",
+    "viewBox": [1400, 640],
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "request-path", "label": "Client to upstream", "focus": ["clients", "route", "registry", "router", "providers", "upstream"], "note": "Follow an ingress request through route detection, translation, and the provider hop." },
+      { "id": "model-resolution", "label": "Model resolution", "focus": ["registry", "alias", "router", "providers"], "note": "A client model name is aliased and routed before reaching a provider." },
+      { "id": "passthrough", "label": "Passthrough shortcut", "focus": ["route", "providers"], "note": "When ingress protocol is in the upstream capabilities, the body is forwarded verbatim over the top arc." }
+    ]
+  },
+  "components": [
+    { "id": "clients", "type": "external", "label": "Clients", "sublabel": "Claude Code · Codex · AI tools", "pos": [40, 260], "size": [130, 64], "tag": "ingress" },
+    { "id": "route", "type": "backend", "label": "Route detection", "sublabel": "POST /v1/{...}", "pos": [220, 260], "size": [140, 64], "tag": "quick.go · gateway.go" },
+    { "id": "registry", "type": "backend", "label": "TranslatorRegistry", "sublabel": "Central Schema hub", "pos": [400, 380], "size": [170, 64], "tag": "schema/internal.go" },
+    { "id": "router", "type": "cloud", "label": "ModelRouter", "sublabel": "name · prefix · default", "pos": [620, 380], "size": [150, 64], "tag": "router.go" },
+    { "id": "alias", "type": "cloud", "label": "AliasFile", "sublabel": "3-layer alias resolve", "pos": [435, 490], "size": [160, 56], "tag": "aliasfile.go" },
+    { "id": "providers", "type": "backend", "label": "Provider clients", "sublabel": "OpenAI · Anthropic · Gemini · Responses", "pos": [880, 260], "size": [180, 64], "tag": "provider/" },
+    { "id": "upstream", "type": "external", "label": "Upstream LLM APIs", "sublabel": "Gemini · OpenAI · Claude · …", "pos": [1110, 260], "size": [180, 64], "tag": "e.g. /v1beta/openai" }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "agent-proxy (in-process HTTP server)", "wraps": ["route", "registry", "alias", "router", "providers"] }
+  ],
+  "connections": [
+    { "from": "clients", "to": "route", "label": "HTTP POST", "variant": "emphasis" },
+    { "from": "route", "to": "registry", "label": "translate path", "variant": "emphasis" },
+    { "from": "route", "to": "providers", "label": "passthrough (verbatim body)", "variant": "dashed", "route": "orthogonal-h", "via": [[360, 140], [880, 140]], "labelAt": [620, 125] },
+    { "from": "registry", "to": "router", "label": "InternalRequest", "labelAt": [595, 376] },
+    { "from": "router", "to": "alias", "label": "resolve alias" },
+    { "from": "router", "to": "providers", "label": "provider body" },
+    { "from": "providers", "to": "upstream", "label": "HTTP", "variant": "emphasis" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Central Schema", "items": ["Every translation passes through InternalRequest / InternalResponse", "No protocol translates directly to another", "Translators enforce per-protocol SSE lifecycles"] },
+    { "dot": "cyan", "title": "Two modes, one core", "items": ["Quick mode: run --db <id> reads one ProxyRecord from SQLite", "Complex mode: run --mode complex reads a config file + web UI", "Both modes share the same translator layer shown here"] },
+    { "dot": "amber", "title": "Model resolution", "items": ["AliasFile resolves fake → real on ingress, real → fake on egress", "ModelRouter picks the provider by name, prefix, or default", "OpenAIPath carries custom prefixes like /v1beta/openai"] }
+  ]
+}
