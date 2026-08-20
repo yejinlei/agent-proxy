@@ -514,14 +514,25 @@ func sniffAll(url, key string) *SniffResult {
 		resp, err := client.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
-			switch resp.StatusCode {
-			case 200:
+			if resp.StatusCode == 200 {
 				models := parseOpenAIModels(resp.Body)
 				result.ModelsMap["openai"] = models
 				result.Capabilities = append(result.Capabilities, "openai")
-			case 401:
-				result.Capabilities = append(result.Capabilities, "openai")
-				result.ModelsMap["openai"] = nil
+			} else if resp.StatusCode == 401 {
+				openaiByQuery := openaiURL + "?key=" + key
+				req2, err := http.NewRequest("GET", openaiByQuery, nil)
+				if err == nil {
+					req2.Header.Set("Accept", "application/json")
+					resp2, err := client.Do(req2)
+					if err == nil {
+						defer resp2.Body.Close()
+						if resp2.StatusCode == 200 {
+							models := parseOpenAIModels(resp2.Body)
+							result.ModelsMap["openai"] = models
+							result.Capabilities = append(result.Capabilities, "openai")
+						}
+					}
+				}
 			}
 		}
 
@@ -598,7 +609,16 @@ func sniffAll(url, key string) *SniffResult {
 	}
 
 	// ── Step 3: Gemini ──────────────────────────────────
-	geminiURL := base + "/v1/models/gemini-pro:generateContent"
+	geminiModel := "gemini-2.5-flash"
+	if len(result.ModelsMap["openai"]) > 0 {
+		for _, m := range result.ModelsMap["openai"] {
+			if strings.HasPrefix(m, "gemini-") {
+				geminiModel = m
+				break
+			}
+		}
+	}
+	geminiURL := base + "/v1/models/" + geminiModel + ":generateContent"
 	geminiBody := map[string]any{
 		"contents": []any{
 			map[string]any{
@@ -610,6 +630,7 @@ func sniffAll(url, key string) *SniffResult {
 		},
 	}
 	geminiBodyJSON, _ := json.Marshal(geminiBody)
+	geminiProbed := false
 	req, err = http.NewRequest("POST", geminiURL, strings.NewReader(string(geminiBodyJSON)))
 	if err == nil {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -619,9 +640,26 @@ func sniffAll(url, key string) *SniffResult {
 		resp, err := shortClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
-			if resp.StatusCode < 300 || resp.StatusCode == 401 {
+			if resp.StatusCode < 300 {
 				result.ModelsMap["gemini"] = nil
 				result.Capabilities = append(result.Capabilities, "gemini")
+				geminiProbed = true
+			}
+		}
+		// Bearer 失败时回退到 ?key= 查询参数
+		if !geminiProbed {
+			req2, err := http.NewRequest("POST", geminiURL+"?key="+key, strings.NewReader(string(geminiBodyJSON)))
+			if err == nil {
+				req2.Header.Set("content-type", "application/json")
+				req2.Header.Set("Accept", "application/json")
+				resp2, err := shortClient.Do(req2)
+				if err == nil {
+					defer resp2.Body.Close()
+					if resp2.StatusCode < 300 {
+						result.ModelsMap["gemini"] = nil
+						result.Capabilities = append(result.Capabilities, "gemini")
+					}
+				}
 			}
 		}
 	}
