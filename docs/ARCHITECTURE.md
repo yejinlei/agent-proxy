@@ -226,10 +226,10 @@ classDiagram
     CombinedTranslator <|-- ResponseTranslator
     CombinedTranslator <|-- StreamTranslator
 
-    CombinedTranslator <|-- CC_T[ChatCompletionTranslator]
-    CombinedTranslator <|-- AN_T[AnthropicTranslator]
-    CombinedTranslator <|-- GM_T[GeminiTranslator]
-    CombinedTranslator <|-- RS_T[ResponsesTranslator]
+    CombinedTranslator <|-- CC_T
+    CombinedTranslator <|-- AN_T
+    CombinedTranslator <|-- GM_T
+    CombinedTranslator <|-- RS_T
 ```
 
 Key signatures:
