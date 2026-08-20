@@ -25,7 +25,7 @@ flowchart TB
 
     subgraph PROXY["agent-proxy (in-process Go HTTP server)"]
         direction TB
-        ROUTE[Route detection<br/>POST /v1/{...}]
+        ROUTE[Route detection<br/>POST /v1/*]
 
         subgraph MODES["Two server modes"]
             QUICK[QuickGateway<br/>cmd/server/quick.go]
@@ -150,7 +150,7 @@ classDiagram
     class InternalToolCall {
         string ID
         string Type
-        Function{Name, Arguments, RawArguments}
+        Function Function
     }
     class InternalResponse {
         string ID
@@ -226,10 +226,10 @@ classDiagram
     CombinedTranslator <|-- ResponseTranslator
     CombinedTranslator <|-- StreamTranslator
 
-    CombinedTranslator <|-- CC_T[[ChatCompletionTranslator]]
-    CombinedTranslator <|-- AN_T[[AnthropicTranslator]]
-    CombinedTranslator <|-- GM_T[[GeminiTranslator]]
-    CombinedTranslator <|-- RS_T[[ResponsesTranslator]]
+    CombinedTranslator <|-- CC_T[ChatCompletionTranslator]
+    CombinedTranslator <|-- AN_T[AnthropicTranslator]
+    CombinedTranslator <|-- GM_T[GeminiTranslator]
+    CombinedTranslator <|-- RS_T[ResponsesTranslator]
 ```
 
 Key signatures:
@@ -307,8 +307,8 @@ Model resolution happens in two stages:
 
 ```mermaid
 flowchart LR
-    A[Client model<br/>"my-gpt-4o"] --> B[AliasFile.Resolve]
-    B -->|found| C[Real upstream model<br/>"gpt-4o"]
+    A[Client model<br/>my-gpt-4o] --> B[AliasFile.Resolve]
+    B -->|found| C[Real upstream model<br/>gpt-4o]
     B -->|not found| D[_default_ or passthrough]
     C --> E[ModelRouter]
     E --> F[Provider selection<br/>by name/prefix/rule]

@@ -87,7 +87,10 @@
       try {
         const { svg } = await mermaid.render('m' + i, div.textContent);
         div.innerHTML = svg;
-      } catch { div.innerHTML = '<pre>' + div.textContent + '</pre>'; }
+      } catch(e) {
+        console.error('Mermaid render failed (block ' + i + '):', e);
+        div.innerHTML = '<pre style="border-left:3px solid #d73a49;padding:8px 12px;margin:1em 0;text-align:left;color:#b71c1c;background:#fff0f0;white-space:pre-wrap;font-size:0.85em">' + 'Mermaid error:\n' + String(e).slice(0,300) + '\n\n--- original ---\n' + div.textContent + '</pre>';
+      }
     }
   }
 </script>
