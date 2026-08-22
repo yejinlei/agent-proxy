@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location "F:\src\agent-proxy"
-$VERSION = "v0.2.102"
+$VERSION = "v0.2.103"
 
 $combos = @(
     @{ GOOS="windows"; GOARCH="amd64"; OUT="dist\agent-proxy_windows_amd64.exe" }
