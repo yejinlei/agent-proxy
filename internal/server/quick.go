@@ -3,10 +3,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -410,7 +414,7 @@ func (q *QuickGateway) Routes() chi.Router {
 	// 4 个协议端点全部走统一的中枢翻译
 	mux.Post("/v1/chat/completions", q.handleChatCompletion)
 	mux.Post("/v1/messages", q.handleMessages)
-	mux.Post("/v1/responses", q.handleResponses)
+	mux.HandleFunc("/v1/responses", q.handleResponses)
 
 	// Gemini: /v1/models/{model}:generateContent — chi * wildcard for colon separator
 	mux.Post("/v1/models/*", q.handleModelsCatchAll)
@@ -625,6 +629,10 @@ func (q *QuickGateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (q *QuickGateway) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		q.handleResponsesWebSocket(w, r)
+		return
+	}
 	q.handleRequest(w, r, "responses")
 }
 
@@ -3449,4 +3457,178 @@ func writeSSE(w http.ResponseWriter, data []byte) bool {
 		return false
 	}
 	return true
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  WebSocket 支持 — OpenAI Codex 通过 WebSocket 连接 /v1/responses
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const (
+	qwsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	qwsOpText  byte = 0x1 // text frame
+	qwsOpClose byte = 0x8 // close frame
+	qwsFin          = 0x80
+	qwsMask         = 0x80
+)
+
+// @AI_GUARD: QUICK_WEBSOCKET_SUPPORT - 快速模式 Codex 支持（需同步 gateway.go handleResponsesWebSocket）
+// @CONSTRAINT: handleResponses 入口必须用 mux.HandleFunc 注册（不能用 mux.Post），否则 chi 在方法过滤阶段就返回 405，handler 不会被调用
+// @REASON: 历史血泪教训 - 之前用 mux.Post 注册，Codex 的 ws:// 连接（GET + Upgrade）被 chi 直接 405，handleResponses 完全收不到请求
+// @RELATED: gateway.go handleResponsesWebSocket, gateway.go Routes(), quick.go Routes()
+
+func quickComputeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + qwsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func quickReadWSFrame(conn net.Conn) ([]byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, err
+	}
+	masked := header[1]&qwsMask != 0
+	length := uint64(header[1] & 0x7F)
+
+	switch {
+	case length == 126:
+		ext := make([]byte, 2)
+		if _, err := io.ReadFull(conn, ext); err != nil {
+			return nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext))
+	case length == 127:
+		ext := make([]byte, 8)
+		if _, err := io.ReadFull(conn, ext); err != nil {
+			return nil, err
+		}
+		length = binary.BigEndian.Uint64(ext)
+	}
+
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+			return nil, err
+		}
+	}
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+	return payload, nil
+}
+
+func quickWriteWSFrame(conn net.Conn, payload []byte) error {
+	length := len(payload)
+	var frame []byte
+	switch {
+	case length < 126:
+		frame = make([]byte, 2+length)
+		frame[0] = qwsFin | qwsOpText
+		frame[1] = byte(length)
+		copy(frame[2:], payload)
+	case length < 65536:
+		frame = make([]byte, 4+length)
+		frame[0] = qwsFin | qwsOpText
+		frame[1] = 126
+		binary.BigEndian.PutUint16(frame[2:4], uint16(length))
+		copy(frame[4:], payload)
+	default:
+		frame = make([]byte, 10+length)
+		frame[0] = qwsFin | qwsOpText
+		frame[1] = 127
+		binary.BigEndian.PutUint64(frame[2:10], uint64(length))
+		copy(frame[10:], payload)
+	}
+	_, err := conn.Write(frame)
+	return err
+}
+
+type qwsResponseWriter struct {
+	conn        net.Conn
+	header      http.Header
+	wroteHeader bool
+}
+
+func (w *qwsResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *qwsResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if err := quickWriteWSFrame(w.conn, b); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (w *qwsResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+}
+
+func (w *qwsResponseWriter) Flush() {}
+
+// handleResponsesWebSocket 处理 OpenAI Codex 的 WebSocket 升级请求（快速模式）
+// 将 WebSocket 协议转换为内部 HTTP 处理，再通过 WebSocket 帧返回响应
+func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "WebSocket not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return
+	}
+	acceptKey := quickComputeAcceptKey(key)
+
+	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	bufrw.WriteString("Upgrade: websocket\r\n")
+	bufrw.WriteString("Connection: Upgrade\r\n")
+	bufrw.WriteString("Sec-WebSocket-Accept: " + acceptKey + "\r\n")
+	bufrw.WriteString("\r\n")
+	if err := bufrw.Flush(); err != nil {
+		return
+	}
+
+	payload, err := quickReadWSFrame(conn)
+	if err != nil {
+		return
+	}
+
+	wsReq, err := http.NewRequestWithContext(r.Context(), "POST", r.URL.String(), io.NopCloser(strings.NewReader(string(payload))))
+	if err != nil {
+		return
+	}
+	wsReq.Header = r.Header.Clone()
+	wsReq.Header.Del("Upgrade")
+	wsReq.Header.Del("Connection")
+	wsReq.Header.Del("Sec-WebSocket-Key")
+	wsReq.Header.Del("Sec-WebSocket-Version")
+
+	wsWriter := &qwsResponseWriter{conn: conn}
+	q.handleRequest(wsWriter, wsReq, "responses")
 }

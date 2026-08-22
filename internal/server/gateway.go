@@ -146,7 +146,7 @@ func (g *Gateway) Routes() chi.Router {
 	// 4 个协议端点全部走统一的中枢翻译
 	mux.Post("/v1/chat/completions", g.handleChatCompletion)
 	mux.Post("/v1/messages", g.handleMessages)
-	mux.Post("/v1/responses", g.handleResponses)
+	mux.HandleFunc("/v1/responses", g.handleResponses)
 	mux.Post("/v1/models", g.handleModels)
 
 	// Gemini: /v1/models/{model}:generateContent
