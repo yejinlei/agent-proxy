@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -93,6 +94,10 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 
 	// --- 2. Input → Messages ---
 	messages := inputToMessages(InputToItems(req.Input))
+
+	// @CODEX-DEBUG v0.2.98：Codex 入站请求形状诊断（生产可见，用 [CODEX-DEBUG] 前缀便于 grep）
+	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
+		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
 
 	// --- 3. Tools → InternalTools ---
 	var tools []schema.InternalTool
@@ -444,11 +449,13 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		buf = append(buf, raw...)
 		buf = append(buf, '\n', '\n')
 		fn(buf, false)
+		log.Printf("[CODEX-DEBUG] TranslateStream emit: %s bytes=%d", eventType, len(buf))
 	}
 
 	sendDoneSSE := func() {
 		buf := []byte("event: done\ndata: [DONE]\n\n")
 		fn(buf, true)
+		log.Printf("[CODEX-DEBUG] TranslateStream emit: done/[DONE] bytes=%d", len(buf))
 	}
 
 	sendOutputItemAddedMsg := func() {
@@ -718,6 +725,10 @@ func (t *ResponsesTranslator) TranslateToProvider(req *schema.InternalRequest) (
 
 	// --- 3. Tools ---
 	tools := toolsToResponses(req.Tools)
+
+	// @CODEX-DEBUG v0.2.98：翻译后下游请求形状
+	log.Printf("[CODEX-DEBUG] TranslateToProvider: model=%q input_items=%d instructions_len=%d tools=%d stream=%v",
+		req.Model, len(input), len(instructions), len(tools), req.Stream)
 
 	return &ResponseRequest{
 		Model:           req.Model,
