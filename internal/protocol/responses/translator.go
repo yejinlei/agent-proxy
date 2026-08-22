@@ -677,13 +677,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			case "error":
 				sendCreated()
 				errData := t.TranslateError(event.Error)
+				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
+					event.Error.Code, event.Error.Type, event.Error.Message)
 				buf := make([]byte, 0, len("event: response.failed\ndata: ")+len(errData)+len("\n\n"))
 				buf = append(buf, []byte("event: response.failed\ndata: ")...)
 				buf = append(buf, errData...)
 				buf = append(buf, '\n', '\n')
 				fn(buf, false)
 				sendDoneSSE()
-				continue
+				return
 
 			case "start":
 				if event.Data != nil && event.Data.Model != "" {
