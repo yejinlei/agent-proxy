@@ -14,6 +14,22 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
 
+// maxRetries 上游请求最大重试次数（0=不重试，默认 2）
+const maxRetries = 2
+
+// retryableStatus 判断 HTTP 状态码是否值得重试
+func retryableStatus(status int) bool {
+	return status == 400 || status == 408 || status == 429 || status >= 500
+}
+
+// retryDelay 重试等待时间（指数退避）
+func retryDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	return time.Duration(attempt*attempt) * 100 * time.Millisecond
+}
+
 // openaiClient 内部表示，支持可配置端点
 type openaiClient struct {
 	name     string
@@ -109,126 +125,212 @@ func (c *OpenAIClient) Endpoint(model string, stream bool) (method string, url s
 
 func (c *OpenAIClient) Call(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (body json.RawMessage, headers http.Header, err error) {
 	url := c.BuildURL(info, info.Name, false)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
-	if err != nil {
-		return nil, nil, err
+	body, headers, err = c.callWithRetry(ctx, req, info, url, false, maxRetries)
+	return
+}
+
+// callWithRetry 非流式请求重试逻辑（适用于 OpenAI/Responses 客户端）
+// 对 400/408/429/5xx 状态码进行最多 maxRetries 次指数退避重试
+// @AI_GUARD: RETRYABLE_STATUS - 400/408/429/5xx 值得重试
+// @CONSTRAINT: 重试必须保持幂等性——同一请求体重发，不修改请求体
+// @RELATED: OpenAIClient.Call, OpenAIClient.CallStream
+// @REASON: Sensenova 等上游存在非确定性行为（同请求体有时 200 有时 400），
+//   重试可消除服务端负载均衡/限流波动造成的偶发失败
+func (c *OpenAIClient) callWithRetry(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo, url string, isStream bool, maxRetries int) (json.RawMessage, http.Header, error) {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
+		if err != nil {
+			return nil, nil, err
+		}
+		headers := c.DefaultHeaders(info)
+		if isStream {
+			headers.Set("Accept", "text/event-stream")
+			headers.Set("Cache-Control", "no-cache")
+			headers.Set("Connection", "keep-alive")
+		}
+		httpReq.Header = headers
+
+		if attempt > 0 {
+			delay := retryDelay(attempt)
+			log.Printf("[retry] attempt %d/%d, waiting %v (model=%s)", attempt, maxRetries, delay, extractModel(req))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			log.Printf("[retry] attempt %d/%d POST %s body_len=%d", attempt, maxRetries, url, len(req))
+		} else {
+			log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
+		}
+
+		resp, err := c.client.Do(httpReq)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		respHeaders := http.Header{}
+		for k, v := range resp.Header {
+			respHeaders[k] = v
+		}
+
+		if resp.StatusCode >= 400 && retryableStatus(resp.StatusCode) && attempt < maxRetries {
+			log.Printf("[retry] HTTP %d on attempt %d/%d, body=%s", resp.StatusCode, attempt, maxRetries, string(respBody))
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			return respBody, respHeaders, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		return respBody, respHeaders, nil
 	}
 
-	headers = c.DefaultHeaders(info)
-	httpReq.Header = headers
+	return nil, nil, fmt.Errorf("all %d retries exhausted", maxRetries)
+}
 
-	log.Printf("[provider] POST %s body_len=%d content_length=%d", url, len(req), httpReq.ContentLength)
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, nil, err
+// extractModel 从请求体中提取 model 名称用于日志
+func extractModel(req json.RawMessage) string {
+	var m map[string]interface{}
+	if err := json.Unmarshal(req, &m); err != nil {
+		return "?"
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, err
+	if model, ok := m["model"].(string); ok {
+		return model
 	}
-
-	// 保存响应头（下游原样返回）
-	respHeaders := http.Header{}
-	for k, v := range resp.Header {
-		respHeaders[k] = v
-	}
-
-	if resp.StatusCode >= 400 {
-		return respBody, respHeaders, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, respHeaders, nil
+	return "?"
 }
 
 func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo) (lines <-chan json.RawMessage, headers http.Header, err error) {
 	linesCh := make(chan json.RawMessage, 50)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BuildURL(info, info.Name, true), bytes.NewReader(req))
-	if err != nil {
-		return nil, nil, err
-	}
-
 	headers = c.DefaultHeaders(info)
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
 	headers.Set("Connection", "keep-alive")
-	httpReq.Header = headers
 
 	go func() {
 		defer close(linesCh)
-		resp, err := c.client.Do(httpReq)
-		if err != nil {
-			errMsg, _ := json.Marshal(map[string]interface{}{
-				"_type":   "error",
-				"_status": 502,
-				"data":    "connection failed: " + err.Error(),
-			})
-			linesCh <- errMsg
-			return
-		}
-		defer resp.Body.Close()
+		url := c.BuildURL(info, info.Name, true)
 
-		// 保存响应头
-		respHeaders := http.Header{}
-		for k, v := range resp.Header {
-			respHeaders[k] = v
-		}
-		// 发送第一个事件带响应头信息（用于下游 header 透传）
-		meta, _ := json.Marshal(map[string]interface{}{
-			"_type":    "headers",
-			"_status":  resp.StatusCode,
-			"_headers": respHeaders,
-		})
-		linesCh <- meta
-
-		// 上游返回错误状态码时，不解析为 SSE，直接转为一条错误事件并关闭 channel
-		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-			errSSE, _ := json.Marshal(map[string]any{
-				"_type":   "error",
-				"_status": resp.StatusCode,
-				"data":    string(errBody),
-			})
-			linesCh <- errSSE
-			return
-		}
-
-		reader := lineReader(ctx, resp.Body)
-
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
+			if err != nil {
+				errMsg, _ := json.Marshal(map[string]interface{}{
+					"_type":   "error",
+					"_status": 502,
+					"data":    "connection failed: " + err.Error(),
+				})
+				linesCh <- errMsg
 				return
-			default:
-				line, err := reader()
-				if err != nil {
-					if err != io.EOF {
-						errMsg, _ := json.Marshal(map[string]interface{}{
-							"_type":   "error",
-							"_status": 502,
-							"data":    "stream read failed: " + err.Error(),
-						})
-						linesCh <- errMsg
-					}
+			}
+			headers := c.DefaultHeaders(info)
+			headers.Set("Accept", "text/event-stream")
+			headers.Set("Cache-Control", "no-cache")
+			headers.Set("Connection", "keep-alive")
+			httpReq.Header = headers
+
+			if attempt > 0 {
+				delay := retryDelay(attempt)
+				log.Printf("[retry] attempt %d/%d, waiting %v (model=%s)", attempt, maxRetries, delay, extractModel(req))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
 					return
 				}
+				log.Printf("[retry] SSE POST %s attempt %d/%d body_len=%d", url, attempt, maxRetries, len(req))
+			}
 
-				if line == nil {
-					continue
+			resp, err := c.client.Do(httpReq)
+			if err != nil {
+				errMsg, _ := json.Marshal(map[string]interface{}{
+					"_type":   "error",
+					"_status": 502,
+					"data":    "connection failed: " + err.Error(),
+				})
+				linesCh <- errMsg
+				return
+			}
+
+			// 保存响应头
+			respHeaders := http.Header{}
+			for k, v := range resp.Header {
+				respHeaders[k] = v
+			}
+
+			if resp.StatusCode >= 400 && retryableStatus(resp.StatusCode) && attempt < maxRetries {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+				resp.Body.Close()
+				log.Printf("[retry] HTTP %d on SSE attempt %d/%d, body=%s", resp.StatusCode, attempt, maxRetries, string(errBody))
+				continue
+			}
+
+			// 发送响应头元数据（仅最终尝试发送）
+			meta, _ := json.Marshal(map[string]interface{}{
+				"_type":    "headers",
+				"_status":  resp.StatusCode,
+				"_headers": respHeaders,
+			})
+			linesCh <- meta
+
+			if resp.StatusCode >= 400 {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+				errSSE, _ := json.Marshal(map[string]any{
+					"_type":   "error",
+					"_status": resp.StatusCode,
+					"data":    string(errBody),
+				})
+				linesCh <- errSSE
+				resp.Body.Close()
+				return
+			}
+
+			reader := lineReader(ctx, resp.Body)
+			for {
+				select {
+				case <-ctx.Done():
+					log.Printf("[provider] SSE context cancelled: %v", ctx.Err())
+					return
+				default:
+					line, err := reader()
+					if err != nil {
+						if err != io.EOF {
+							errMsg, _ := json.Marshal(map[string]interface{}{
+								"_type":   "error",
+								"_status": 502,
+								"data":    "stream read failed: " + err.Error(),
+							})
+							linesCh <- errMsg
+						}
+						return
+					}
+
+					if line == nil {
+						continue
+					}
+
+					trimmed := strings.TrimSpace(string(line))
+					if trimmed == "" || trimmed == "data: [DONE]" || strings.HasPrefix(trimmed, ":") {
+						continue
+					}
+
+					linesCh <- json.RawMessage(trimmed)
 				}
-
-				trimmed := strings.TrimSpace(string(line))
-				if trimmed == "" || trimmed == "data: [DONE]" || strings.HasPrefix(trimmed, ":") {
-					continue
-				}
-
-				linesCh <- json.RawMessage(trimmed)
 			}
 		}
+
+		// 所有重试次数已用尽
+		errMsg, _ := json.Marshal(map[string]interface{}{
+			"_type":   "error",
+			"_status": 502,
+			"data":    fmt.Sprintf("all %d retries exhausted", maxRetries),
+		})
+		linesCh <- errMsg
 	}()
 
 	return linesCh, nil, nil
