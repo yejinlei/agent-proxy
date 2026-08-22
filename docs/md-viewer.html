@@ -84,17 +84,26 @@
     const blocks = [...md.matchAll(/~~~\s*mermaid\s*\n([\s\S]*?)~~~\n/g)].concat([...md.matchAll(/```\s*mermaid\s*\n([\s\S]*?)```/g)]);
     if (!blocks.length) return;
     mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+    const codeBlocks = [...document.querySelectorAll('pre > code.language-mermaid')];
     for (let i = 0; i < blocks.length; i++) {
       const div = document.createElement('div');
-      div.className = 'mermaid'; div.textContent = blocks[i][1];
-      document.getElementById('content').append(div);
+      div.className = 'mermaid';
+      const src = blocks[i][1];
+      const code = codeBlocks[i];
       try {
-        const { svg } = await mermaid.render('m' + i, div.textContent);
+        const { svg } = await mermaid.render('m' + i, src);
         div.innerHTML = svg;
+        if (code) code.parentElement.replaceWith(div);
+        else document.getElementById('content').append(div);
       } catch(e) {
         console.error('Mermaid render failed (block ' + i + '):', e);
-        div.innerHTML = '<pre style="border-left:3px solid #d73a49;padding:8px 12px;margin:1em 0;text-align:left;color:#b71c1c;background:#fff0f0;white-space:pre-wrap;font-size:0.85em">' + 'Mermaid error:\n' + String(e).slice(0,300) + '\n\n--- original ---\n' + div.textContent + '</pre>';
+        div.innerHTML = '<pre style="border-left:3px solid #d73a49;padding:8px 12px;margin:1em 0;text-align:left;color:#b71c1c;background:#fff0f0;white-space:pre-wrap;font-size:0.85em">' + 'Mermaid error:\n' + String(e).slice(0,300) + '\n\n--- original ---\n' + src + '</pre>';
+        if (code) code.parentElement.replaceWith(div);
+        else document.getElementById('content').append(div);
       }
+    }
+    for (let i = blocks.length; i < codeBlocks.length; i++) {
+      codeBlocks[i].parentElement.style.display = 'none';
     }
   }
 </script>
