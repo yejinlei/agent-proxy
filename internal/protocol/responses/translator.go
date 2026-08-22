@@ -192,6 +192,33 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 						}
 					}
 					contentBlocks = append(contentBlocks, icb)
+				case "tool_result":
+					var toolCallID string
+					if tcid, ok := block["tool_call_id"].(string); ok {
+						toolCallID = tcid
+					}
+					if toolCallID == "" {
+						toolCallID = item.ToolCallID
+					}
+					var toolText string
+					switch toolContent := block["content"].(type) {
+					case string:
+						toolText = toolContent
+					case []interface{}:
+						for _, sub := range toolContent {
+							if subBlock, ok := sub.(map[string]interface{}); ok {
+								if subText, ok := subBlock["text"].(string); ok {
+									toolText += subText
+								}
+							}
+						}
+					}
+					toolContentJSON, _ := json.Marshal(toolText)
+					msgs = append(msgs, schema.InternalMessage{
+						Role:       schema.Role("tool"),
+						ToolCallID: toolCallID,
+						Content:    toolContentJSON,
+					})
 				}
 			}
 			text = joinText(textParts)
@@ -219,6 +246,9 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 			})
 		}
 
+		if text == "" && len(contentBlocks) == 0 && len(msg.ToolCalls) == 0 {
+			continue
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs
