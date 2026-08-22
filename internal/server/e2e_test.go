@@ -379,6 +379,7 @@ func setupMockGateway(t *testing.T) *mockGateway {
 		[]string{"openai"},
 		nil,
 		"",
+		"",
 		30,
 		"", false, 0,
 	)

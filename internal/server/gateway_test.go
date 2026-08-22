@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/chatcompletion"
+	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
 
 // TestGateway_SSEDataPrefix_HandlesVariousFormats verifies the fix in
@@ -161,4 +162,38 @@ func TestQuickGateway_SSEDataPrefixAlreadyFixed(t *testing.T) {
 
 func getTestGatewayCache() *sync.Map {
 	return &sync.Map{}
+}
+
+// TestBuildCCRequest_DevRoleMapToSystem verifies Responses API's "developer"
+// role is mapped to "system" when building CC requests. Sensenova and other
+// CC endpoints reject role:"developer" with 400; it must be mapped to system.
+func TestBuildCCRequest_DevRoleMapToSystem(t *testing.T) {
+	content, _ := json.Marshal("hello")
+	req := &schema.InternalRequest{
+		Model:   "test-model",
+		Stream:  true,
+		Messages: []schema.InternalMessage{
+			{Role: "developer", Content: content},   // should map → "system"
+			{Role: schema.RoleUser, Content: content}, // stays "user"
+		},
+	}
+	ccReq := buildCCRequest(req)
+
+	if len(ccReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(ccReq.Messages))
+	}
+
+	// developer → system
+	var role1 string
+	json.Unmarshal(ccReq.Messages[0].Content.Raw(), &role1)
+	if ccReq.Messages[0].Role != "system" {
+		t.Fatalf("developer role: got %q, want system", ccReq.Messages[0].Role)
+	}
+
+	// user stays user
+	if ccReq.Messages[1].Role != "user" {
+		t.Fatalf("user role: got %q, want user", ccReq.Messages[1].Role)
+	}
+	t.Logf("✓ developer→system mapping correct (developer=%q, user=%q)",
+		ccReq.Messages[0].Role, ccReq.Messages[1].Role)
 }

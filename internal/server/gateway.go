@@ -1219,7 +1219,20 @@ func (g *Gateway) translateToProvider(info *schema.ProviderInfo, internalReq *sc
 //   - ToolCalls.Arguments 是 JSON 字符串（不可 Marshal 为对象）
 //   - Stop 序列化：string/[]string 两种格式
 //
-// @RELATED: quick.go buildCCRequest (两个文件各自有独立实现，修改需同步)
+// @RELATED: quick.go translateToProvider（openai/sensenova 分支调用同一函数）
+//
+// mapRoleToCC 将入站协议角色映射为 ChatCompletion 端点支持的 4 种角色。
+// OpenAI CC 只接受 system/user/assistant/tool。
+// Responses API 的 "developer" 角色（OpenAI 2024-11 新增，语义最接近 system）
+// 上游 CC 端点可能不支持（如 Sensenova），统一映射为 "system" 避免 400。
+func mapRoleToCC(role string) string {
+	switch role {
+	case "developer":
+		return "system"
+	}
+	return role
+}
+
 func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionRequest {
 	messages := make([]chatcompletion.Message, 0, len(req.Messages)+1)
 
@@ -1241,7 +1254,7 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 			continue
 		}
 		im := chatcompletion.Message{
-			Role: string(msg.Role),
+			Role: mapRoleToCC(string(msg.Role)),
 			Name: msg.Name,
 		}
 		// 优先使用 ContentBlocks（含图片等多模态内容），否则回退到 Content 纯文本
