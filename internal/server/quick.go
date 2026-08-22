@@ -3573,6 +3573,9 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 	if err := quickWriteWSFrame(w.conn, b); err != nil {
 		return 0, err
 	}
+	// @CODEX-DEBUG v0.2.98：每帧写出记录（生产可见，前 120 字节用于定位生命周期事件）
+	preview := strings.ReplaceAll(strings.TrimRight(string(b[:min(len(b), 120)]), "\n"), "\r", "")
+	log.Printf("[CODEX-DEBUG] WS frame → client: bytes=%d preview=%q", len(b), preview)
 	return len(b), nil
 }
 
@@ -3618,6 +3621,11 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	if err != nil {
 		return
 	}
+
+	// @CODEX-DEBUG v0.2.98：记录握手成功 + 入站帧大小 + 前 200 字节（用于定位入站请求形状问题）
+	inboundPreview := strings.ReplaceAll(strings.TrimRight(string(payload[:min(len(payload), 200)]), "\n"), "\r", "")
+	log.Printf("[CODEX-DEBUG] WS handshake 101 OK, client=%s, inbound_frame_bytes=%d, preview=%q",
+		r.RemoteAddr, len(payload), inboundPreview)
 
 	wsReq, err := http.NewRequestWithContext(r.Context(), "POST", r.URL.String(), io.NopCloser(strings.NewReader(string(payload))))
 	if err != nil {
