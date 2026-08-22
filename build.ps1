@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location "F:\src\agent-proxy"
-$VERSION = "v0.2.93"
+$VERSION = "v0.2.99"
 
 $combos = @(
     @{ GOOS="windows"; GOARCH="amd64"; OUT="dist\agent-proxy_windows_amd64.exe" }
@@ -18,7 +18,7 @@ foreach ($c in $combos) {
     $env:GOOS = $goos
     $env:GOARCH = $goarch
     Write-Output "Building $out..."
-    go build -ldflags "-X github.com/agent-proxy/agent-proxy/version=$VERSION" -o $out .
+    go build -ldflags "-X main.version=$VERSION" -o $out .
     Write-Output "  done"
 }
 
