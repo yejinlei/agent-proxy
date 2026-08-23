@@ -357,7 +357,14 @@ func (g *Gateway) resolveAlias(clientModel string) (real string, original string
 		return clientModel, clientModel, false
 	}
 
-	rawVal, ok := g.aliasFile.Lookup(clientModel)
+	rawVal, ok := g.aliasFile.Resolve(clientModel)
+	if !ok {
+		// 原始名未命中 → 将点号替换为连字符再试一次（与 quick.go 同步）
+		normalized := strings.ReplaceAll(clientModel, ".", "-")
+		if normalized != clientModel {
+			rawVal, ok = g.aliasFile.Resolve(normalized)
+		}
+	}
 	if !ok {
 		return clientModel, clientModel, false
 	}
@@ -1311,6 +1318,23 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 		respFmt = &chatcompletion.ResponseFormat{Type: req.ResponseFormat.Type}
 	}
 
+	// @AI_GUARD: CC_TOP_P_AND_MAX_TOKENS_FILTER - SenseNova 严格校验 top_p/max_tokens
+	// @CONSTRAINT:
+	//   - top_p 必须 ∈ (0, 1]，≤0 时不发送（omitempty 过滤掉字段）
+	//   - max_tokens 必须 ∈ [1, 65536]，≤0 时不发送（让上游使用默认值）
+	// @REASON: 13/13 HTTP 400 根因：Claude Code 默认 top_p:0，通过 buildCCRequest 透传后
+	//          SenseNova 直接 400 "field TopP invalid"。已通过 curl 确认：
+	//          curl -d '{"top_p":0}' → 400；curl -d '{}' → 200。
+	//          同理 max_tokens:0 → 400 "field MaxTokens invalid, should be in [1, 65536]"。
+	var topP *float64
+	if req.TopP != nil && *req.TopP > 0 {
+		topP = req.TopP
+	}
+	var maxTokens int
+	if req.MaxTokens > 0 {
+		maxTokens = req.MaxTokens
+	}
+
 	return &chatcompletion.ChatCompletionRequest{
 		Model:          req.Model,
 		Messages:       messages,
@@ -1318,8 +1342,8 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 		Stream:         req.Stream,
 		StreamOptions:  &chatcompletion.StreamOptions{IncludeUsage: true},
 		Temperature:    req.Temperature,
-		TopP:           req.TopP,
-		MaxTokens:      req.MaxTokens,
+		TopP:           topP,
+		MaxTokens:      maxTokens,
 		Stop:           stop,
 		ResponseFormat: respFmt,
 		User:           req.UserID,
