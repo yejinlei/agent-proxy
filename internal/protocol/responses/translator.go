@@ -762,20 +762,26 @@ func (t *ResponsesTranslator) TranslateToProvider(req *schema.InternalRequest) (
 	log.Printf("[CODEX-DEBUG] TranslateToProvider: model=%q input_items=%d instructions_len=%d tools=%d stream=%v",
 		req.Model, len(input), len(instructions), len(tools), req.Stream)
 
-	return &ResponseRequest{
-		Model:           req.Model,
-		Input:           input,
-		Tools:           tools,
-		Stream:          req.Stream,
-		Temperature:     req.Temperature,
-		TopP:            req.TopP,
-		MaxOutputTokens: req.MaxOutputTokens,
-		StopSequences:   req.StopSequences,
-		ResponseFormat:  responseFormatToResponses(req.ResponseFormat),
-		Metadata:        &Metadata{UserID: req.UserID, Seed: req.Seed},
-		Instructions:    instructions,
-	}, nil
-}
+	// @AI_GUARD: RESPONSES_TOP_P_FILTER - SenseNova 要求 top_p ∈ (0, 1]
+		var topP *float64
+		if req.TopP != nil && *req.TopP > 0 {
+			topP = req.TopP
+		}
+
+		return &ResponseRequest{
+			Model:           req.Model,
+			Input:           input,
+			Tools:           tools,
+			Stream:          req.Stream,
+			Temperature:     req.Temperature,
+			TopP:            topP,
+			MaxOutputTokens: req.MaxOutputTokens,
+			StopSequences:   req.StopSequences,
+			ResponseFormat:  responseFormatToResponses(req.ResponseFormat),
+			Metadata:        &Metadata{UserID: req.UserID, Seed: req.Seed},
+			Instructions:    instructions,
+		}, nil
+	}
 
 func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 	var items []InputItem

@@ -227,7 +227,8 @@ func (q *QuickGateway) resolveAlias(clientModel string) (real string, original s
 			}
 		}
 		q.modelsMu.RUnlock()
-		// 二次兜底：仍然失败就透传原始值，上游会报错提示用户
+		// v0.2.105:  解析失败时透传原始值，上游会报错提示用户
+		log.Printf("[route]  解析失败，透传 %q → 可能 400", clientModel)
 		return clientModel, clientModel, false
 	case strings.HasPrefix(rawVal, "@db:"):
 		// @db:<id>,<model_name>: 取逗号后面的模型名
@@ -916,6 +917,9 @@ func stripSensenovaRequestFields(body json.RawMessage) json.RawMessage {
 // 1. 删除所有层级的 guided_grammar
 // 2. 删除所有层级的 cache_control
 // 3. output_config.effort="xhigh" → "high"
+// 4. @AI_GUARD: 删除 top_p ≤ 0（SenseNova 要求 top_p ∈ (0,1]）
+// 5. @AI_GUARD: 删除 max_tokens ≤ 0（SenseNova 要求 max_tokens ∈ [1,65536]）
+//    @REASON: 透传路径原样转发请求体，Claude Code 默认 top_p:0，SenseNova 直接 400
 func stripSensenovaIncompatible(v interface{}) interface{} {
 	switch m := v.(type) {
 	case map[string]interface{}:
@@ -927,6 +931,46 @@ func stripSensenovaIncompatible(v interface{}) interface{} {
 			if effort, ok := oc["effort"].(string); ok && effort == "xhigh" {
 				oc["effort"] = "high"
 				log.Printf("[strip] output_config.effort xhigh→high")
+			}
+		}
+		// @AI_GUARD: SENSENOVA_TOP_P_FILTER
+		if tp, ok := m["top_p"]; ok {
+			switch v := tp.(type) {
+			case float64:
+				if v <= 0 {
+					delete(m, "top_p")
+					log.Printf("[strip] top_p %.4f → removed (SenseNova requires > 0)", v)
+				}
+			case int:
+				if v <= 0 {
+					delete(m, "top_p")
+					log.Printf("[strip] top_p %d → removed (SenseNova requires > 0)", v)
+				}
+			case int64:
+				if v <= 0 {
+					delete(m, "top_p")
+					log.Printf("[strip] top_p %d → removed (SenseNova requires > 0)", v)
+				}
+			}
+		}
+		// @AI_GUARD: SENSENOVA_MAX_TOKENS_FILTER
+		if mt, ok := m["max_tokens"]; ok {
+			switch v := mt.(type) {
+			case float64:
+				if v <= 0 {
+					delete(m, "max_tokens")
+					log.Printf("[strip] max_tokens %.0f → removed (SenseNova requires >= 1)", v)
+				}
+			case int:
+				if v <= 0 {
+					delete(m, "max_tokens")
+					log.Printf("[strip] max_tokens %d → removed (SenseNova requires >= 1)", v)
+				}
+			case int64:
+				if v <= 0 {
+					delete(m, "max_tokens")
+					log.Printf("[strip] max_tokens %d → removed (SenseNova requires >= 1)", v)
+				}
 			}
 		}
 		for k, val := range m {
