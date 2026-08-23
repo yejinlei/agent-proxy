@@ -180,8 +180,8 @@ func DefaultAliases() *AliasFile {
 		"codex-fable-5", "codex-opus-4", "codex-sonnet-4",
 		// GPT / OpenAI 系列
 		"gpt-5-5", "gpt-5-4", "gpt-5-3", "gpt-5-2", "gpt-5",
-		"gpt-4-2", "gpt-4", "gpt-3-5-turbo", "gpt-3-5", "gpt-3",
-		"o1", "o3", "o4-mini", "o4",
+		"gpt-4-2", "gpt-4o", "gpt-4o-mini", "gpt-4", "gpt-3-5-turbo", "gpt-3-5", "gpt-3",
+		"o1", "o3", "o3-mini", "o4-mini", "o4",
 		// DeepSeek 系列
 		"deepseek-v4", "deepseek-r1", "deepseek-v3",
 		// Gemini 系列
