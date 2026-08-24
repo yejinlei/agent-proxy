@@ -3104,7 +3104,7 @@ func (q *QuickGateway) translateToProvider(providerType string, internalReq *sch
 	switch providerType {
 	case "openai", "sensenova":
 		// OpenAI 兼容：使用 InternalRequest 的 Model
-		ccReq := buildCCRequest(internalReq)
+		ccReq := buildCCRequest(internalReq, q.info.BaseURL)
 		downstreamReq, _ := json.Marshal(ccReq)
 		return nil, downstreamReq
 
@@ -3127,7 +3127,7 @@ func (q *QuickGateway) translateToProvider(providerType string, internalReq *sch
 		return pt, downstreamReq
 
 	default:
-		downstreamReq, _ := json.Marshal(buildCCRequest(internalReq))
+		downstreamReq, _ := json.Marshal(buildCCRequest(internalReq, q.info.BaseURL))
 		return nil, downstreamReq
 	}
 }

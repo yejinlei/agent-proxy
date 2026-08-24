@@ -38,7 +38,7 @@ func TestRootCause_LeakageFields(t *testing.T) {
 			Stream:   true,
 			ResponseFormat: &schema.InternalResponseFormat{Type: "text"},
 		}
-		cc := buildCCRequest(ir)
+		cc := buildCCRequest(ir, "")
 		raw, _ := json.Marshal(cc)
 		var decoded map[string]interface{}
 		json.Unmarshal(raw, &decoded)
@@ -53,7 +53,7 @@ func TestRootCause_LeakageFields(t *testing.T) {
 			Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
 			Stream:   false,
 		}
-		cc := buildCCRequest(ir)
+		cc := buildCCRequest(ir, "")
 		raw, _ := json.Marshal(cc)
 		var decoded map[string]interface{}
 		json.Unmarshal(raw, &decoded)
@@ -120,7 +120,7 @@ func TestDeveloperToSystem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cc := buildCCRequest(ir)
+	cc := buildCCRequest(ir, "")
 	raw, _ := json.Marshal(cc)
 	var decoded map[string]interface{}
 	json.Unmarshal(raw, &decoded)
@@ -130,4 +130,60 @@ func TestDeveloperToSystem(t *testing.T) {
 		t.Fatalf("developer 未映射为 system: %q", first["role"])
 	}
 	t.Logf("✅ developer → system")
+}
+
+// TestCodex_SensenovaStreamOptionsFilter 验证 sensenova 翻译路径上 buildCCRequest 不再注入 stream_options
+// （Codex 400 "Invalid request format" 根因）
+func TestCodex_SensenovaStreamOptionsFilter(t *testing.T) {
+	content := json.RawMessage(`"hi"`)
+	ir := &schema.InternalRequest{
+		Model:    "sensenova-6.8-flash-lite",
+		Messages: []schema.InternalMessage{{Role: "user", Content: content}},
+		Stream:   true,
+		Tools: []schema.InternalTool{
+			{Type: "function", Function: &schema.InternalFunction{Name: "read", Parameters: map[string]interface{}{}}},
+			{Type: "function"}, // nil Function → 空 Tool 槽，应被过滤
+		},
+	}
+
+	// sensenova 上游：stream_options 必须省略
+	cc := buildCCRequest(ir, "https://token.sensenova.cn/v1")
+	raw, _ := json.Marshal(cc)
+	var decoded map[string]interface{}
+	json.Unmarshal(raw, &decoded)
+	if _, ok := decoded["stream_options"]; ok {
+		t.Fatalf("sensenova 上游不应带 stream_options: %s", raw)
+	}
+	t.Logf("✅ sensenova 上游 stream_options 已省略")
+
+	// 非 sensenova 上游：stream_options 必须保留（Claude Code 依赖 usage）
+	cc2 := buildCCRequest(ir, "https://api.openai.com/v1")
+	raw2, _ := json.Marshal(cc2)
+	var decoded2 map[string]interface{}
+	json.Unmarshal(raw2, &decoded2)
+	if _, ok := decoded2["stream_options"]; !ok {
+		t.Fatalf("非 sensenova 上游应带 stream_options: %s", raw2)
+	}
+	t.Logf("✅ 非 sensenova 上游 stream_options 保留")
+}
+
+// TestBuildCCRequest_EmptyToolSlotFiltered 验证 nil Function 的 Tool 槽不会序列化为 {"type":"","function":null}
+func TestBuildCCRequest_EmptyToolSlotFiltered(t *testing.T) {
+	ir := &schema.InternalRequest{
+		Model:    "sensenova-6.8-flash-lite",
+		Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
+		Tools: []schema.InternalTool{
+			{Type: "function"}, // nil Function
+			{Type: "function", Function: &schema.InternalFunction{Name: "read"}},
+		},
+	}
+	cc := buildCCRequest(ir, "https://token.sensenova.cn/v1")
+	raw, _ := json.Marshal(cc)
+	if bytes.Contains(raw, []byte(`"function":null`)) {
+		t.Fatalf("不应含空 Tool 槽 function:null: %s", raw)
+	}
+	if bytes.Contains(raw, []byte(`"type":""`)) {
+		t.Fatalf("不应含空 type 字段: %s", raw)
+	}
+	t.Logf("✅ 空 Tool 槽已过滤, tools=%d", len(cc.Tools))
 }

@@ -177,7 +177,7 @@ func TestBuildCCRequest_DevRoleMapToSystem(t *testing.T) {
 			{Role: schema.RoleUser, Content: content}, // stays "user"
 		},
 	}
-	ccReq := buildCCRequest(req)
+	ccReq := buildCCRequest(req, "")
 
 	if len(ccReq.Messages) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(ccReq.Messages))
