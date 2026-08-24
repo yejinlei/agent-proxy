@@ -1190,7 +1190,7 @@ func (g *Gateway) translateToProvider(info *schema.ProviderInfo, internalReq *sc
 	switch providerType {
 	case "openai", "sensenova":
 		// OpenAI 兼容：直接透传（使用 InternalRequest 的 Model）
-		ccReq := buildCCRequest(internalReq)
+		ccReq := buildCCRequest(internalReq, info.BaseURL)
 		downstreamReq, _ := json.Marshal(ccReq)
 		return nil, downstreamReq
 
@@ -1214,7 +1214,7 @@ func (g *Gateway) translateToProvider(info *schema.ProviderInfo, internalReq *sc
 
 	default:
 		// 兜底：直接透传
-		downstreamReq, _ := json.Marshal(buildCCRequest(internalReq))
+		downstreamReq, _ := json.Marshal(buildCCRequest(internalReq, info.BaseURL))
 		return nil, downstreamReq
 	}
 }
@@ -1240,7 +1240,7 @@ func mapRoleToCC(role string) string {
 	return role
 }
 
-func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionRequest {
+func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion.ChatCompletionRequest {
 	messages := make([]chatcompletion.Message, 0, len(req.Messages)+1)
 
 	// System prompt
@@ -1288,17 +1288,17 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 		messages = append(messages, im)
 	}
 
-	tools := make([]chatcompletion.Tool, len(req.Tools))
-	for i, tool := range req.Tools {
+	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
+	for _, tool := range req.Tools {
 		if tool.Function != nil {
-			tools[i] = chatcompletion.Tool{
+			tools = append(tools, chatcompletion.Tool{
 				Type: "function",
 				Function: &chatcompletion.FunctionDef{
 					Name:        tool.Function.Name,
 					Description: tool.Function.Description,
 					Parameters:  tool.Function.Parameters,
 				},
-			}
+			})
 		}
 	}
 
@@ -1335,12 +1335,24 @@ func buildCCRequest(req *schema.InternalRequest) *chatcompletion.ChatCompletionR
 		maxTokens = req.MaxTokens
 	}
 
+	// @AI_GUARD: CC_STREAM_OPTIONS_SENSENOVA - sensenova CC 端点不支持 stream_options
+	// @CONSTRAINT: stream_options:{include_usage:true} 必须无条件注入（Claude Code 依赖 usage），
+	//   但对 sensenova 上游会触发 HTTP 400 "Invalid request format"——sensenova 拒绝该未知字段。
+	// @REASON: Codex 翻译路径（Responses→CC，sensenova 端点）根因：buildCCRequest 无条件注入
+	//          stream_options，sensenova 直接 400。已通过生产日志确认两次请求均 "Invalid request format"，
+	//          body 尾部（formatJSON 20KB 截断）含 stream_options。
+	// @RELATED: 透传路径由 stripSensenovaRequestFields 处理；翻译路径无 DB upstreamType 判断，必须在此按 baseURL 检测。
+	streamOptions := &chatcompletion.StreamOptions{IncludeUsage: true}
+	if DetectUpstreamType(baseURL) == "sensenova" {
+		streamOptions = nil
+	}
+
 	return &chatcompletion.ChatCompletionRequest{
 		Model:          req.Model,
 		Messages:       messages,
 		Tools:          tools,
 		Stream:         req.Stream,
-		StreamOptions:  &chatcompletion.StreamOptions{IncludeUsage: true},
+		StreamOptions:  streamOptions,
 		Temperature:    req.Temperature,
 		TopP:           topP,
 		MaxTokens:      maxTokens,
