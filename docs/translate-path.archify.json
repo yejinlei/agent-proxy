@@ -2,52 +2,242 @@
   "schema_version": 1,
   "diagram_type": "sequence",
   "meta": {
-    "title": "Translate Path — Central Schema Round-trip",
+    "title": "翻译路径 — Central Schema 往返图",
     "output": "docs/translate-path.html",
-    "viewBox": [1100, 970],
+    "viewBox": [
+      1100,
+      970
+    ],
     "column_fit": "spread",
     "animation": "trace",
     "quality_profile": "showcase",
     "views": [
-      { "id": "request-ingress", "label": "Ingress & translate", "focus": ["client", "proxy", "treg"], "note": "The ingress request is detected and normalized into InternalRequest." },
-      { "id": "upstream-call", "label": "Upstream call", "focus": ["proxy", "upstream"], "note": "The translated body is sent to the upstream provider." },
-      { "id": "sse-return", "label": "SSE return", "focus": ["upstream", "treg", "proxy", "client"], "note": "Upstream SSE is translated back through the Central Schema and streamed to the client." }
+      {
+        "id": "request-ingress",
+        "label": "Ingress & translate",
+        "focus": [
+          "client",
+          "proxy",
+          "treg"
+        ],
+        "note": "The ingress request is detected and normalized into InternalRequest."
+      },
+      {
+        "id": "upstream-call",
+        "label": "Upstream call",
+        "focus": [
+          "proxy",
+          "upstream"
+        ],
+        "note": "The translated body is sent to the upstream provider."
+      },
+      {
+        "id": "sse-return",
+        "label": "SSE return",
+        "focus": [
+          "upstream",
+          "treg",
+          "proxy",
+          "client"
+        ],
+        "note": "Upstream SSE is translated back through the Central Schema and streamed to the client."
+      }
     ]
   },
   "participants": [
-    { "id": "client", "type": "external", "label": "Client", "sublabel": "Claude Code · Codex" },
-    { "id": "proxy", "type": "backend", "label": "Proxy", "sublabel": "quick.go / gateway.go" },
-    { "id": "treg", "type": "backend", "label": "TranslatorRegistry", "sublabel": "Central Schema" },
-    { "id": "upstream", "type": "external", "label": "Upstream API", "sublabel": "e.g. Anthropic" }
+    {
+      "id": "client",
+      "type": "external",
+      "label": "客户端",
+      "sublabel": "Claude Code · Codex"
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "代理",
+      "sublabel": "quick.go / gateway.go"
+    },
+    {
+      "id": "treg",
+      "type": "backend",
+      "label": "TranslatorRegistry",
+      "sublabel": "Central Schema"
+    },
+    {
+      "id": "upstream",
+      "type": "external",
+      "label": "上游 API",
+      "sublabel": "如 Anthropic"
+    }
   ],
   "segments": [
-    { "from": 180, "to": 400, "label": "Request ingress" },
-    { "from": 420, "to": 560, "label": "Upstream call" },
-    { "from": 580, "to": 830, "label": "SSE return" }
+    {
+      "from": 180,
+      "to": 400,
+      "label": "入站请求"
+    },
+    {
+      "from": 420,
+      "to": 560,
+      "label": "上游调用"
+    },
+    {
+      "from": 580,
+      "to": 830,
+      "label": "SSE 返回"
+    }
   ],
   "messages": [
-    { "id": "m1", "from": "client", "to": "proxy", "y": 210, "label": "POST /v1/chat/completions", "variant": "emphasis" },
-    { "id": "m2", "from": "proxy", "to": "treg", "y": 250, "label": "TranslateRequest(raw)", "variant": "default" },
-    { "id": "m3", "from": "treg", "to": "proxy", "y": 290, "label": "InternalRequest", "variant": "return" },
-    { "id": "m4", "from": "proxy", "to": "treg", "y": 335, "label": "TranslateToProvider(target)", "variant": "default" },
-    { "id": "m5", "from": "treg", "to": "proxy", "y": 380, "label": "provider body (json.RawMessage)", "variant": "return" },
-    { "id": "m6", "from": "proxy", "to": "upstream", "y": 470, "label": "POST /v1/messages", "variant": "emphasis" },
-    { "id": "m7", "from": "upstream", "to": "proxy", "y": 540, "label": "SSE: message_start → content_block_delta …", "variant": "return" },
-    { "id": "m8", "from": "proxy", "to": "treg", "y": 620, "label": "TranslateStreamEvent(rawEvent)", "variant": "default" },
-    { "id": "m9", "from": "treg", "to": "proxy", "y": 665, "label": "InternalStreamEvent", "variant": "return" },
-    { "id": "m10", "from": "proxy", "to": "treg", "y": 710, "label": "TranslateStream(eventChan, outFn)", "variant": "default" },
-    { "id": "m11", "from": "treg", "to": "proxy", "y": 755, "label": "data: {\"choices\":[…]}", "variant": "return" },
-    { "id": "m12", "from": "proxy", "to": "client", "y": 800, "label": "SSE chunks → [DONE]", "variant": "return" }
+    {
+      "id": "m1",
+      "from": "client",
+      "to": "proxy",
+      "y": 210,
+      "label": "POST /v1/chat/completions",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "proxy",
+      "to": "treg",
+      "y": 250,
+      "label": "TranslateRequest(raw)",
+      "variant": "default"
+    },
+    {
+      "id": "m3",
+      "from": "treg",
+      "to": "proxy",
+      "y": 290,
+      "label": "InternalRequest",
+      "variant": "return"
+    },
+    {
+      "id": "m4",
+      "from": "proxy",
+      "to": "treg",
+      "y": 335,
+      "label": "TranslateToProvider(target)",
+      "variant": "default"
+    },
+    {
+      "id": "m5",
+      "from": "treg",
+      "to": "proxy",
+      "y": 380,
+      "label": "provider body (json.RawMessage)",
+      "variant": "return"
+    },
+    {
+      "id": "m6",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 470,
+      "label": "POST /v1/messages",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m7",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 540,
+      "label": "SSE: message_start → content_block_delta …",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "proxy",
+      "to": "treg",
+      "y": 620,
+      "label": "TranslateStreamEvent(rawEvent)",
+      "variant": "default"
+    },
+    {
+      "id": "m9",
+      "from": "treg",
+      "to": "proxy",
+      "y": 665,
+      "label": "InternalStreamEvent",
+      "variant": "return"
+    },
+    {
+      "id": "m10",
+      "from": "proxy",
+      "to": "treg",
+      "y": 710,
+      "label": "TranslateStream(eventChan, outFn)",
+      "variant": "default"
+    },
+    {
+      "id": "m11",
+      "from": "treg",
+      "to": "proxy",
+      "y": 755,
+      "label": "data: {\"choices\":[…]}",
+      "variant": "return"
+    },
+    {
+      "id": "m12",
+      "from": "proxy",
+      "to": "client",
+      "y": 800,
+      "label": "SSE chunks → [DONE]",
+      "variant": "return"
+    }
   ],
   "activations": [
-    { "participant": "client", "from": 210, "to": 805, "type": "external" },
-    { "participant": "proxy", "from": 210, "to": 805, "type": "backend" },
-    { "participant": "treg", "from": 245, "to": 760, "type": "backend" },
-    { "participant": "upstream", "from": 465, "to": 545, "type": "external" }
+    {
+      "participant": "client",
+      "from": 210,
+      "to": 805,
+      "type": "external"
+    },
+    {
+      "participant": "proxy",
+      "from": 210,
+      "to": 805,
+      "type": "backend"
+    },
+    {
+      "participant": "treg",
+      "from": 245,
+      "to": 760,
+      "type": "backend"
+    },
+    {
+      "participant": "upstream",
+      "from": 465,
+      "to": 545,
+      "type": "external"
+    }
   ],
   "cards": [
-    { "dot": "emerald", "title": "Invariants", "items": ["Message-format conversion always runs before the stream/non-stream decision", "InternalRequest.Stream is captured at TranslateRequest time and preserved to the final handler", "System prompt is extracted to InternalRequest.SystemPrompt, never carried in Messages"] },
-    { "dot": "rose", "title": "Passthrough shortcut", "items": ["When ingress protocol is in the upstream capabilities, translation is skipped", "Only the model alias is resolved; the body is forwarded verbatim", "Adaptive stream wrapping/unwrapping makes passthrough clients notice nothing"] },
-    { "dot": "amber", "title": "SSE teardown", "items": ["Each protocol enforces its full event lifecycle", "Cancellation-safe: closing events are emitted even if the channel closes early", "Claude Code and Codex validate these sequences strictly"] }
+    {
+      "dot": "emerald",
+      "title": "Invariants",
+      "items": [
+        "消息格式转换始终先于流 / 非流决策",
+        "InternalRequest.Stream 在 TranslateRequest 阶段捕获并保留至最终 handler",
+        "system 抽到 InternalRequest.SystemPrompt，绝不留在 Messages 里"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Passthrough shortcut",
+      "items": [
+        "当入站协议属于上游能力时，跳过翻译",
+        "只解析模型别名；请求体原样转发",
+        "自适应流包装 / 拆包让透传客户端毫无察觉"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "SSE teardown",
+      "items": [
+        "每个协议执行完整事件生命周期",
+        "取消安全：通道提前关闭也发完收尾事件",
+        "Claude Code 与 Codex 严格校验这些序列"
+      ]
+    }
   ]
 }
