@@ -57,6 +57,9 @@ node_modules/
 package.json
 package-lock.json
 
+# Local build/dev helpers (not shipped)
+tools/
+
 # ── Temp & test files ──
 .tmp/
 test-request.json
@@ -66,5 +69,8 @@ test-stream.json
 *.log
 # visual-check diagnostics — not needed on the live site
 docs/*.visual-check.*
+# ad-hoc verification screenshots
+docs/*verify*.png
+docs/*.png
 # local debug harnesses (not tests, not shipped)
 internal/server/debug_test/
