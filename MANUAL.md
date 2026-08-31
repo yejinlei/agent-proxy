@@ -58,7 +58,7 @@ go build -trimpath -ldflags "-s -w" -o agent-proxy.exe .
 ```powershell
 # ① 嗅探并添加代理（自动探测所有协议和模型，交互确认入库）
 agent-proxy db add --url https://token.sensenova.cn/v1 ^
-                   --key sk-b9ffyFsWinZg7QSOkMfF6P4gEXQ2mFKf ^
+                   --key sk-xxx ^
                    --name sensenova
 
 # ② 快速模式启动（--nokey 本地开发，无需客户端认证）
@@ -203,11 +203,7 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
 | `agent-proxy run --mode simple --db 1` | 快速模式（显式指定 mode） |
 | `agent-proxy run --mode complex --host 0.0.0.0 --port 8080` | 复杂模式（默认配置） |
 | `agent-proxy run --mode complex --conf agent-proxy.yaml` | 复杂模式 + 配置文件 |
-| `agent-proxy run --db 1 -v` / `-vv` | 追加日志级别（摘要 / 四向全链路） |
-| `agent-proxy run --db 1 --stream-mode stream` | 强制上游使用流式（SSE） |
-| `agent-proxy run --db 1 --stream-mode non-stream` | 强制上游使用非流式 |
-| `agent-proxy run --db 1 --stream-mode passthrough` | 直连透传，不注入心跳/SSE 包装 |
-| `agent-proxy run --db 1 --stream-mode auto` | 自动按请求体 `stream` 字段 + 自适应偏好（默认） |
+| `agent-proxy run --db 1 -v` / `-vv` | 追加日志级别（摘要 / 四向全链路，仅快速模式生效） |
 | `agent-proxy --help` | 显示帮助 |
 
 ### db 管理
@@ -248,7 +244,7 @@ cfg.ModelRouter.DefaultProvider = "sensenova"  // 兜底
   ID:           1
   Name:         sensenova
   URL:          https://token.sensenova.cn/v1
-  Key:          sk-b9****2mFKf
+  Key:          sk-abc***xyz
   Provider:     openai
   检测格式:     openai-compatible
   OpenAI:       true
@@ -405,16 +401,9 @@ agent-proxy run --db 1 --nokey
 
 agent-proxy 支持 4×4 协议互转（OpenAI / Anthropic / Gemini / Responses），入站协议与上游协议相同时零开销透传，不同时自动翻译。
 
-### `--stream-mode` 流式策略
+### 流式策略
 
-控制透传和翻译路径下如何向上游发送请求：
-
-| 模式 | 行为 | 适用场景 |
-|------|------|---------|
-| `auto`（默认） | 按请求体 `stream` 字段自适应路由，首次探测上游速度后选择最优方式 | 日常使用 |
-| `stream` | 强制上游走 SSE 流式 | 上游仅支持流式 |
-| `non-stream` | 强制上游走非流式 | 上游流式不稳定 |
-| `passthrough` | 直连透传，不注入心跳/SSE 包装（仅透传路径生效） | 协议完全对齐 |
+无命令行开关。网关按请求体 `stream` 字段自适应路由：请求带 `stream: true` 走 SSE 流式，否则走非流式 JSON；上游返回的非流式响应会按需包装成 SSE。该策略自 v0.2.60 起取代已移除的 `--stream-mode` 参数。
 
 > 底层机制（Central Schema 架构、透传/翻译路径、心跳机制、SSE 合规性、Anthropic 事件生命周期、消息转换流转图、Claude Code 接入流程等）详见 [设计文档](docs/DESIGN.md)。
 
@@ -422,15 +411,15 @@ agent-proxy 支持 4×4 协议互转（OpenAI / Anthropic / Gemini / Responses�
 
 ## -v / -vv 日志
 
-快速模式和复杂模式均支持两级详细日志，作为启动标志追加即可。
+`-v` 仅快速模式生效；复杂模式下 `-v` 为 no-op，需用 `-vv` 才输出请求/响应体。作为启动标志追加即可。
 
 ### 日志级别
 
 | 级别 | 参数 | 输出内容 |
 |------|------|---------|
 | 默认 | （不传） | 仅启动信息 + 错误日志 |
-| 摘要 | `-v` | 客户端 IP / 入站协议 / 上游协议 / 模型 / 状态码 / 耗时 / Token 用量 |
-| 四向 | `-vv` | `-v` 基础上，依次打印四条完整消息体 |
+| 摘要 | `-v` | 客户端 IP / 入站协议 / 上游协议 / 模型 / 状态码 / 耗时 / Token 用量（仅快速模式） |
+| 四向 | `-vv` | `-v` 基础上，依次打印四条完整消息体（两种模式均生效） |
 
 ### 摘要日志（-v）示例
 

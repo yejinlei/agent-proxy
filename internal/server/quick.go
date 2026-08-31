@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -608,6 +609,19 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		vctx.upstreamReq = downstreamReq
 	}
 	ctx = context.WithValue(ctx, verboseCtxKey{}, vctx)
+
+	// ── 上游请求字段清单诊断（v0.2.107）──
+	// 翻译路径上，sensenova 若拒绝请求，400 会即时返回，success-path 的 logRequest
+	// 根本不会被调用（所有调用点都传 http.StatusOK），且 body 尾部被 formatJSON 的
+	// 20KB 截断砍掉。故在此处、上游调用**之前**直接打印顶层字段清单：
+	// 不依赖 -v/-vv，也不受 20KB 截断影响，一眼可见
+	// temperature / stop / user / seed / stream_options / tools 是否存在及取值。
+	// 见 v0.2.106 Codex 400 根因排查。
+	if downstreamReq != nil {
+		bodyKeyInventory(fmt.Sprintf("proxy → %s [%s]", q.info.Name, DetectUpstreamType(q.info.BaseURL)), downstreamReq)
+	} else if q.verboseLevel >= 1 {
+		log.Printf("[diag] translation path produced nil downstreamReq (providerType=%s) — 请求将无法发送", providerType)
+	}
 	if stream {
 		if q.verboseLevel >= 2 {
 			log.Printf("[route] translation stream=true, calling handleStreamRequest")
@@ -3478,9 +3492,27 @@ func normalizeProtocolName(proto string) string {
 }
 
 // formatJSON 将 JSON 字节切片格式化为缩进 JSON，限制到 20 KB 并附加省略标记，避免超大 body 撑爆终端。
+// 超出 20 KB 时同时输出**尾部 8 KB**：sensenova 不兼容字段（tools / stream_options / stop /
+// user / seed）通常位于 body 尾部（system prompt 占据前 20 KB），只输出头部会恰好截掉
+// 最关键的诊断信息（见 v0.2.106 Codex 400 根因排查）。
 func formatJSON(raw []byte) string {
 	if len(raw) > 20*1024 {
-		return string(raw[:20*1024]) + fmt.Sprintf("\n... (body too large, %d bytes total)\n", len(raw))
+		const tail = 8 * 1024
+		if len(raw) <= 20*1024+tail {
+			// 头尾重叠，无信息损失，直接完整输出
+			var data any
+			if json.Unmarshal(raw, &data) != nil {
+				return string(raw)
+			}
+			pretty, err := json.MarshalIndent(data, "", "  ")
+			if err != nil {
+				return string(raw)
+			}
+			return string(pretty)
+		}
+		out := fmt.Sprintf("%s\n... (%d bytes omitted ...)\n%s",
+			string(raw[:20*1024]), len(raw)-20*1024-tail, string(raw[len(raw)-tail:]))
+		return out + fmt.Sprintf("\n... (body too large, %d bytes total)\n", len(raw))
 	}
 	var data any
 	if json.Unmarshal(raw, &data) != nil {
@@ -3491,6 +3523,40 @@ func formatJSON(raw []byte) string {
 		return string(raw)
 	}
 	return string(pretty)
+}
+
+// bodyKeyInventory 输出 JSON body 的**顶层字段清单**（字段名 + 字节长度 + 标量值）。
+// 用途：超大 body（63 KB 级别）无法靠翻日志肉眼定位不兼容字段，先看清单即可知道
+// temperature / stop / user / seed / stream_options / tools 是否存在及取值。
+func bodyKeyInventory(label string, raw []byte) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		fmt.Printf("[%s] body 非 JSON 对象（%d bytes, %v）\n", label, len(raw), err)
+		return
+	}
+	// 稳定排序输出，便于跨请求 diff
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	const scalarLimit = 120
+	fmt.Printf("[%s] 顶层字段清单（共 %d 个字段，body %d bytes）:\n", label, len(fields), len(raw))
+	for _, k := range keys {
+		v := fields[k]
+		head := string(v)
+		if len(head) > scalarLimit {
+			head = head[:scalarLimit] + "…"
+		}
+		// 标量（非对象/数组）原样打印，数组/对象只打印长度与首字节
+		kind := "scalar"
+		trimmed := bytes.TrimSpace(v)
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			kind = fmt.Sprintf("%c-container", trimmed[0])
+		}
+		fmt.Printf("  - %-16s %-12s len=%-8d %s\n", k, kind, len(v), head)
+	}
 }
 
 // writeSSE 安全写 SSE 事件：返回 true 表示成功，false 表示客户端已断开（ECONNRESET/BROKEN PIPE）
