@@ -46,9 +46,9 @@ flowchart TD
 
     B2 --> L2B
 
-    subgraph L2B["🟡 透传：流/非流决策"]
+    subgraph L2B["🟡 透传：自适应流/非流决策"]
         direction LR
-        C1["--stream-mode<br/>控制路由"] --> C2["stream / non-stream<br/>auto / passthrough"]
+        C1["按请求体 stream 字段<br/>自适应路由"] --> C2["streamPrefer 探测偏好<br/>+ 100KB 大请求阈值"]
     end
 
     B3 --> L3
@@ -63,10 +63,9 @@ flowchart TD
 
     subgraph L4["🔴 第 4 层：流/非流决策（后于格式转换）"]
         direction LR
-        E1["--stream-mode 覆写<br/>internalReq.Stream"]
-        E1 --> E2{"stream?"}
-        E2 -->|true| E3["handleStreamRequest<br/>或 handleStreamRequestAsNonStream"]
-        E2 -->|false| E4["handleNonStreamResponse<br/>或 handleNonStreamResponseAsSSE"]
+        E1["internalReq.Stream<br/>原样保留，无覆写"] --> E2{"stream?"}
+        E2 -->|true| E3["handleStreamRequest<br/>上游流式 → 出站 SSE"]
+        E2 -->|false| E4["handleNonStreamResponse<br/>上游非流式 → 出站 JSON"]
     end
 
     style L1 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
@@ -77,7 +76,7 @@ flowchart TD
 ```
 
 > **关键结论：消息格式转换（第 3 层）在流/非流决策（第 4 层）之前。**
-> `InternalRequest.Stream` 字段担任"信使"——在 TranslateRequest 阶段从入站协议提取并保留，传递到第 4 层供 `--stream-mode` 覆写。
+> `InternalRequest.Stream` 字段担任"信使"——在 TranslateRequest 阶段从入站协议提取并保留，原样传递到第 4 层决定路由。翻译路径不覆写该字段，客户端的 `stream` 取值直通上游。
 
 ### 两大路径：透传 vs 翻译
 
@@ -103,47 +102,47 @@ flowchart TD
 flowchart TD
     A[入站请求到达] --> B[selectProtocol<br/>根据 URL 路径识别入站协议]
     B --> C{入站协议 ∈<br/>Provider capabilities?}
-    C -->|YES| D[透传路径<br/>--stream-mode 控制路由]
+    C -->|YES| D[透传路径<br/>按 stream 字段自适应]
     C -->|NO| E[翻译路径<br/>ingressTranslator.TranslateRequest]
-    D --> F[stream / non-stream / auto / passthrough<br/>按模式选择 handler]
-    E --> G[覆写 internalReq.Stream<br/>按 --stream-mode]
+    D --> D1{请求体 stream?}
+    D1 -->|true| D2[streamPrefer 探测偏好<br/>首次自动竞速，后续按偏好<br/>+ 100KB 阈值回退]
+    D1 -->|无/false| D3[handlePassthroughNonStream<br/>非流式 JSON]
+    E --> G[internalReq.Stream<br/>原样保留，无覆写]
     G --> H{stream?}
-    H -->|true| I[handleStreamRequest<br/>或 handleStreamRequestAsNonStream]
-    H -->|false| J[handleNonStreamResponse<br/>或 handleNonStreamResponseAsSSE]
+    H -->|true| I[handleStreamRequest<br/>上游流式 → 出站 SSE]
+    H -->|false| J[handleNonStreamResponse<br/>上游非流式 → 出站 JSON]
 ```
 
-### 透传路径分支标注（按 `--stream-mode`）
+### 透传路径分支标注（按请求体 `stream` 字段自适应）
 
-| 请求体 `stream` 字段 | `stream`                                                 | `auto`                                          | `non-stream`                                    | `passthrough`              |
-| --------------- | -------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------- | -------------------------- |
-| `stream: true`  | **`StreamWithBody`** — 注入 `stream:true`，上游 SSE → 客户端 SSE | **自适应** — 首次 `NonStreamAsSSE` + 探测，后续按偏好        | **`NonStreamAsSSE`** — 上游非流式 → JSON 拆解为 SSE 事件流 | **`RawStream`** — 直连透传，零处理 |
-| 无 `stream` 字段   | **`NonStream`** — 上游非流式 → 客户端 JSON                       | **`NonStream`** — chunked JSON（先写头 + Flush 防超时） | **`NonStreamAsSSE`** — 上游非流式 → SSE 包装           | **`RawNonStream`** — 直连透传  |
-| `stream: false` | **`StreamWithBody`** — 注入 `stream:true` 变流式              | **`NonStream`** — chunked JSON                  | **`NonStreamAsSSE`** — SSE 包装                   | **`RawNonStream`** — 直连透传  |
+`--stream-mode` 自 v0.2.60 起已移除，透传路径不再有模式参数，改由请求体 `stream` 字段直接决定：
+
+| 请求体 `stream` 字段 | 上游请求 | 上游响应 → 客户端 | 处理函数 |
+| ------------------ | ------- | ---------------- | ------- |
+| `stream: true`（首次，未探测） | 非流式 | JSON 拆解为 SSE 事件流 | `handlePassthroughNonStreamAsSSE` |
+| `stream: true`（偏好非流式更快） | 非流式 | JSON 拆解为 SSE 事件流 | `handlePassthroughNonStreamAsSSE` |
+| `stream: true`（偏好 SSE 更快，body ≤ 100KB） | 流式 | 原样透传 SSE | `handlePassthroughStream` |
+| `stream: true`（body > 100KB） | 非流式 | JSON 拆解为 SSE 事件流 | `handlePassthroughNonStreamAsSSE` |
+| 无 `stream` 字段 / `stream: false` | 非流式 | 原样透传 JSON（chunked transfer） | `handlePassthroughNonStream` |
+
+> `stream: true` 时**不会**向上游注入 `stream:true`——首次请求按非流式发出，仅在探测确认 SSE 更快且请求体小于 100KB 后才走原生流式。100KB 阈值为 `LARGE_BODY_SKIP_STREAM` 约束：大请求流式处理在 SenseNova 等上游会失败，客户端等不到结果即断开。
 
 **分支使用的消息转换：**
 
 | 分支函数                              | 入站→上游                  | 上游→出站           | 转换说明                                                  |
 | --------------------------------- | ---------------------- | --------------- | ----------------------------------------------------- |
-| `handlePassthroughStream`         | 无转换（但注入 `stream:true`） | 无转换（原样透传 SSE）   | 仅替换 model 名 + 统一 `data:` 前缀                           |
+| `handlePassthroughStream`         | 无转换（body 原样，仅替换 model） | 无转换（原样透传 SSE）   | 统一 `data:` 前缀，500ms 心跳                              |
 | `handlePassthroughNonStream`      | 无转换（仅替换 model 名）       | 无转换（原样透传 JSON）  | chunked transfer 防超时                                  |
 | `handlePassthroughNonStreamAsSSE` | 无转换（仅替换 model 名）       | **JSON→SSE 拆解** | 上游非流式 JSON → Anthropic/OpenAI/Gemini/Responses SSE 事件 |
-| `handlePassthroughRaw`            | 无转换                    | 无转换             | 零处理，仅替换 model 名                                       |
-| `handlePassthroughStreamWithBody` | 注入 `stream:true`       | 无转换             | 适用 Anthropic 等无 stream 字段的协议                          |
 
-### 翻译路径分支标注（按 `--stream-mode`）
+### 翻译路径分支标注（按 `internalReq.Stream` 原样路由）
 
-翻译路径同样受 `--stream-mode` 控制：覆写 `internalReq.Stream` 后再根据结果路由。
+翻译路径**不做任何覆写**：客户端 `stream: true` 就走上游流式，否则走上游非流式。客户端与上游的流式取值始终一致。
 
-| 模式           | 入站 `stream` | 上游 `stream`（覆写后） | 处理函数                             | 说明                        |
-| ------------ | ----------- | ---------------- | -------------------------------- | ------------------------- |
-| `auto`       | true        | true             | `handleStreamRequest`            | 入站流式→上游流式→出站 SSE          |
-| `auto`       | false       | false            | `handleNonStreamResponse`        | 入站非流式→上游非流式→出站 JSON       |
-| `non-stream` | true        | **false**        | `handleNonStreamResponseAsSSE`   | 入站流式→上游非流式→SSE 包装         |
-| `non-stream` | false       | false            | `handleNonStreamResponse`        | 入站非流式→上游非流式→出站 JSON       |
-| `stream`     | true        | true             | `handleStreamRequest`            | 入站流式→上游流式→出站 SSE          |
-| `stream`     | false       | **true**         | `handleStreamRequestAsNonStream` | 入站非流式→上游流式→收集 SSE 组装 JSON |
-
-> `passthrough` 模式仅在透传路径生效，翻译路径忽略。
+| 入站 `stream` | 上游 `stream` | 处理函数                 | 说明                        |
+| ----------- | ----------- | -------------------- | ------------------------- |
+| true        | true        | `handleStreamRequest`   | 入站流式 → 上游流式 → 出站 SSE          |
+| false       | false       | `handleNonStreamResponse` | 入站非流式 → 上游非流式 → 出站 JSON       |
 
 **翻译管道核心流程：**
 
@@ -183,38 +182,27 @@ flowchart LR
 
 ## 透传路径底层机制
 
-### `--stream-mode` 流式策略控制
+### 自适应流式策略（原 `auto`，现为唯一行为）
 
-`--stream-mode` 控制代理如何向上游发送请求（流式/非流式）。**透传和翻译路径均生效**：透传路径直接按模式选择 handler，翻译路径先覆写 `internalReq.Stream` 再路由。
+`--stream-mode` 自 v0.2.60 起已移除。原 `auto` 模式的自适应探测逻辑成为透传路径 `stream: true` 请求的唯一行为，不再有 `stream` / `non-stream` / `passthrough` 三种可选模式。
 
-**四种模式：**
-
-| 模式            | 行为                                        | 适用场景        |
-| ------------- | ----------------------------------------- | ----------- |
-| `auto`（默认）    | 自适应：首次走非流式上游 + SSE 包装，后台探测 SSE 速度，后续按偏好选择 | 日常使用        |
-| `stream`      | 强制上游走 SSE 流                               | 上游仅支持流式     |
-| `non-stream`  | 强制上游走非流式                                  | 上游流式不稳定     |
-| `passthrough` | 直连透传，仅替换 model 名                          | 协议完全对齐（零损耗） |
-
-### `auto` 模式自适应机制
-
-首次请求走非流式 (`handlePassthroughNonStream`)，响应后启动后台 goroutine 探测同上游的 SSE 流式速度。后续请求按探测结果选择。
+首次 `stream: true` 请求走非流式上游 + SSE 包装，响应后启动后台 goroutine 探测同上游的 SSE 流式速度；后续请求按探测结果选择。
 
 ```mermaid
 flowchart TD
-    A[客户端请求到达] --> B{streamPrefer<br/>已有记录?}
-    B -->|无| C[首次请求<br/>handlePassthroughNonStream<br/>非流式 chunked JSON]
+    A[客户端 stream:true 请求到达] --> B{streamPrefer<br/>已有记录?}
+    B -->|无| C[首次请求<br/>handlePassthroughNonStreamAsSSE<br/>非流式上游 → JSON 拆解为 SSE]
     B -->|有 SSE 更快| D[handlePassthroughStream<br/>SSE 流式透传 + 心跳]
-    B -->|有 非流式更快| E[handlePassthroughNonStream<br/>非流式 chunked JSON]
+    B -->|有 非流式更快| E[handlePassthroughNonStreamAsSSE<br/>非流式上游 → SSE 包装]
     C --> F[响应完成]
     F --> G[后台 goroutine<br/>probeStreamPrefer]
-    G --> H[发送探测请求<br/>注入 stream:true]
+    G --> H[发送探测请求<br/>注入 stream:true, max_tokens:1]
     H --> I[记录 SSE 耗时]
     I --> J[与非流式耗时对比]
     J --> K[写入 streamPrefer<br/>按 baseURL 存储]
 ```
 
-偏好按上游地址独立存储 (`streamPrefer map[string]bool`)，多上游互不干扰。
+偏好按上游地址独立存储 (`streamPrefer map[string]bool`)，多上游互不干扰。探测失败（SSE 不支持）时保留默认偏好（非流式）。
 
 ### chunked JSON 防超时机制
 
@@ -442,11 +430,11 @@ flowchart TD
     N --> O[写入客户端]
 ```
 
-#### 场景 B：入站非流式 → 上游流式 → 出站 JSON（`handleStreamRequestAsNonStream`）
+#### 场景 B：入站非流式 → 上游流式 → 出站 JSON（`handleStreamRequestAsNonStream`）❌ 当前不可达
 
-当 `--stream-mode stream` 强制上游走流式，但客户端发的是非流式请求时，收集所有流式事件后组装为非流式 JSON 返回。
+`--stream-mode stream` 在 v0.2.60 已移除，翻译路径不再覆写 `internalReq.Stream`，因此**不会出现**「客户端非流式但上游流式」的组合。该函数在 `internal/server/` 中已无任何调用点，仅在 `@AI_GUARD` 注释中被交叉引用。保留其原始描述供历史参考：
 
-**关键处理步骤：**
+若该路径被恢复启用，关键处理步骤为：
 
 1. **先写响应头**：`WriteHeader(200)` + `Flush()` 启用 chunked transfer，防止上游响应慢时客户端超时
 2. **调用上游流式 API**：`p.CallStream()` 获取 SSE 流
@@ -459,17 +447,6 @@ flowchart TD
 5. **组装 InternalResponse**：将累积内容、finish\_reason、usage 组装为完整的 `InternalResponse`
 6. **翻译为入站协议 JSON**：`ingressTranslator.TranslateResponse(ctx, internalResp)` → 入站协议完整 JSON
 7. **写入客户端**：`json.NewEncoder(w).Encode(resp)`
-
-```mermaid
-flowchart TD
-    A[客户端非流式请求] --> B[先写响应头 + Flush<br/>chunked transfer 防超时]
-    B --> C[p.CallStream<br/>调用上游流式 API]
-    C --> D[逐行收集 SSE 事件]
-    D --> E[累积 content + reasoning<br/>记录 finish_reason + usage]
-    E --> F[组装 InternalResponse]
-    F --> G[ingressTranslator.TranslateResponse<br/>→ 入站协议 JSON]
-    G --> H[写入客户端]
-```
 
 元数据事件（`_type: "headers"`）被解析后用于透传响应头。
 
@@ -495,23 +472,11 @@ flowchart TD
     G --> H[写入客户端]
 ```
 
-#### 场景 D：入站流式 → 上游非流式 → 出站 SSE（`handleNonStreamResponseAsSSE`）
+#### 场景 D：入站流式 → 上游非流式 → 出站 SSE（`handleNonStreamResponseAsSSE`）❌ 当前不可达
 
-当 `--stream-mode non-stream` 强制上游走非流式，但客户端发的是流式请求时，将上游完整 JSON 拆解为 SSE 事件流返回。
+`--stream-mode non-stream` 在 v0.2.60 已移除，翻译路径不再覆写 `internalReq.Stream`，因此**不会出现**「客户端流式但上游非流式」的组合。该函数在 `internal/server/` 中已无任何调用点。
 
-```mermaid
-flowchart TD
-    A[客户端 SSE 请求] --> B[设置 SSE 响应头<br/>text/event-stream]
-    B --> C[ingressTranslator.TranslateRequest<br/>入站协议 → InternalRequest]
-    C --> D[providerTranslator.TranslateToProvider<br/>InternalRequest → 下游请求体]
-    D --> E[p.Call<br/>调用上游非流式 API]
-    E --> F[providerTranslator.TranslateFromProvider<br/>上游响应 → InternalResponse]
-    F --> G[ingressTranslator.TranslateResponse<br/>InternalResponse → 入站协议 JSON]
-    G --> H[writeNonStreamAsSSE<br/>入站协议 JSON → 入站协议 SSE 事件流]
-    H --> I[写入客户端]
-```
-
-> 与透传路径的 `handlePassthroughNonStreamAsSSE` 不同：翻译路径多了一步 TranslateResponse（将上游协议 JSON 转为入站协议 JSON），再拆解为 SSE。透传路径直接拆解原始 JSON。
+**注意：同名不同路径。** 透传路径的 `handlePassthroughNonStreamAsSSE` **仍然活跃**（场景 6/7 的可达路径），负责把上游非流式 JSON 拆解为入站协议 SSE 事件流。两者差异在于翻译路径多一步 `TranslateResponse`（上游协议 JSON → 入站协议 JSON），再拆解为 SSE；透传路径直接拆解原始 JSON。
 
 ### 协议感知路由
 
@@ -526,65 +491,69 @@ flowchart TD
 
 ## 消息转换流转图
 
-9 张图覆盖入站/上游协议 × 流式/非流式的全部组合，展示从客户端请求到上游调用再到响应的完整消息转换路径。
+> ⚠️ 本节 SVG 图由 `docs/draw_flow.py` 生成，仍基于 v0.2.60 之前的 `--stream-mode` 四种模式设计，**图中标注的 `--stream-mode stream` / `non-stream` 已不存在**。自 v0.2.60 起流式路由完全由请求体 `stream` 字段 + `streamPrefer` 探测决定，下方每场景说明给出**当前实际可达性**。
+
+**当前可达场景只有 4 个：1、2、6、7。** 场景 3、4、5、8、9 描述的「入站流式取值 ≠ 上游流式取值」组合，在移除 `--stream-mode` 后已不可达——翻译路径原样保留 `internalReq.Stream`，透传路径也不注入 `stream:true`。
 
 ### 全览
 
 ![全览](overview_all_scenarios.svg)
 
-### 场景 1：Anthropic 流式 → OpenAI 流式
+### 场景 1：Anthropic 流式 → OpenAI 流式 ✅ 可达
 
-**翻译路径** — `TranslateRequest(Anthropic) → InternalRequest → TranslateToProvider(OpenAI)`，stream 保留。
+**翻译路径** — `TranslateRequest(Anthropic) → InternalRequest → TranslateToProvider(OpenAI)`，`stream:true` 原样保留 → `handleStreamRequest` → 上游 SSE → 出站 SSE。
 
 ![场景1](scenario_01_anthropic_stream_openai_stream.svg)
 
-### 场景 2：Anthropic 非流式 → OpenAI 非流式
+### 场景 2：Anthropic 非流式 → OpenAI 非流式 ✅ 可达
 
-**翻译路径** — `TranslateRequest → TranslateToProvider`，stream 保留。
+**翻译路径** — `TranslateRequest → TranslateToProvider`，`stream` 缺省/false → `handleNonStreamResponse` → 上游非流式 JSON → 出站 JSON。
 
 ![场景2](scenario_02_anthropic_nonstream_openai_nonstream.svg)
 
-### 场景 3：Anthropic 流式 → OpenAI 非流式
+### 场景 3：Anthropic 流式 → OpenAI 非流式 ❌ 当前不可达
 
-**翻译 +** **`--stream-mode non-stream`** — 入站 SSE → 收集 → TranslateFromProvider → TranslateResponse → 非流式 JSON。
+原需 `--stream-mode non-stream` 强制上游非流式。现在入站 `stream:true` 会原样传递，上游同样走流式，实际退化为场景 1。`handleNonStreamResponseAsSSE` 虽仍存在（翻译路径非流式→SSE 包装），但**在 `internal/server/` 中已无任何调用点**，仅被 `@AI_GUARD` 注释交叉引用。
 
 ![场景3](scenario_03_anthropic_stream_openai_nonstream.svg)
 
-### 场景 4：Anthropic 非流式 → OpenAI 流式
+### 场景 4：Anthropic 非流式 → OpenAI 流式 ❌ 当前不可达
 
-**翻译 +** **`--stream-mode stream`** — 入站非流式 → TranslateToProvider(stream:true) → SSE 收集 → TranslateStream → 非流式 JSON。
+原需 `--stream-mode stream` 强制上游流式。现在入站 `stream` 缺省则上游也非流式，实际退化为场景 2。`handleStreamRequestAsNonStream` 同样已无调用点。
 
 ![场景4](scenario_04_anthropic_nonstream_openai_stream.svg)
 
-### 场景 5：Anthropic 非流式 → Anthropic 流式
+### 场景 5：Anthropic 非流式 → Anthropic 流式 ❌ 当前不可达
 
-**透传 +** **`--stream-mode stream`** — 入站非流式 JSON → 注入 `stream:true` → 上游 SSE → 客户端 SSE。
+原需 `--stream-mode stream` 注入 `stream:true`。现在透传路径不再注入 `stream` 字段，无 `stream` 即走上游非流式（Anthropic API 标准：`stream` 缺省 = false）。
 
 ![场景5](scenario_05_anthropic_nonstream_anthropic_stream.svg)
 
-### 场景 6：Anthropic 流式 → Anthropic 非流式
+### 场景 6：Anthropic 流式 → Anthropic 非流式 ✅ 可达（自适应路径）
 
-**透传 +** **`--stream-mode non-stream`** — 入站 SSE → 上游非流式 JSON → `writeNonStreamAsSSE` SSE 包装。
+**透传路径** — 入站 `stream:true` + `streamPrefer` 判定非流式更快（首次请求默认值，或探测结论），或 body > 100KB 触发 `LARGE_BODY_SKIP_STREAM` → `handlePassthroughNonStreamAsSSE`：上游非流式 JSON → `writeNonStreamAsSSE` 拆解为入站协议 SSE 事件流。
 
 ![场景6](scenario_06_anthropic_stream_anthropic_nonstream.svg)
 
-### 场景 7：OpenAI 流式 → OpenAI 非流式
+### 场景 7：OpenAI 流式 → OpenAI 非流式 ✅ 可达（自适应路径）
 
-**透传 +** **`--stream-mode non-stream`** — 入站 SSE → 上游非流式 JSON → SSE 包装。
+同场景 6，仅入站/上游协议换为 OpenAI ChatCompletion。SSE 拆解格式为 CC chunk（`choices[0].delta`）。
 
 ![场景7](scenario_07_openai_stream_openai_nonstream.svg)
 
-### 场景 8：Responses 非流式 → OpenAI 流式
+### 场景 8：Responses 非流式 → OpenAI 流式 ❌ 当前不可达
 
-**翻译 +** **`--stream-mode stream`** — `ResponsesTranslator` → `InternalRequest` → `ChatCompletionTranslator` SSE 收集 → JSON。
+同场景 4，入站 `stream` 缺省则上游非流式。`handleStreamRequestAsNonStream` 无调用点。
 
 ![场景8](scenario_08_responses_nonstream_openai_stream.svg)
 
-### 场景 9：Responses 流式 → OpenAI 非流式
+### 场景 9：Responses 流式 → OpenAI 非流式 ❌ 当前不可达
 
-**翻译 +** **`--stream-mode non-stream`** — `ResponsesTranslator` SSE → `InternalStreamEvent` → `ChatCompletionTranslator` 非流式 → SSE 包装。
+同场景 3，入站 `stream:true` 原样传递上游。`handleNonStreamResponseAsSSE` 无调用点。
 
 ![场景9](scenario_09_responses_stream_openai_nonstream.svg)
+
+> 需要更新 SVG 时运行 `python docs/draw_flow.py`（需同步移除其中 20 处 `--stream-mode` 标注）。
 
 ***
 

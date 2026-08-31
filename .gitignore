@@ -26,6 +26,7 @@
 # build/ directory: multi-platform release binaries (published via GitHub Releases)
 build/agent-proxy-*
 build/sha256sums.txt
+build/v*/
 
 # Shared libraries
 *.dll
@@ -51,6 +52,11 @@ dist/
 # Release metadata (generated)
 release_body.json
 
+# Node tooling (doc rendering)
+node_modules/
+package.json
+package-lock.json
+
 # ── Temp & test files ──
 .tmp/
 test-request.json
@@ -59,6 +65,6 @@ test-stream.json
 # Runtime logs
 *.log
 # visual-check diagnostics — not needed on the live site
-docs/*.visual-check.png
-docs/*.visual-check.json
-docs/*.visual-check.html
+docs/*.visual-check.*
+# local debug harnesses (not tests, not shipped)
+internal/server/debug_test/

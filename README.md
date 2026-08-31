@@ -54,10 +54,10 @@ agent-proxy [command]
   run         启动网关（快速模式 --db / 复杂模式 --mode complex）
   db          代理数据库管理（增删查改 / 嗅探 / 有效性检查）
   detect      db add 的兼容别名（嗅探并新增代理）
-  completion  生成 shell 自动补全脚本
+  version     查看版本号（同 --version / -V）
 
 全局选项：
-  -v, -vv   日志级别（摘要 / 四向全链路消息体）
+  -v, -vv   日志级别（摘要 / 四向全链路消息体；-v 仅快速模式生效，复杂模式需用 -vv）
   --host    监听地址（默认 127.0.0.1）
   --port    监听端口（默认 8080）
 ```
