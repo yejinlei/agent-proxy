@@ -2,44 +2,208 @@
   "schema_version": 1,
   "diagram_type": "dataflow",
   "meta": {
-    "title": "OpenAIPath Propagation — Discovery to BuildURL",
+    "title": "OpenAIPath 传递链 — 从探测到 BuildURL",
     "output": "docs/openai-path.html",
-    "viewBox": [1100, 950],
+    "viewBox": [
+      1100,
+      950
+    ],
     "animation": "trace",
     "quality_profile": "showcase",
     "views": [
-      { "id": "discovery-store", "label": "Discovery & store", "focus": ["sniff", "rec", "db"], "note": "sniffAll discovers the prefix; CLI persists it into the record and SQLite." },
-      { "id": "runtime", "label": "Runtime load", "focus": ["db", "qg", "prov"], "note": "run --db <id> loads the record and threads openAIPath into the provider." },
-      { "id": "url-build", "label": "Build the URL", "focus": ["prov", "burl", "req"], "note": "NewOpenAIClientWithPath normalizes empty to /v1; BuildURL concatenates base + prefix + endpoint." }
+      {
+        "id": "discovery-store",
+        "label": "Discovery & store",
+        "focus": [
+          "sniff",
+          "rec",
+          "db"
+        ],
+        "note": "sniffAll discovers the prefix; CLI persists it into the record and SQLite."
+      },
+      {
+        "id": "runtime",
+        "label": "Runtime load",
+        "focus": [
+          "db",
+          "qg",
+          "prov"
+        ],
+        "note": "run --db <id> loads the record and threads openAIPath into the provider."
+      },
+      {
+        "id": "url-build",
+        "label": "Build the URL",
+        "focus": [
+          "prov",
+          "burl",
+          "req"
+        ],
+        "note": "NewOpenAIClientWithPath normalizes empty to /v1; BuildURL concatenates base + prefix + endpoint."
+      }
     ]
   },
   "stages": [
-    { "label": "Discovery" },
-    { "label": "Record" },
-    { "label": "SQLite" },
-    { "label": "Runtime" },
-    { "label": "Provider & URL" }
+    {
+      "label": "探测发现"
+    },
+    {
+      "label": "记录"
+    },
+    {
+      "label": "SQLite"
+    },
+    {
+      "label": "运行时"
+    },
+    {
+      "label": "Provider 与 URL"
+    }
   ],
   "nodes": [
-    { "id": "sniff", "type": "backend", "label": "sniffAll()", "sublabel": "probe upstream", "stage": 0, "row": 1, "width": 140 },
-    { "id": "rec", "type": "cloud", "label": "ProxyRecord", "sublabel": "OpenAIPath field", "stage": 1, "row": 1, "width": 150 },
-    { "id": "db", "type": "database", "label": "SQLite", "sublabel": "proxies.openai_path", "stage": 2, "row": 1, "width": 140 },
-    { "id": "qg", "type": "backend", "label": "NewQuickGateway", "sublabel": "openAIPath param", "stage": 3, "row": 1, "width": 150 },
-    { "id": "prov", "type": "backend", "label": "OpenAI client", "sublabel": "NewOpenAIClientWithPath", "stage": 4, "row": 0, "width": 160 },
-    { "id": "burl", "type": "cloud", "label": "BuildURL()", "sublabel": "base + prefix + endpoint", "stage": 4, "row": 1, "width": 150 },
-    { "id": "req", "type": "external", "label": "Final request", "sublabel": "POST /v1beta/openai/…", "stage": 4, "row": 2, "width": 150 }
+    {
+      "id": "sniff",
+      "type": "backend",
+      "label": "sniffAll()",
+      "sublabel": "探测上游",
+      "stage": 0,
+      "row": 1,
+      "width": 140
+    },
+    {
+      "id": "rec",
+      "type": "cloud",
+      "label": "ProxyRecord",
+      "sublabel": "OpenAIPath 字段",
+      "stage": 1,
+      "row": 1,
+      "width": 150
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": "proxies.openai_path",
+      "stage": 2,
+      "row": 1,
+      "width": 140
+    },
+    {
+      "id": "qg",
+      "type": "backend",
+      "label": "NewQuickGateway",
+      "sublabel": "openAIPath 参数",
+      "stage": 3,
+      "row": 1,
+      "width": 150
+    },
+    {
+      "id": "prov",
+      "type": "backend",
+      "label": "OpenAI 客户端",
+      "sublabel": "NewOpenAIClientWithPath",
+      "stage": 4,
+      "row": 0,
+      "width": 160
+    },
+    {
+      "id": "burl",
+      "type": "cloud",
+      "label": "BuildURL()",
+      "sublabel": "base + prefix + endpoint",
+      "stage": 4,
+      "row": 1,
+      "width": 150
+    },
+    {
+      "id": "req",
+      "type": "external",
+      "label": "最终请求",
+      "sublabel": "POST /v1beta/openai/…",
+      "stage": 4,
+      "row": 2,
+      "width": 150
+    }
   ],
   "flows": [
-    { "from": "sniff", "to": "rec", "label": "detected prefix", "variant": "emphasis", "labelAt": [205, 314] },
-    { "from": "rec", "to": "db", "label": "store.Add / Update", "labelAt": [425, 238] },
-    { "from": "db", "to": "qg", "label": "store.GetByID(id)", "variant": "emphasis", "labelAt": [635, 314] },
-    { "from": "qg", "to": "prov", "label": "q.openAIPath", "variant": "emphasis", "labelAt": [735, 220] },
-    { "from": "prov", "to": "burl", "label": "pathPrefix" },
-    { "from": "burl", "to": "req", "label": "final URL", "variant": "emphasis" }
+    {
+      "from": "sniff",
+      "to": "rec",
+      "label": "发现的前缀",
+      "variant": "emphasis",
+      "labelAt": [
+        205,
+        314
+      ]
+    },
+    {
+      "from": "rec",
+      "to": "db",
+      "label": "store.Add / Update",
+      "labelAt": [
+        425,
+        238
+      ]
+    },
+    {
+      "from": "db",
+      "to": "qg",
+      "label": "store.GetByID(id)",
+      "variant": "emphasis",
+      "labelAt": [
+        635,
+        314
+      ]
+    },
+    {
+      "from": "qg",
+      "to": "prov",
+      "label": "q.openAIPath",
+      "variant": "emphasis",
+      "labelAt": [
+        735,
+        220
+      ]
+    },
+    {
+      "from": "prov",
+      "to": "burl",
+      "label": "pathPrefix"
+    },
+    {
+      "from": "burl",
+      "to": "req",
+      "label": "最终 URL",
+      "variant": "emphasis"
+    }
   ],
   "cards": [
-    { "dot": "emerald", "title": "Backward compatible", "items": ["NewOpenAIClientWithPath normalizes empty string to /v1", "Old DB records without the column behave exactly as before", "Gemini native client (NewGeminiClient) is unaffected"] },
-    { "dot": "cyan", "title": "Two entry points, one provider", "items": ["Quick mode: DB → NewQuickGateway → provider", "Complex mode: config.json → NewGateway → provider", "Both call NewOpenAIClientWithPath with the same semantics"] },
-    { "dot": "rose", "title": "Re-sniff consistency", "items": ["db check and db update rewrite openai_path on re-sniff", "If an upstream endpoint moves, run --db <id> picks up the new prefix", "The prefix lives beside the record, not in a global config"] }
+    {
+      "dot": "emerald",
+      "title": "Backward compatible",
+      "items": [
+        "NewOpenAIClientWithPath 把空串归一为 /v1",
+        "无该列的老 DB 记录行为完全不变",
+        "Gemini 原生客户端（NewGeminiClient）不受影响"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Two entry points, one provider",
+      "items": [
+        "快速模式：DB → NewQuickGateway → provider",
+        "复杂模式：config.json → NewGateway → provider",
+        "两者都调用 NewOpenAIClientWithPath，语义一致"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Re-sniff consistency",
+      "items": [
+        "db check 与 db update 重新探测时重写 openai_path",
+        "若上游端点迁移，run --db <id> 立即用上新前缀",
+        "前缀紧随记录，不放全局配置"
+      ]
+    }
   ]
 }
