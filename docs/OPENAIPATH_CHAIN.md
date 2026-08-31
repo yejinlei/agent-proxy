@@ -1,77 +1,77 @@
-# Agent-Proxy — OpenAIPath Propagation Chain
+# Agent-Proxy — OpenAIPath 端到端传递链
 
-> How the proxy discovers and carries a non-standard OpenAI-compatible endpoint prefix (e.g. Google Gemini's `/v1beta/openai`) all the way from discovery to the HTTP request, in **both** Quick mode and Complex mode.
+> 代理如何发现并携带一个非标准 OpenAI 兼容端点前缀（如 Google Gemini 的 `/v1beta/openai`），从发现一路贯穿到 HTTP 请求，在**快速模式**和**复杂模式**下都成立。
 >
-> Standard OpenAI / vLLM / SGLang endpoints live at `/v1`. Google Gemini's OpenAI-compatible endpoint lives at `/v1beta/openai`. Without carrying this prefix, the proxy would always POST to `<base>/v1/...` and 404 on Gemini.
+> 标准 OpenAI / vLLM / SGLang 端点都在 `/v1`。Google Gemini 的 OpenAI 兼容端点则在 `/v1beta/openai`。如果不传递这个前缀，代理会始终 POST 到 `&lt;base&gt;/v1/...`，Gemini 那边就 404。
 
 ---
 
-## 1. The Problem
+## 1. 问题
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant P as Proxy
+    participant C as 客户端
+    participant P as 代理
     participant G as Google Gemini
 
     C->>P: POST /v1/chat/completions
-    Note over P: default prefix = /v1
-    P->>G: POST <base>/v1/chat/completions
-    G-->>P: 404 (wrong path)
+    Note over P: 默认前缀 = /v1
+    P->>G: POST &lt;base&gt;/v1/chat/completions
+    G-->>P: 404（路径错了）
 ```
 
-The fix: let sniffing discover the real prefix, persist it, and thread it into the provider's `BuildURL()`.
+修法：让探测发现真实前缀、把它持久化、再一路注入 provider 的 `BuildURL()`。
 
 ---
 
-## 2. End-to-End Flow (Quick mode, `agent-proxy run --db <id>`)
+## 2. 端到端流程（快速模式，`agent-proxy run --db <id>`）
 
 ```mermaid
 flowchart TD
-    A[sniffAll() probes upstream] --> B[SniffResult.OpenAIPath<br/>e.g. "/v1beta/openai"]
+    A["sniffAll() 探测上游"] --> B["SniffResult.OpenAIPath<br/>如 '/v1beta/openai'"]
 
-    B -->|add/check/update| C[ProxyRecord.OpenAIPath]
+    B -->|db add/check/update| C[ProxyRecord.OpenAIPath]
     C --> D[(SQLite: proxies.openai_path)]
 
-    D -->|run --db id| E[startQuickMode<br/>main.go]
-    E --> F[NewQuickGateway(...,<br/>record.OpenAIPath, ...)]
+    D -->|"run --db id"| E["startQuickMode<br/>main.go"]
+    E --> F["NewQuickGateway(...,<br/>record.OpenAIPath, ...)"]
 
     F --> G[QuickGateway.openAIPath]
-    G --> H[getProvider("openai")]
-    H --> I[provider.NewOpenAIClientWithPath(<br/>name, baseURL, timeout,<br/>q.openAIPath)]
+    G --> H["getProvider('openai')"]
+    H --> I["provider.NewOpenAIClientWithPath(<br/>name, baseURL, timeout、<br/>q.openAIPath)"]
 
-    I --> J[OpenAIClient.BuildURL()<br/>= base + pathPrefix + endpoint]
-    J --> K[POST <base>/v1beta/openai/chat/completions]
+    I --> J["OpenAIClient.BuildURL()<br/>= base + pathPrefix + endpoint"]
+    J --> K["POST &lt;base&gt;/v1beta/openai/chat/completions"]
 
     style D fill:#e3f2fd
     style G fill:#fff3e0
     style J fill:#e8f5e9
 ```
 
-**Empty prefix = standard `/v1`.** `NewOpenAIClientWithPath` normalizes `""` → `"/v1"`, so non-Gemini upstreams are untouched.
+**空前缀 = 标准 `/v1`。** `NewOpenAIClientWithPath` 把 `""` 归一为 `"/v1"`，非 Gemini 上游不受影响。
 
 ---
 
-## 3. End-to-End Flow (Complex mode, `--mode complex` / config file)
+## 3. 端到端流程（复杂模式，`--mode complex` / 配置文件）
 
 ```mermaid
 flowchart TD
-    A[config.json / config.yaml] --> B[ProviderConfig.openai_path<br/>e.g. "/v1beta/openai"]
-    B --> C[NewGateway(cfg)]
-    C --> D[provider.NewOpenAIClientWithPath(<br/>name, pc.BaseURL, pc.TimeoutSec,<br/>pc.OpenAIPath)]
-    D --> E[BuildURL() → <base>/v1beta/openai/...]
+    A[config.json / config.yaml] --> B["ProviderConfig.openai_path<br/>如 '/v1beta/openai'"]
+    B --> C["NewGateway(cfg)"]
+    C --> D["provider.NewOpenAIClientWithPath(<br/>name, pc.BaseURL, pc.TimeoutSec、<br/>pc.OpenAIPath)"]
+    D --> E["BuildURL() → &lt;base&gt;/v1beta/openai/..."]
 
     style B fill:#e3f2fd
     style D fill:#e8f5e9
 ```
 
-The complex-mode path reads the prefix from config rather than from DB — same provider constructor, same normalization.
+复杂模式从配置而不是 DB 读前缀 —— 同一个 provider 构造函数，同样的归一化。
 
 ---
 
-## 4. Where `openai_path` Lives in the DB
+## 4. `openai_path` 在 DB 里的位置
 
-`db.go` adds the column via migration at `Init()` and threads it through every read/write path:
+`db.go` 在 `Init()` 时通过迁移补列，并一路传给每个读写路径：
 
 ```mermaid
 classDiagram
@@ -98,45 +98,45 @@ classDiagram
     ProxyRecord --> DB
 ```
 
-The `proxies` table columns touched for OpenAIPath:
+`proxies` 表为 OpenAIPath 触碰的列：
 
 ```sql
-ALTER TABLE proxies ADD COLUMN openai_path TEXT;   -- idempotent migration
+ALTER TABLE proxies ADD COLUMN openai_path TEXT;   -- 幂等迁移
 
 INSERT INTO proxies (..., upstream_type, openai_path, ...) VALUES (..., ?, ?, ...);
 SELECT ..., upstream_type, openai_path, ... FROM proxies ...;
 UPDATE proxies SET ..., upstream_type = ?, openai_path = ? WHERE id = ?;
 ```
 
-All SELECTs (`GetByID`, `List`, `Search`, `FirstRecord`) read it into `ProxyRecord.OpenAIPath` via `scanRecord`.
+所有 SELECT（`GetByID`、`List`、`Search`、`FirstRecord`）都通过 `scanRecord` 把它读进 `ProxyRecord.OpenAIPath`。
 
 ---
 
-## 5. CLI Write Paths (`cmd/cli.go`)
+## 5. CLI 写路径（`cmd/cli.go`）
 
-Every command that touches sniffing persists the discovered prefix:
+每个触碰探测的命令都会把发现的前缀持久化：
 
-| Command | Code |
+| 命令 | 代码 |
 |---|---|
-| `db add` / `detect` | `ProxyRecord{OpenAIPath: result.OpenAIPath, ...}` before `store.Add(r)` |
-| `db check` | `r.OpenAIPath = sniffResult.OpenAIPath` before `store.Update(r)` |
-| `db update` | `r.OpenAIPath = result.OpenAIPath` before `store.Update(r)` |
+| `db add` / `db detect` | `ProxyRecord{OpenAIPath: result.OpenAIPath, ...}` 再 `store.Add(r)` |
+| `db check` | `r.OpenAIPath = sniffResult.OpenAIPath` 再 `store.Update(r)` |
+| `db update` | `r.OpenAIPath = result.OpenAIPath` 再 `store.Update(r)` |
 
-This keeps `re-sniff` consistent with `add`: if the upstream changes its prefix (e.g., an endpoint moves), `db check` / `db update` writes the new value back so `run --db <id>` picks it up.
+这让"重新探测"与"新增"保持一致：上游换了前缀（比如某个端点迁移），`db check` / `db update` 会把新值写回去，`run --db <id>` 立刻就能用上。
 
 ---
 
-## 6. Provider Constructor
+## 6. Provider 构造函数
 
-`internal/provider/openai.go`:
+`internal/provider/openai.go`：
 
 ```go
-// default — backward-compatible, used everywhere except where a custom prefix is needed
+// 默认 —— 向后兼容，除自定义前缀外到处用
 func NewOpenAIClient(name, baseURL string, timeout int) *OpenAIClient {
     return newOpenAIClient(name, baseURL, timeout, "/v1")
 }
 
-// custom prefix (e.g. Google Gemini "/v1beta/openai"); empty → "/v1"
+// 自定义前缀（如 Google Gemini 的 "/v1beta/openai"）；空串 → "/v1"
 func NewOpenAIClientWithPath(name, baseURL string, timeout int, pathPrefix string) *OpenAIClient {
     if pathPrefix == "" {
         pathPrefix = "/v1"
@@ -145,13 +145,13 @@ func NewOpenAIClientWithPath(name, baseURL string, timeout int, pathPrefix strin
 }
 ```
 
-`BuildURL()` inside `OpenAIClient` then concatenates `<baseURL>/<pathPrefix>/<endpoint>` (e.g. `/chat/completions`), producing `<base>/v1beta/openai/chat/completions` for Gemini.
+`OpenAIClient` 内的 `BuildURL()` 把 `<baseURL>/<pathPrefix>/<endpoint>` 拼接起来（如 `/chat/completions`），对 Gemini 产出 `<base>/v1beta/openai/chat/completions`。
 
 ---
 
-## 7. Backward Compatibility
+## 7. 向后兼容
 
-- `NewOpenAIClient` unchanged — any existing call site still works, still assumes `/v1`.
-- `ProxyRecord.OpenAIPath` defaults to `""` in DB (no column = no prefix override). Old DB records without the column behave exactly as before (`""` → `"/v1"`).
-- `ProviderConfig.OpenAIPath` defaults to `""` in config. Old config files omit it and get `/v1`.
-- Gemini's native client (`NewGeminiClient`) is unaffected — it uses the Gemini protocol path, not the OpenAI-compatible one.
+- `NewOpenAIClient` 不变 —— 任何现存调用点继续可用，仍假设 `/v1`。
+- `ProxyRecord.OpenAIPath` 在 DB 里默认 `""`（无列 = 无前缀覆盖）。没有该列的老 DB 记录行为完全不变（`""` → `"/v1"`）。
+- `ProviderConfig.OpenAIPath` 在配置里默认 `""`。老配置文件省略它，得到 `/v1`。
+- Gemini 原生客户端（`NewGeminiClient`）不受影响 —— 它走 Gemini 协议路径，不走 OpenAI 兼容路径。
