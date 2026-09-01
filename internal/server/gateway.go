@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/config"
@@ -1577,9 +1578,13 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 const (
 	wsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	wsOpText  byte = 0x1 // text frame
+	wsOpPing  byte = 0x9 // ping frame
+	wsOpPong  byte = 0xA // pong frame
 	wsOpClose byte = 0x8 // close frame
 	wsFin          = 0x80
 	wsMask         = 0x80
+	// wsMaxPayload 防御性上限：单帧 payload 超过 64MB 视为异常，拒绝并断开。
+	wsMaxPayload = 64 << 20
 )
 
 // computeAcceptKey 计算 WebSocket Sec-WebSocket-Accept 值
@@ -1589,50 +1594,85 @@ func computeAcceptKey(key string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-// readWSFrame 从连接读取一个 WebSocket 帧，返回 payload 数据
+// readWSFrame 读取下一个数据帧（text/binary），自动应答 ping、跳过 pong/close。
+// @AI_GUARD: WS_FRAME_CONTROL_FRAMES - 必须同步 quick.go quickReadWSFrame。
+//   Codex/tungstenite 可能在 response.create 之前先发 WS Ping（keepalive）；
+//   旧实现把任意首帧当请求体解析 → JSON 失败 → 空输入 → Codex 降级 HTTP POST。
+// @CONSTRAINT: 控制帧按 RFC 6455 应答（ping→pong），close 回 1000 后断开。
+// @RELATED: quick.go quickReadWSFrame
 func readWSFrame(conn net.Conn) ([]byte, error) {
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
-	}
-
-	masked := header[1]&wsMask != 0
-	length := uint64(header[1] & 0x7F)
-
-	switch {
-	case length == 126:
-		ext := make([]byte, 2)
-		if _, err := io.ReadFull(conn, ext); err != nil {
+	for {
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(conn, header); err != nil {
 			return nil, err
 		}
-		length = uint64(binary.BigEndian.Uint16(ext))
-	case length == 127:
-		ext := make([]byte, 8)
-		if _, err := io.ReadFull(conn, ext); err != nil {
+		opcode := header[0] & 0x0F
+		masked := header[1]&wsMask != 0
+		length := uint64(header[1] & 0x7F)
+
+		switch {
+		case length == 126:
+			ext := make([]byte, 2)
+			if _, err := io.ReadFull(conn, ext); err != nil {
+				return nil, err
+			}
+			length = uint64(binary.BigEndian.Uint16(ext))
+		case length == 127:
+			ext := make([]byte, 8)
+			if _, err := io.ReadFull(conn, ext); err != nil {
+				return nil, err
+			}
+			length = binary.BigEndian.Uint64(ext)
+		}
+		if length > wsMaxPayload {
+			return nil, fmt.Errorf("websocket: frame payload too large (%d bytes)", length)
+		}
+
+		var maskKey [4]byte
+		if masked {
+			if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+				return nil, err
+			}
+		}
+
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(conn, payload); err != nil {
 			return nil, err
 		}
-		length = binary.BigEndian.Uint64(ext)
-	}
 
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
-			return nil, err
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+
+		switch opcode {
+		case wsOpText:
+			return payload, nil
+		case wsOpPing:
+			// RFC 6455：收到 ping 必须原样回 pong（服务端帧不掩码）
+			if err := writeWSCtrl(conn, wsOpPong, payload); err != nil {
+				return nil, err
+			}
+		case wsOpPong:
+			// 忽略 unsolicited pong
+		case wsOpClose:
+			writeWSCtrl(conn, wsOpClose, []byte{0x03, 0xE8}) // 1000 normal closure
+			return nil, fmt.Errorf("websocket: closed by peer")
+		default:
+			// continuation / 未知操作码：跳过
 		}
 	}
+}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return nil, err
-	}
-
-	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	return payload, nil
+// writeWSCtrl 写一个非掩码的控制帧（pong/close）。
+func writeWSCtrl(conn net.Conn, opcode byte, payload []byte) error {
+	frame := make([]byte, 2+len(payload))
+	frame[0] = wsFin | opcode
+	frame[1] = byte(len(payload))
+	copy(frame[2:], payload)
+	_, err := conn.Write(frame)
+	return err
 }
 
 // writeWSFrame 向连接写入一个 WebSocket 文本帧
@@ -1664,10 +1704,17 @@ func writeWSFrame(conn net.Conn, payload []byte) error {
 	return err
 }
 
+// wsWriteDeadline 每帧写出的 socket 死线：防止客户端停滞（TCP 缓冲满）时 handler
+// goroutine 永久阻塞、连接与上游流泄漏。必须同步 quick.go qwsWriteDeadline。
+const wsWriteDeadline = 60 * time.Second
+
 // wsResponseWriter 实现 http.ResponseWriter + http.Flusher，将 HTTP 响应写入 WebSocket 帧
 type wsResponseWriter struct {
-	conn        net.Conn
-	header      http.Header
+	conn   net.Conn
+	mu     sync.Mutex // 序列化所有 conn.Write（SSE 事件 + 心跳 ping 可能来自不同 goroutine）
+	header http.Header
+	// @AI_GUARD: WS_FLUSHER_NOT_BUFFERED - Flush() 保持 no-op：每个 SSE 事件已是独立
+	//   WS 帧、原子到达客户端。若引入 bufio 缓冲，必须让 Flush 真正刷缓冲。
 	wroteHeader bool
 }
 
@@ -1685,10 +1732,26 @@ func (w *wsResponseWriter) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
+		return 0, err
+	}
 	if err := writeWSFrame(w.conn, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
+}
+
+// WritePing 发送一个 WS ping 控制帧（应用层心跳），维持 Codex 侧「通道活跃」判定。
+// 与 Write 共用 mu，保证与控制帧/数据帧不交错。必须同步 quick.go qwsResponseWriter.WritePing。
+func (w *wsResponseWriter) WritePing() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
+		return err
+	}
+	return writeWSCtrl(w.conn, wsOpPing, nil)
 }
 
 func (w *wsResponseWriter) WriteHeader(statusCode int) {
@@ -1749,5 +1812,31 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	wsReq.Header.Del("Sec-WebSocket-Version")
 
 	wsWriter := &wsResponseWriter{conn: conn}
+
+	// WS 应用层心跳：每 15s 一个 ping 控制帧。
+	// @AI_GUARD: WS_HEARTBEAT - 必须同步 quick.go handleResponsesWebSocket。
+	//   Responses 流式路径只在「静默 >500ms」时发 SSE ping；短内容快速回答整轮零心跳，
+	//   Codex/tungstenite keepalive 判定（~10s）可能误判停滞 → 降级 HTTP POST。
+	// @RELATED: sse_heartbeat.go StartSSEHeartbeat（SSE 层心跳，勿混用两种格式）
+	hbCtx, hbCancel := context.WithCancel(r.Context())
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				if err := wsWriter.WritePing(); err != nil {
+					return // 写失败说明连接已死，停止心跳
+				}
+			}
+		}
+	}()
+
 	g.handleRequest(wsWriter, wsReq, "responses")
+	hbCancel()
+	<-hbDone
 }
