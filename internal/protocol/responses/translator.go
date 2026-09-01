@@ -95,13 +95,39 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	// --- 2. Input → Messages ---
 	messages := inputToMessages(InputToItems(req.Input))
 
+	// @AI_GUARD: RESPONSES_EMPTY_INPUT_USER_FALLBACK - 空 input 注入 user 消息
+	// @CONSTRAINT: 若 messages 为空（Codex prewarm 请求 input:[] / generate:false），
+	//   必须注入一条最小 user 消息兜底，否则上游（Sensenova）只有 system 消息时报
+	//   400 "Failed to build prompt: No user query found in messages."
+	// @RELATED: inputToMessages
+	// @REASON: v0.2.109 — Codex 连接预热发 input:[] 请求，翻译后只有 system 无 user，
+	//   Sensenova 拒绝。注入中性 user 消息让上游接受请求并正常返回（content 可为空串）。
+	if len(messages) == 0 {
+		emptyContent, _ := json.Marshal("")
+		messages = []schema.InternalMessage{{
+			Role:    schema.RoleUser,
+			Content: emptyContent,
+		}}
+	}
+
 	// @CODEX-DEBUG v0.2.98：Codex 入站请求形状诊断（生产可见，用 [CODEX-DEBUG] 前缀便于 grep）
 	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
 		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
 
 	// --- 3. Tools → InternalTools ---
+	// @AI_GUARD: RESPONSES_FILTER_BUILTIN_TOOLS - 跳过客户端内置工具
+	// @CONSTRAINT: 只把 type=="function" 且 name 非空的 tool 转发给上游；其余（tool_search/web_search
+	//   等客户端执行的内置工具）必须丢弃，否则会产出 function.name 为空的非法定义，
+	//   上游报 400 "Invalid request format"
+	// @RELATED: types.go Tool.UnmarshalJSON（空 name 回退分支）
+	// @REASON: v0.2.109 — Codex 经 WS 发来的 tools 含 tool_search/web_search 内置工具，
+	//   UnmarshalJSON 因 t.Name=="" 走 else 分支只设 Type/Parameters，name 留空；
+	//   翻译器若原样包成 function 转发，Sensenova 报 Invalid request format。
 	var tools []schema.InternalTool
 	for _, tool := range req.Tools {
+		if tool.Type != "function" || tool.Name == "" {
+			continue
+		}
 		tools = append(tools, schema.InternalTool{
 			Type: "function",
 			Function: &schema.InternalFunction{
