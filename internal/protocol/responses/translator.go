@@ -459,6 +459,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	createdSent := false
 	itemAdded := false
 	textDoneSent := false
+	msgItemClosed := false
 	messageID := fmt.Sprintf("msg_%d", now)
 
 	type funcCallState struct {
@@ -468,14 +469,27 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		OutputIdx  int
 		argsBuffer strings.Builder
 		addedSent  bool
+		argsDone   bool // fc_arguments.done 已发送（防止 sendCompleted 重复发）
+		itemDone   bool // function_call output_item.done 已发送（保证 added/done 配对）
 	}
 	funcCalls := make(map[string]*funcCallState)
 	funcCallOrder := make([]string, 0)
 	nextFuncOutputIdx := 1
 
 	getFC := func(tc schema.InternalToolCall, tcIndexInDelta int) *funcCallState {
+		// @AI_GUARD: RESPONSES_FC_KEYING - 无 ID 的续传 delta 必须合并回当前 fc，不能各造幽灵条目
+		// @CONSTRAINT: 上游 CC 流里 tool_call 的 ID/Name 只在首个分片出现，后续分片 ID 为空。
+		//   空 ID 且已有活跃 fc 时，按 index 匹配现有条目（找不到则取最后一个），继续累积参数。
+		// @REASON: v0.2.109 之前空 ID 一律合成 "synth-N" 新条目 → 同一调用裂成多条，
+		//   产生未登记的 output_item.added + "{}" 幽灵 fc_arguments.done，Codex 拿到空参数
+		//   （pwd 工具返回空 Path）。
 		key := tc.ID
 		if key == "" {
+			// 续传分片：合并回同一 choice 内正在流式输出的 fc（取最后登记的条目）。
+			// 多并行 tool_call 场景下上游通常仍带 ID，只有纯参数续传才为空。
+			if len(funcCallOrder) > 0 {
+				return funcCalls[funcCallOrder[len(funcCallOrder)-1]]
+			}
 			key = fmt.Sprintf("synth-%d-%d", tcIndexInDelta, nextFuncOutputIdx)
 		}
 		fc, ok := funcCalls[key]
@@ -494,6 +508,8 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			nextFuncOutputIdx++
 			funcCalls[key] = fc
 			funcCallOrder = append(funcCallOrder, key)
+		} else if newName := tc.Function.Name; newName != "" && fc.Name == "" {
+			fc.Name = newName
 		}
 		return fc
 	}
@@ -574,9 +590,92 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"call_id":   fc.CallID,
 				"name":      fc.Name,
 				"status":    "in_progress",
-				"arguments": map[string]interface{}{},
+				"arguments": "", // @CONSTRAINT: 必须是字符串（流式期间尚未累积参数），不能是对象——Codex 严格校验 item 类型
 			},
 		})
+	}
+
+	// closeFuncCall 关闭一个 function_call item：fc_arguments.done + output_item.done 各一次。
+	// @AI_GUARD: RESPONSES_FC_TEARDOWN - added/done 必须严格配对
+	// @CONSTRAINT: 每个 opened fc 恰好一条 fc_arguments.done（argsDone 守卫）+ 一条
+	//   output_item.done(function_call)（itemDone 守卫）；done 后不再接收该 fc 的 delta。
+	// @REASON: v0.2.109 之前 per-fc output_item.done 从未发送（3 added / 1 done 失衡），
+	//   且 sendCompleted 对空 buffer 幽灵条目补发 "{}" fc_arguments.done，与流式期间已发的
+	//   真 done 重复 → Codex 先绑定空参数 → pwd 工具空 Path。
+	closeFuncCall := func(fc *funcCallState) {
+		if !fc.addedSent {
+			sendOutputItemAddedFunc(fc)
+		}
+		finalArgs := fc.argsBuffer.String()
+		if finalArgs == "" {
+			finalArgs = "{}"
+		}
+		if !fc.argsDone {
+			fc.argsDone = true
+			sendSSE("response.function_call_arguments.done", map[string]interface{}{
+				"type":         "response.function_call_arguments.done",
+				"item_id":      fc.CallID,
+				"output_index": fc.OutputIdx,
+				"name":         fc.Name,
+				"arguments":    finalArgs,
+			})
+		}
+		if !fc.itemDone {
+			fc.itemDone = true
+			var argsObj interface{} = map[string]interface{}{}
+			raw := fc.argsBuffer.String()
+			if raw != "" {
+				_ = json.Unmarshal([]byte(raw), &argsObj)
+			}
+			sendSSE("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": fc.OutputIdx,
+				"item": map[string]interface{}{
+					"id":        fc.CallID,
+					"type":      "function_call",
+					"call_id":   fc.CallID,
+					"name":      fc.Name,
+					"status":    "completed",
+					"arguments": argsObj,
+				},
+			})
+		}
+	}
+
+	// closeMessageItem 关闭 message item：output_text.done + output_item.done(message)。
+	closeMessageItem := func(status string) map[string]interface{} {
+		finalText := accumulatedText.String()
+		if !textDoneSent {
+			textDoneSent = true
+			sendSSE("response.output_text.done", map[string]interface{}{
+				"type":          "response.output_text.done",
+				"item_id":       messageID,
+				"output_index":  0,
+				"content_index": 0,
+				"text":          finalText,
+			})
+		}
+		item := map[string]interface{}{
+			"id":     messageID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": status,
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "output_text",
+					"text": finalText,
+				},
+			},
+		}
+		if !msgItemClosed {
+			msgItemClosed = true
+			sendSSE("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": 0,
+				"item":         item,
+			})
+		}
+		return item
 	}
 
 	sendFuncArgsDelta := func(fc *funcCallState, delta string) {
@@ -591,67 +690,17 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		})
 	}
 
-	sendCompleted := func() {
-		sendCreated()
-
-		finalText := accumulatedText.String()
-
-		// 确保 message 类型的 output_item.added 已发送
-		sendOutputItemAddedMsg()
-
-		if !textDoneSent {
-			textDoneSent = true
-			sendSSE("response.output_text.done", map[string]interface{}{
-				"type":          "response.output_text.done",
-				"item_id":       messageID,
-				"output_index":  0,
-				"content_index": 0,
-				"text":          finalText,
-			})
-		}
-
-		// 发送 message 类型的 output_item.done
-		finalMsgItem := map[string]interface{}{
-			"id":     messageID,
-			"type":   "message",
-			"role":   "assistant",
-			"status": "completed",
-			"content": []interface{}{
-				map[string]interface{}{
-					"type": "output_text",
-					"text": finalText,
-				},
-			},
-		}
-		sendSSE("response.output_item.done", map[string]interface{}{
-			"type":         "response.output_item.done",
-			"output_index": 0,
-			"item":         finalMsgItem,
-		})
-
-		for _, key := range funcCallOrder {
-			fc := funcCalls[key]
-			if !fc.addedSent {
-				sendOutputItemAddedFunc(fc)
-			}
-			finalArgs := fc.argsBuffer.String()
-			if finalArgs == "" {
-				finalArgs = "{}"
-			}
-			sendSSE("response.function_call_arguments.done", map[string]interface{}{
-				"type":         "response.function_call_arguments.done",
-				"item_id":      fc.CallID,
-				"output_index": fc.OutputIdx,
-				"name":         fc.Name,
-				"arguments":    finalArgs,
-			})
-		}
-
+	// finalizeItems 按协议顺序收尾所有已打开的 item：
+	// 先关 message（output_text.done + output_item.done），再逐个关 function_call。
+	// @AI_GUARD: RESPONSES_ITEM_ORDER - completed 前必须关闭所有 opened item，且 added/done 一一配对
+	finalizeItems := func(status string) []interface{} {
+		sendCreated()      // 兜底：保证 created + msg added 存在
+		msgItem := closeMessageItem(status)
 		output := make([]interface{}, 0, 1+len(funcCallOrder))
-		output = append(output, finalMsgItem)
-
+		output = append(output, msgItem)
 		for _, key := range funcCallOrder {
 			fc := funcCalls[key]
+			closeFuncCall(fc)
 			var argsObj interface{} = map[string]interface{}{}
 			raw := fc.argsBuffer.String()
 			if raw != "" {
@@ -662,10 +711,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"type":      "function_call",
 				"call_id":   fc.CallID,
 				"name":      fc.Name,
-				"status":    "completed",
+				"status":    status,
 				"arguments": argsObj,
 			})
 		}
+		return output
+	}
+
+	sendCompleted := func() {
+		output := finalizeItems("completed")
 
 		respPayload := map[string]interface{}{
 			"id":     responseID,
@@ -707,46 +761,19 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				// @RELATED: sendCompleted() 正常结束路径, anthropic/translator.go 错误路径
 				// @REASON: v0.2.98 在限流(429 rpm exhausted)场景下 error 分支跳过 sendCompleted，
 				//   导致 Codex 永远收不到 response.completed，报 stream closed before response.completed
-				sendCreated() // response.created + output_item.added
 				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
 					event.Error.Code, event.Error.Type, event.Error.Message)
 				streamErr := t.TranslateError(event.Error) // {"error":{...}} RawMessage
 
-				// 关闭已开启的 message output item（status=failed）
-				failedMsgItem := map[string]interface{}{
-					"id":     messageID,
-					"type":   "message",
-					"role":   "assistant",
-					"status": "failed",
-					"content": []interface{}{
-						map[string]interface{}{
-							"type": "output_text",
-							"text": accumulatedText.String(),
-						},
-					},
-				}
-				if !textDoneSent {
-					textDoneSent = true
-					sendSSE("response.output_text.done", map[string]interface{}{
-						"type":          "response.output_text.done",
-						"item_id":       messageID,
-						"output_index":  0,
-						"content_index": 0,
-						"text":          accumulatedText.String(),
-					})
-				}
-				sendSSE("response.output_item.done", map[string]interface{}{
-					"type":         "response.output_item.done",
-					"output_index": 0,
-					"item":         failedMsgItem,
-				})
+				// 关闭所有已打开 item（message + 已出现的 fc），status=failed
+				output := finalizeItems("failed")
 
 				// response.completed 作为终态，response.error 携带上游错误信息
 				respPayload := map[string]interface{}{
-					"id":      responseID,
-					"status":  "failed",
-					"output":  []interface{}{failedMsgItem},
-					"error":   json.RawMessage(streamErr),
+					"id":     responseID,
+					"status": "failed",
+					"output": output,
+					"error":  json.RawMessage(streamErr),
 				}
 				if lastModel != "" {
 					respPayload["model"] = lastModel
@@ -796,6 +823,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				continue
 
 			case "done":
+				// @AI_GUARD: RESPONSES_DONE_EMBEDDED_CONTENT - finish 分片可能携带正文/工具调用，不能丢弃
+				// @CONSTRAINT: 部分上游（sensenova 等）把完整 tool_calls 塞进带 finish_reason 的
+				//   最后一个 chunk；此前 done 分支只读 Model/Usage → 全部丢失。
+				//   必须先按 delta 同样方式处理 Content/ToolCalls，再收尾。
+				// @REASON: v0.2.110 工具调用修复——日志显示 fc 事件错位 + Codex 拿不到参数。
 				if event.Data != nil {
 					if event.Data.Model != "" {
 						lastModel = event.Data.Model
@@ -805,6 +837,25 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 							InputTokens:  event.Data.Usage.PromptTokens,
 							OutputTokens: event.Data.Usage.CompletionTokens,
 							TotalTokens:  event.Data.Usage.TotalTokens,
+						}
+					}
+					if len(event.Data.Choices) > 0 {
+						choice := event.Data.Choices[0]
+						if choice.Message.Content != nil {
+							var text string
+							json.Unmarshal(choice.Message.Content, &text)
+							if text != "" {
+								sendTextDelta(text)
+								accumulatedText.WriteString(text)
+							}
+						}
+						for i, tc := range choice.Message.ToolCalls {
+							fc := getFC(tc, i)
+							sendOutputItemAddedFunc(fc)
+							if tc.Function.Arguments != "" {
+								sendFuncArgsDelta(fc, tc.Function.Arguments)
+								fc.argsBuffer.WriteString(tc.Function.Arguments)
+							}
 						}
 					}
 				}
