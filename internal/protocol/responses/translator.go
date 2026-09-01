@@ -675,15 +675,65 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 			switch event.Type {
 			case "error":
-				sendCreated()
-				errData := t.TranslateError(event.Error)
+				// @AI_GUARD: RESPONSES_STREAM_ERROR_TEARDOWN - 上游错误时必须补发完整结束序列
+				// @CONSTRAINT: Codex 状态机要求 response.completed 作为终态标记；只发 response.failed + [DONE]
+				//   会让 Codex 报 "stream closed before response.completed"（见 CLAUDE.md Responses SSE 生命周期）
+				// @RELATED: sendCompleted() 正常结束路径, anthropic/translator.go 错误路径
+				// @REASON: v0.2.98 在限流(429 rpm exhausted)场景下 error 分支跳过 sendCompleted，
+				//   导致 Codex 永远收不到 response.completed，报 stream closed before response.completed
+				sendCreated() // response.created + output_item.added
 				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
 					event.Error.Code, event.Error.Type, event.Error.Message)
-				buf := make([]byte, 0, len("event: response.failed\ndata: ")+len(errData)+len("\n\n"))
-				buf = append(buf, []byte("event: response.failed\ndata: ")...)
-				buf = append(buf, errData...)
-				buf = append(buf, '\n', '\n')
-				fn(buf, false)
+				streamErr := t.TranslateError(event.Error) // {"error":{...}} RawMessage
+
+				// 关闭已开启的 message output item（status=failed）
+				failedMsgItem := map[string]interface{}{
+					"id":     messageID,
+					"type":   "message",
+					"role":   "assistant",
+					"status": "failed",
+					"content": []interface{}{
+						map[string]interface{}{
+							"type": "output_text",
+							"text": accumulatedText.String(),
+						},
+					},
+				}
+				if !textDoneSent {
+					textDoneSent = true
+					sendSSE("response.output_text.done", map[string]interface{}{
+						"type":          "response.output_text.done",
+						"item_id":       messageID,
+						"output_index":  0,
+						"content_index": 0,
+						"text":          accumulatedText.String(),
+					})
+				}
+				sendSSE("response.output_item.done", map[string]interface{}{
+					"type":         "response.output_item.done",
+					"output_index": 0,
+					"item":         failedMsgItem,
+				})
+
+				// response.completed 作为终态，response.error 携带上游错误信息
+				respPayload := map[string]interface{}{
+					"id":      responseID,
+					"status":  "failed",
+					"output":  []interface{}{failedMsgItem},
+					"error":   json.RawMessage(streamErr),
+				}
+				if lastModel != "" {
+					respPayload["model"] = lastModel
+				}
+				if lastUsage != nil {
+					respPayload["usage"] = lastUsage
+				} else {
+					respPayload["usage"] = &Usage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
+				}
+				sendSSE("response.completed", map[string]interface{}{
+					"type":     "response.completed",
+					"response": respPayload,
+				})
 				sendDoneSSE()
 				return
 
