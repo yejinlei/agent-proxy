@@ -2909,8 +2909,25 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// @REASON: 历史血泪教训 - 事件序列不完整导致 Kimi 解析失败，修复多次才稳定
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
 	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
+	//
+	// @AI_GUARD: STREAM_WRITE_ERROR - TranslateStream 回调必须检查 Write 错误
+	// @CONSTRAINT:
+	//   - qwsResponseWriter.Write 返回错误时（如 WS 帧写出失败、SetWriteDeadline 超时），
+	//     不得静默丢弃；必须取消 ctx，终止上游流式响应 channel 和后续事件
+	//   - 静默丢弃的后果：TranslateStream 完整走完生命周期（包括 response.completed + [DONE]），
+	//     handler 以 status=200 正常退出；客户端 0 字节接收，判定通道卡死，永不渲染
+	//   - gateway.go 镜像同步（GATEWAY_STREAM_REQUEST）
+	// @RELATED: qwsResponseWriter.Write, quickWriteWSFrame, openai.go CallStream
+	// @REASON: v0.2.111 日志 conn 53875 三次 13 工具载荷请求：10 条 TranslateStream emit
+	//   但 0 条 WS frame → client — 写错误被本 callback 静默吞掉，handler 205782ms 正常退出
+	//   而 Codex 侧 0 字节卡 Working。见 docs/release-v0.2.112.md
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
-		mw.Write(eventData)
+		_, err := mw.Write(eventData)
+		if err != nil {
+			log.Printf("[WS-ERR] translate stream write failed (%s), aborting: %v", q.proxyName, err)
+			cancel()
+			return
+		}
 		mw.Flush()
 	})
 
