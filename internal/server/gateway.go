@@ -978,8 +978,10 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 		callDone1, callFinished1 = StartSSEHeartbeat(w, flusher, r.Context(), g.verboseLevel)
 	}
 
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	upstreamStart := time.Now()
-	lines, _, err := client.CallStream(ctx, downstreamReq, info)
+	lines, _, err := client.CallStream(streamCtx, downstreamReq, info)
 	if g.verboseLevel >= 2 {
 		log.Printf("[upstream] CallStream %s → %v", internalReq.Model, time.Since(upstreamStart))
 	}
@@ -1165,8 +1167,14 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
 	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
-	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
-		mw.Write(eventData)
+	//
+	ingressTranslator.TranslateStream(streamCtx, events, func(eventData []byte, isDone bool) {
+		_, err := mw.Write(eventData)
+		if err != nil {
+			log.Printf("[WS-ERR] gateway translate stream write failed, aborting: %v", err)
+			cancelStream()
+			return
+		}
 		mw.Flush()
 	})
 
