@@ -1759,7 +1759,11 @@ func (w *wsResponseWriter) WritePing() error {
 	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
 		return err
 	}
-	return writeWSCtrl(w.conn, wsOpPing, nil)
+	// @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 text 帧（opcode 0x1）承载应用层 SSE ping 事件；
+	//   不可用 ping 控制帧（opcode 0x9）——RFC 6455 ping 控制帧在 WS 栈内透明处理，
+	//   应用层不可见，客户端不会将其计入"内容活动"，keepalive 定时器不重置。
+	// @RELATED: heartbeatEvent, quick.go qwsResponseWriter.WritePing, ws-keepalive-fix memory
+	return writeWSFrame(w.conn, heartbeatEvent)
 }
 
 func (w *wsResponseWriter) WriteHeader(statusCode int) {
@@ -1830,7 +1834,14 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	hbDone := make(chan struct{})
 	go func() {
 		defer close(hbDone)
-		ticker := time.NewTicker(15 * time.Second)
+		// @AI_GUARD: WS_HEARTBEAT_INTERVAL - Codex WS keepalive 判定窗口 ~10s；
+		//   SenseNova 冷启动单轮 10–35s，若 ping 周期 ≥ keepalive 窗口，Codex 会先
+		//   判定通道停滞、主动关 TCP（broken pipe）。5s 留有安全余量，任何 handler
+		//   路径下通道都保持活跃。
+		// @RELATED: ws-keepalive-fix memory（三方案 A/B/C 决策记录）；quick.go 同名函数
+		// @REASON: v0.2.112 后日志 8 个 WS 连接全部 broken pipe；handler 10–35s 才
+		//   发出首个事件，15s 心跳周期 > Codex keepalive 窗口，客户端先关 TCP
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
