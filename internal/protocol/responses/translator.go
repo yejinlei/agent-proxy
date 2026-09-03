@@ -742,6 +742,20 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		sendDoneSSE()
 	}
 
+	// @AI_GUARD: RESPONSES_CREATED_EAGER - response.created 必须在上游首个事件前立即发出
+	// @CONSTRAINT: 上游（sensenova）冷启动 2–4 分钟才产出首个 SSE 事件；lazy sendCreated()
+	//   依赖 case "start"/"done"，静默期内完全不触发 → Codex keepalive 判定时长到达、主动关 TCP
+	//   （broken pipe）。必须在 select 阻塞上游之前立即发出 response.created + output_item.added，
+	//   让 Codex 在握手完成后毫秒级收到应用层信号、重置 keepalive。
+	// @RELATED: ws-keepalive-fix memory（方案 B），quick.go WritePing（text 帧心跳是辅修）
+	// @REASON: v0.2.113 把 WS 心跳从 ping 控制帧改为 text 帧（5s），但 sensenova 冷启动远超
+	//   Codex keepalive 窗口，心跳仍不足以救活连接；日志显示 8 个 WS 连接全部 broken pipe。
+	// @CONSTRAINT: sendCreated() 内部的 createdSent=true 保证后续 case "start"/"done" 不会重复发送
+	//   response.created（已注册 item 也不会重复），与 lazy 路径完全兼容
+	// @REASON: Anthropic 翻译器自然地在 TranslateStream 入口发送 message_start，本翻译器此前遗漏
+	// @AI_GUARD: 不触碰 anthropic/translator.go，符合"涉及 claude 协议的先不要动"约定
+	sendCreated()
+
 	for {
 		select {
 		case <-ctx.Done():
