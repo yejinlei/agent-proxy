@@ -1858,4 +1858,12 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	g.handleRequest(wsWriter, wsReq, "responses")
 	hbCancel()
 	<-hbDone
+
+	// @AI_GUARD: WS_CLOSE_FRAME - 正常收尾时必须先发 close 帧，再关 TCP
+	// @CONSTRAINT: 服务端在 [DONE] 后直接 conn.Close() 关 TCP，未先发 WS close 帧（0x8）→
+	//   Codex 检测到 "Connection reset without closing handshake" → 判 WS 协议错误、fallback HTTPS。
+	//   心跳 goroutine 已由 hbCancel + <-hbDone 保证退出，此处是唯一写方，无需加锁。
+	// @RELATED: quick.go handleResponsesWebSocket（双模式同步）
+	// @REASON: v0.2.114 Plan B 修好首字节延迟后，暴露出收尾缺 close 帧的协议问题
+	_ = writeWSCtrl(conn, wsOpClose, []byte{0x03, 0xE8}) // 1000 normal closure
 }

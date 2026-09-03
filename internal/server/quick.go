@@ -928,12 +928,12 @@ func stripSensenovaRequestFields(body json.RawMessage) json.RawMessage {
 }
 
 // stripSensenovaIncompatible 递归处理 sensenova 不兼容字段
-// 1. 删除所有层级的 guided_grammar
-// 2. 删除所有层级的 cache_control
-// 3. output_config.effort="xhigh" → "high"
-// 4. @AI_GUARD: 删除 top_p ≤ 0（SenseNova 要求 top_p ∈ (0,1]）
-// 5. @AI_GUARD: 删除 max_tokens ≤ 0（SenseNova 要求 max_tokens ∈ [1,65536]）
-//    @REASON: 透传路径原样转发请求体，Claude Code 默认 top_p:0，SenseNova 直接 400
+//  1. 删除所有层级的 guided_grammar
+//  2. 删除所有层级的 cache_control
+//  3. output_config.effort="xhigh" → "high"
+//  4. @AI_GUARD: 删除 top_p ≤ 0（SenseNova 要求 top_p ∈ (0,1]）
+//  5. @AI_GUARD: 删除 max_tokens ≤ 0（SenseNova 要求 max_tokens ∈ [1,65536]）
+//     @REASON: 透传路径原样转发请求体，Claude Code 默认 top_p:0，SenseNova 直接 400
 func stripSensenovaIncompatible(v interface{}) interface{} {
 	switch m := v.(type) {
 	case map[string]interface{}:
@@ -3615,8 +3615,10 @@ func quickComputeAcceptKey(key string) string {
 
 // quickReadWSFrame 读取下一个数据帧（text/binary），自动应答 ping、跳过 pong/close。
 // @AI_GUARD: WS_FRAME_CONTROL_FRAMES - Codex/tungstenite 可能在 response.create 之前先发
-//   WS Ping（keepalive）或续接帧；旧实现把任意首帧当请求体解析，JSON 解析失败 →
-//   handleRequest 空输入 → Codex 判 WS 通道不可用 → 降级 HTTP POST。
+//
+//	WS Ping（keepalive）或续接帧；旧实现把任意首帧当请求体解析，JSON 解析失败 →
+//	handleRequest 空输入 → Codex 判 WS 通道不可用 → 降级 HTTP POST。
+//
 // @CONSTRAINT: 控制帧必须按 RFC 6455 应答（ping→pong），close 帧回 1000 后返回错误断开。
 // @RELATED: gateway.go readWSFrame（双模式必须同步）
 func quickReadWSFrame(conn net.Conn) ([]byte, error) {
@@ -3763,10 +3765,12 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 
 // WritePing 发送一个 WS text 帧，内容就是 heartbeatEvent（`event: ping\ndata: {"type":"ping"}`）。
 // @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 text 帧（opcode 0x1）承载应用层 SSE ping 事件；
-//   不可用 ping 控制帧（opcode 0x9）——RFC 6455 ping 控制帧在 WS 栈内透明处理，
-//   应用层不可见，客户端不会将其计入"内容活动"，keepalive 定时器不重置。
-//   日志证明：v0.2.112 的 8 个 WS 连接虽然 15s 一次 ping 控制帧，全部 broken pipe；
-//   Anthropic 协议走 SSE text 帧时同格式心跳正常工作。
+//
+//	不可用 ping 控制帧（opcode 0x9）——RFC 6455 ping 控制帧在 WS 栈内透明处理，
+//	应用层不可见，客户端不会将其计入"内容活动"，keepalive 定时器不重置。
+//	日志证明：v0.2.112 的 8 个 WS 连接虽然 15s 一次 ping 控制帧，全部 broken pipe；
+//	Anthropic 协议走 SSE text 帧时同格式心跳正常工作。
+//
 // @RELATED: heartbeatEvent, gateway.go wsResponseWriter.WritePing, ws-keepalive-fix memory
 func (w *qwsResponseWriter) WritePing() error {
 	w.mu.Lock()
@@ -3847,14 +3851,14 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	hbDone := make(chan struct{})
 	go func() {
 		defer close(hbDone)
-			// @AI_GUARD: WS_HEARTBEAT_INTERVAL - Codex WS keepalive 判定窗口 ~10s；
-			//   SenseNova 冷启动单轮 10–35s，若 ping 周期 ≥ keepalive 窗口，Codex 会先
-			//   判定通道停滞、主动关 TCP（broken pipe）。5s 留有安全余量，任何 handler
-			//   路径下通道都保持活跃。
-			// @RELATED: ws-keepalive-fix memory（三方案 A/B/C 决策记录）
-			// @REASON: v0.2.112 后日志 8 个 WS 连接全部 broken pipe；handler 10–35s 才
-			//   发出首个事件，15s 心跳周期 > Codex keepalive 窗口，客户端先关 TCP
-			ticker := time.NewTicker(5 * time.Second)
+		// @AI_GUARD: WS_HEARTBEAT_INTERVAL - Codex WS keepalive 判定窗口 ~10s；
+		//   SenseNova 冷启动单轮 10–35s，若 ping 周期 ≥ keepalive 窗口，Codex 会先
+		//   判定通道停滞、主动关 TCP（broken pipe）。5s 留有安全余量，任何 handler
+		//   路径下通道都保持活跃。
+		// @RELATED: ws-keepalive-fix memory（三方案 A/B/C 决策记录）
+		// @REASON: v0.2.112 后日志 8 个 WS 连接全部 broken pipe；handler 10–35s 才
+		//   发出首个事件，15s 心跳周期 > Codex keepalive 窗口，客户端先关 TCP
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -3871,4 +3875,13 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	q.handleRequest(wsWriter, wsReq, "responses")
 	hbCancel()
 	<-hbDone
+
+	// @AI_GUARD: WS_CLOSE_FRAME - 正常收尾时必须先发 close 帧，再关 TCP
+	// @CONSTRAINT: 服务端在 [DONE] 后直接 conn.Close() 关 TCP，未先发 WS close 帧（0x8）→
+	//   Codex 检测到 "Connection reset without closing handshake" → 判 WS 协议错误、fallback HTTPS。
+	//   心跳 goroutine 已由 hbCancel + <-hbDone 保证退出，此处是唯一写方，无需加锁。
+	// @RELATED: gateway.go handleResponsesWebSocket（双模式同步）
+	// @REASON: v0.2.114 Plan B 修好首字节延迟后，暴露出收尾缺 close 帧的协议问题；日志全程
+	//   0 条 WS-ERR 但 Codex 仍报 Connection reset without closing handshake
+	_ = quickWriteWSCtrl(conn, qwsOpClose, []byte{0x03, 0xE8}) // 1000 normal closure
 }
