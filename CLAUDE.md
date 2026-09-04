@@ -284,6 +284,7 @@ grep -rn "@REASON:" internal/
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
 | `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`event: ping\ndata: {"type":"ping"}\n\n`，必须带 `event:` 前缀） |
 | `SSE_HEARTBEAT_FACTORY` | sse_heartbeat.go | 统一心跳工厂函数，所有 handler 共用 |
+| `WS_HEARTBEAT_LOG` | quick.go | WS 心跳必须打日志（gateway.go 同步），否则无法区分"心跳没发"和"心跳发了但客户端没用" |
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
 | `TRANSLATE_STREAM_OUTPUT` | quick.go | Anthropic SSE 事件序列 |
@@ -295,6 +296,7 @@ grep -rn "@REASON:" internal/
 | `GATEWAY_STREAM_REQUEST` | gateway.go | 必须同步 quick.go |
 | **provider** | | |
 | `CONNECTION_POOL_CONFIG` | openai.go | 4 个 Provider 配置一致 |
+| `STREAM_TIMEOUT_RETRY` | openai.go | 响应头超时（`context.DeadlineExceeded`）必须在重试预算内重试，否则等于只把失败提前 |
 
 ---
 
