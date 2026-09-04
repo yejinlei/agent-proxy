@@ -3772,13 +3772,19 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 //	Anthropic 协议走 SSE text 帧时同格式心跳正常工作。
 //
 // @RELATED: heartbeatEvent, gateway.go wsResponseWriter.WritePing, ws-keepalive-fix memory
+//
+// @AI_GUARD: WS_HEARTBEAT_LOG - 心跳必须打日志，否则无法区分"心跳没发"和"心跳发了但客户端没用"
+// @REASON: Write() 一直有 [CODEX-DEBUG] WS frame 日志，WritePing() 没有；v0.2.113~v0.2.116
+//   的日志里 event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区
 func (w *qwsResponseWriter) WritePing() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.conn.SetWriteDeadline(time.Now().Add(qwsWriteDeadline)); err != nil {
 		return err
 	}
-	return quickWriteWSFrame(w.conn, heartbeatEvent)
+	err := quickWriteWSFrame(w.conn, heartbeatEvent)
+	log.Printf("[CODEX-DEBUG] WS ping → client: bytes=%d err=%v", len(heartbeatEvent), err)
+	return err
 }
 
 func (w *qwsResponseWriter) WriteHeader(statusCode int) {
@@ -3841,11 +3847,11 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 	wsWriter := &qwsResponseWriter{conn: conn}
 
-	// WS 应用层心跳：每 15s 一个 ping 控制帧。
+	// WS 应用层心跳：每 5s 一个 WS text 帧（内容是 SSE ping 事件，非 ping 控制帧）。
 	// @AI_GUARD: WS_HEARTBEAT - Responses 流式路径（handleStreamRequest）只在「静默 >500ms」
 	//   时发 SSE ping；短内容快速回答整轮零心跳，Codex/tungstenite 的 keepalive 判定
-	//   （默认 ~10s）可能误判通道停滞 → 重连/降级 HTTP POST。WS 层的 ping 帧与 SSE 事件
-	//   正交、客户端自动回 pong，任何 handler 路径下通道都保持活跃。
+	//   （默认 ~10s）可能误判通道停滞 → 重连/降级 HTTP POST。WS 层的 text 帧心跳与 SSE
+	//   事件正交，任何 handler 路径下通道都保持活跃。
 	// @RELATED: sse_heartbeat.go StartSSEHeartbeat（SSE 层心跳，勿混用两种格式）
 	hbCtx, hbCancel := context.WithCancel(r.Context())
 	hbDone := make(chan struct{})
