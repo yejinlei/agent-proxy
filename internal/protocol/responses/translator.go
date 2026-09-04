@@ -597,6 +597,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 	// closeFuncCall 关闭一个 function_call item：fc_arguments.done + output_item.done 各一次。
 	// @AI_GUARD: RESPONSES_FC_TEARDOWN - added/done 必须严格配对
+	// @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING - function_call.arguments 必须是 JSON 字符串，不能是对象
+	// @CONSTRAINT: 输出侧（output_item.done.function_call.arguments / response.completed.output[].arguments）
+	//   必须是原始参数字符串（如 "{\"path\":\"F:/src/x\"}"），Responses API 规范如此，Codex 工具调用
+	//   harness 据此反序列化。此前用 json.Unmarshal 还原成 map 再 Marshal 成对象输出 → Codex 无法解析，
+	//   整个 turn 静默丢弃（工具不执行，且不再发下一轮请求）。
 	// @CONSTRAINT: 每个 opened fc 恰好一条 fc_arguments.done（argsDone 守卫）+ 一条
 	//   output_item.done(function_call)（itemDone 守卫）；done 后不再接收该 fc 的 delta。
 	// @REASON: v0.2.109 之前 per-fc output_item.done 从未发送（3 added / 1 done 失衡），
@@ -622,11 +627,6 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		}
 		if !fc.itemDone {
 			fc.itemDone = true
-			var argsObj interface{} = map[string]interface{}{}
-			raw := fc.argsBuffer.String()
-			if raw != "" {
-				_ = json.Unmarshal([]byte(raw), &argsObj)
-			}
 			sendSSE("response.output_item.done", map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": fc.OutputIdx,
@@ -636,7 +636,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"call_id":   fc.CallID,
 					"name":      fc.Name,
 					"status":    "completed",
-					"arguments": argsObj,
+					"arguments": finalArgs,
 				},
 			})
 		}
@@ -701,10 +701,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		for _, key := range funcCallOrder {
 			fc := funcCalls[key]
 			closeFuncCall(fc)
-			var argsObj interface{} = map[string]interface{}{}
-			raw := fc.argsBuffer.String()
-			if raw != "" {
-				_ = json.Unmarshal([]byte(raw), &argsObj)
+			var argsStr string
+			if raw := fc.argsBuffer.String(); raw != "" {
+				argsStr = raw
+			} else {
+				argsStr = "{}"
 			}
 			output = append(output, map[string]interface{}{
 				"id":        fc.CallID,
@@ -712,7 +713,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"call_id":   fc.CallID,
 				"name":      fc.Name,
 				"status":    status,
-				"arguments": argsObj,
+				"arguments": argsStr,
 			})
 		}
 		return output
