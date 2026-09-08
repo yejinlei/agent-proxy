@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -629,4 +630,98 @@ func TestE2E_AnthropicStream_UpstreamError_KeepsMessageStart(t *testing.T) {
 	if strings.Contains(out, "event: response.completed") {
 		t.Errorf("Anthropic 客户端不应收到 Responses 事件:\n%s", out)
 	}
+}
+
+// TestWritePing_UsesControlFrameNotText 锁定 WS 心跳的帧形状。
+//
+// 背景：v0.2.124 的 WS 心跳是 text 帧（opcode 0x1），内容为 `event: ping`。
+// 但本项目的 handleStreamRequest 早已在 isResponsesIngress 处禁用 Responses 入站的
+// SSE 层 event: ping——理由写死在代码注释里：该 event 不属于 OpenAI Responses 事件集，
+// 插入会让 Codex 解析器报 "stream closed before response.completed"。WS 层却把同一个
+// 违规 payload 从另一条路送回去（WS text 帧内的内容正是按 SSE 格式解析的），
+// 导致 Responses 入站"应用层禁 ping、传输层照常 ping"，前后自相矛盾。
+//
+// v0.2.124 实测（WS 探针）：上游静默 11.7s 时 5s/10s 各收到一个 text 帧 event: ping，
+// Codex 仍报 stream closed before response.completed 并降级 HTTPS；同一请求走 HTTPS
+// （全程零 ping）事件序列完整正常。故心跳改为 RFC 6455 ping 控制帧（opcode 0x9）：
+// 控制帧在 WS 栈内透明处理、应用层完全不可见，不可能污染上层 SSE 事件流。
+func TestWritePing_UsesControlFrameNotText(t *testing.T) {
+	const (
+		opPing = 0x9
+		opText = 0x1
+		finBit = 0x80
+	)
+
+	// check 自己持有管道两端：测试侧读 server 端，被测代码写 client 端。
+	check := func(t *testing.T, name string, ping func(net.Conn) error) {
+		t.Helper()
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		got := make([]byte, 0, 16)
+		done := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 2)
+			if _, err := io.ReadFull(server, buf); err != nil {
+				done <- err
+				return
+			}
+			done <- nil
+			got = append(got, buf...)
+		}()
+
+		if err := ping(client); err != nil {
+			t.Fatalf("%s: WritePing 出错: %v", name, err)
+		}
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: 读帧失败: %v", name, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: 超时，未收到任何帧", name)
+		}
+
+		if len(got) < 2 {
+			t.Fatalf("%s: 帧过短: % X", name, got)
+		}
+		b0, b1 := got[0], got[1]
+		opcode := b0 & 0x0F
+		fin := b0&finBit != 0
+		masked := b1&0x80 != 0
+		payloadLen := int(b1 & 0x7F)
+
+		if !fin {
+			t.Errorf("%s: 控制帧必须 FIN=1，实际 b0=%#x", name, b0)
+		}
+		if masked {
+			t.Errorf("%s: 服务端控制帧不得掩码，实际 b1=%#x", name, b1)
+		}
+		if opcode != opPing {
+			t.Errorf("%s: 期望 ping 控制帧 opcode=0x9，实际 opcode=%#x", name, opcode)
+		}
+		if opcode == opText {
+			t.Errorf("%s: 期望 ping 控制帧，实际发来 text 帧——会把 SSE 事件注入应用层，"+
+				"这正是 Codex 报 stream closed before response.completed 的原因", name)
+		}
+		// RFC 6455 §5.5.2：控制帧 payload 不得超过 125 字节
+		if payloadLen > 125 {
+			t.Errorf("%s: 控制帧 payload 长度 %d 超过 125", name, payloadLen)
+		}
+		// 帧必须是完整且自洽的：声明的长度不能超出实际字节
+		if len(got) < 2+payloadLen {
+			t.Errorf("%s: 帧声明 payload %d 字节但只读到 %d 字节", name, payloadLen, len(got))
+		}
+		t.Logf("%s: b0=%#x b1=%#x opcode=%#x payloadLen=%d ✅", name, b0, b1, opcode, payloadLen)
+	}
+
+	check(t, "quick mode", func(c net.Conn) error {
+		return (&qwsResponseWriter{conn: c}).WritePing()
+	})
+
+	check(t, "gateway mode", func(c net.Conn) error {
+		return (&wsResponseWriter{conn: c}).WritePing()
+	})
 }

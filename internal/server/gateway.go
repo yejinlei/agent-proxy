@@ -1823,24 +1823,30 @@ func (w *wsResponseWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// WritePing 发送一个 WS text 帧，内容就是 heartbeatEvent（`event: ping\ndata: {"type":"ping"}`）。
+// WritePing 发送一个 RFC 6455 ping 控制帧（opcode 0x9，无 payload）。
 // 与 Write 共用 mu，保证与控制帧/数据帧不交错。必须同步 quick.go qwsResponseWriter.WritePing。
+// @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 ping 控制帧（opcode 0x9），不可用 text 帧（0x1）
+//   承载 `event: ping` 应用层事件：控制帧在 WS 栈内透明处理、应用层完全不可见，
+//   不会污染上层 SSE 事件流；而本项目的 handleStreamRequest 已在 isResponsesIngress 处
+//   明确禁用 Responses 入站的 SSE 层 event: ping（该 event 不属于 OpenAI Responses 事件集，
+//   插入会让 Codex 解析器状态机异常并报 stream closed before response.completed）。
+//   WS 层若继续发 text 帧 ping，等于把同一违规 payload 从另一条路送回去。
+// @RELATED: heartbeatEvent, quick.go qwsResponseWriter.WritePing, ws-keepalive-fix memory
+//
+// @AI_GUARD: WS_HEARTBEAT_LOG - 心跳必须打日志，否则无法区分"心跳没发"和"心跳发了但客户端没用"
+// @REASON: Write() 一直有 [CODEX-DEBUG] 日志，WritePing() 没有；v0.2.113~v0.2.116 的日志里
+//   event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区。
+//   v0.2.125 起 WritePing 从 text 帧改为控制帧：v0.2.124 实测（WS 探针，11.7s 上游静默）
+//   5s/10s 各发一个 text 帧 event: ping，Codex 仍报 stream closed before
+//   response.completed 并降级 HTTPS；同一请求走 HTTPS（全程零 ping）事件序列完整正常。
 func (w *wsResponseWriter) WritePing() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
 		return err
 	}
-	// @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 text 帧（opcode 0x1）承载应用层 SSE ping 事件；
-	//   不可用 ping 控制帧（opcode 0x9）——RFC 6455 ping 控制帧在 WS 栈内透明处理，
-	//   应用层不可见，客户端不会将其计入"内容活动"，keepalive 定时器不重置。
-	// @RELATED: heartbeatEvent, quick.go qwsResponseWriter.WritePing, ws-keepalive-fix memory
-	//
-	// @AI_GUARD: WS_HEARTBEAT_LOG - 心跳必须打日志，否则无法区分"心跳没发"和"心跳发了但客户端没用"
-	// @REASON: Write() 一直有 [CODEX-DEBUG] 日志，WritePing() 没有；v0.2.113~v0.2.116 的日志里
-	//   event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区
-	err := writeWSFrame(w.conn, heartbeatEvent)
-	log.Printf("[CODEX-DEBUG] WS ping → client: bytes=%d err=%v", len(heartbeatEvent), err)
+	err := writeWSCtrl(w.conn, wsOpPing, nil)
+	log.Printf("[CODEX-DEBUG] WS ping → client: opcode=0x9 bytes=0 err=%v", err)
 	return err
 }
 
