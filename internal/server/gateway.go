@@ -1249,6 +1249,50 @@ func mapRoleToCC(role string) string {
 	return role
 }
 
+// logCCRequestShape 打印发往上游 CC 的请求体形状与工具往返配对检查结果。
+// 只打形状（长度/名称/id），不打印正文与参数原文，避免日志膨胀和敏感内容外泄。
+// 双模式共用 buildCCRequest，因此快速/复杂模式都覆盖。
+func logCCRequestShape(model string, messages []chatcompletion.Message, nTools int) {
+	if len(messages) == 0 {
+		return
+	}
+
+	var roles []string
+	var fcs []string
+	toolCallIDs := make(map[string]bool)
+	toolResultIDs := make(map[string]bool)
+	for _, m := range messages {
+		roles = append(roles, m.Role)
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" {
+				toolCallIDs[tc.ID] = true
+			}
+			fcs = append(fcs, fmt.Sprintf("%s/%s/%d", tc.ID, tc.Function.Name, len(tc.Function.Arguments)))
+		}
+		if m.Role == "tool" {
+			toolResultIDs[m.ToolCallID] = true
+		}
+	}
+
+	// 悬空工具结果：role:tool 的 tool_call_id 找不到对应的 assistant tool_calls。
+	// tool_call_id 为空本身就是孤儿（上游无法配对）。
+	// 这是静默故障——上游一律 HTTP 200、不发 response.error，日志里此前完全看不见。
+	// v0.2.121 的 buildCCRequest 漏拷 tool_call_id 正是这个形态。配对断裂后模型把
+	// 已读文件当成"没读过"，改成自由发挥并停止发起工具调用。
+	orphans := 0
+	for id := range toolResultIDs {
+		if id == "" || !toolCallIDs[id] {
+			orphans++
+		}
+	}
+	if len(fcs) == 0 {
+		fcs = []string{"none"}
+	}
+	log.Printf("[CODEX-DEBUG] buildCCRequest: model=%q messages=%d roles=[%s] tools=%d tool_calls=%d fcs=[%s] orphaned_tool_results=%d",
+		model, len(messages), strings.Join(roles, ","), nTools,
+		len(toolCallIDs), strings.Join(fcs, " "), orphans)
+}
+
 func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion.ChatCompletionRequest {
 	messages := make([]chatcompletion.Message, 0, len(req.Messages)+1)
 
@@ -1304,6 +1348,14 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 		}
 		messages = append(messages, im)
 	}
+
+	// 上游 CC 请求体形状摘要 + 悬空工具结果检查。
+	// 这是数据离开代理的最后一个可观测点：请求体日志被 formatJSON 截到 20KB+8KB，
+	// messages 中段（正是工具往返所在的位置）进不了日志。此处只打形状。
+	// 悬空检查针对的正是静默故障：role:tool 带 tool_call_id 但历史里没有 assistant
+	// tool_calls 携带该 id，或 assistant tool_calls 没有对应的工具结果——上游一律 HTTP 200，
+	// 配对断了模型就把已读文件当成没读过并停止调工具。
+	logCCRequestShape(req.Model, messages, len(req.Tools))
 
 	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
 	for _, tool := range req.Tools {
@@ -1691,6 +1743,14 @@ func writeWSCtrl(conn net.Conn, opcode byte, payload []byte) error {
 	return err
 }
 
+// wsPreview 取帧头前 120 字节并压成单行，供 [CODEX-DEBUG] 日志使用。
+// 只用于日志，两个模式的 WS 写出路径共用，保证日志格式一致。
+// 所有空白（含换行）折叠成单空格：SSE 帧天然含 \n\n，不压平会把一条日志
+// 打散成多行，交错时无法归属到具体请求。
+func wsPreview(b []byte) string {
+	return strings.Join(strings.Fields(string(b[:min(len(b), 120)])), " ")
+}
+
 // writeWSFrame 向连接写入一个 WebSocket 文本帧
 func writeWSFrame(conn net.Conn, payload []byte) error {
 	length := len(payload)
@@ -1751,9 +1811,16 @@ func (w *wsResponseWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
 		return 0, err
 	}
 	if err := writeWSFrame(w.conn, b); err != nil {
+		// WS 数据帧写出失败必须落日志：静默返回会让"WS 降级到 HTTPS"这类
+		// 客户端侧症状在代理日志里零线索，无法区分是客户端先关、还是我们写超时。
+		// v0.2.121 实测 13:23:53 后所有请求从 WS 变成 HTTPS，日志里查不到任何
+		// 失败记录——这条路径此前只 return err，err 在 handler 里被当成正常流结束吞掉。
+		// 必须与 quick.go qwsResponseWriter.Write 保持同步。
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
 		return 0, err
 	}
 	return len(b), nil

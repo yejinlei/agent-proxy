@@ -115,6 +115,15 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
 		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
 
+	// @CODEX-DEBUG v0.2.121：input items 逐条形状摘要。
+	// 上游请求体日志被 formatJSON 截到 20KB+8KB（quick.go），大请求的 messages 中段
+	// 完整内容进不了日志；排查"模型最后一轮决定收口而不再调工具"这类问题时，
+	// 看不到历史里到底有哪些 function_call / function_call_output 往返，无法判断
+	// 是模型认为已读过、还是被前面的 tool result 带偏。此处只打形状不打印文本身，
+	// 避免日志膨胀。
+	items := InputToItems(req.Input)
+	log.Printf("[CODEX-DEBUG] input items digest: %s", responsesItemDigest(items))
+
 	// --- 3. Tools → InternalTools ---
 	// @AI_GUARD: RESPONSES_FILTER_BUILTIN_TOOLS - 跳过客户端内置工具
 	// @CONSTRAINT: 只把 type=="function" 且 name 非空的 tool 转发给上游；其余（tool_search/web_search
@@ -215,6 +224,135 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 	}
 
 	return msgs
+}
+
+// responsesItemDigest 生成 input items 的逐条形状摘要（只打形状，不打印文本身）。
+//
+// Codex 工具循环类问题的关键证据在 items 的形状序列里——历史中 function_call /
+// function_call_output 的 call_id 是否成对出现、最后一次工具结果之后又跟了什么。
+// 上游请求体日志被 formatJSON 截断（quick.go 20KB+8KB），大请求中段内容进不了日志，
+// 因此这里在翻译入口就地打一份形状摘要。只报长度与标识，不输出文本/参数原文，
+// 避免日志膨胀与敏感内容外泄。
+//
+// 字段的取值分支必须与 itemToMessage / functionCallOutputItemToMessage 一致，
+// 否则摘要显示的 call_id 与真正发出的不一致，会把排查引向错误方向。
+func responsesItemDigest(items []InputItem) string {
+	if len(items) == 0 {
+		return "(no items)"
+	}
+	parts := make([]string, 0, len(items))
+	for i, item := range items {
+		itemType := item.Type
+		if itemType == "" {
+			itemType = "message"
+		}
+		p := fmt.Sprintf("%d:%s", i, itemType)
+		switch itemType {
+		case "message":
+			if item.Role != "" {
+				p += " role=" + item.Role
+			} else {
+				// 空 role 会走 itemToMessage 的默认分支，摘要标出来便于确认
+				p += " role=<default>"
+			}
+			switch c := item.Content.(type) {
+			case string:
+				p += fmt.Sprintf(" text_bytes=%d", len(c))
+			case []interface{}:
+				var blockTypes []string
+				textBytes := 0
+				for _, cb := range c {
+					m, ok := cb.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					bt, _ := m["type"].(string)
+					if bt == "" {
+						bt = "?"
+					}
+					blockTypes = append(blockTypes, bt)
+					if bt == "input_text" || bt == "output_text" || bt == "text" {
+						if ts, ok := m["text"].(string); ok {
+							textBytes += len(ts)
+						}
+					}
+				}
+				if len(blockTypes) > 0 {
+					p += " blocks=" + strings.Join(blockTypes, ",")
+				}
+				p += fmt.Sprintf(" text_bytes=%d", textBytes)
+			default:
+				p += fmt.Sprintf(" content_bytes=%d", jsonLen(item.Content))
+			}
+			if len(item.ToolCalls) > 0 {
+				p += fmt.Sprintf(" tool_calls=%d", len(item.ToolCalls))
+			}
+		case "function_call":
+			name := item.Name
+			args := item.Arguments
+			call := item.CallID
+			if len(item.ToolCalls) > 0 {
+				if item.ToolCalls[0].Name != "" {
+					name = item.ToolCalls[0].Name
+				}
+				call = item.ToolCalls[0].ID
+				if args == "" {
+					args = string(jsonMarshalCompact(item.ToolCalls[0].Input))
+				}
+			}
+			if name == "" {
+				name = "?"
+			}
+			p += fmt.Sprintf(" name=%s call=%s args=%d", name, digestCallID(call), len(args))
+		case "function_call_output":
+			p += fmt.Sprintf(" call=%s out=%d", digestCallID(item.CallID), len(extractOutputText(item.Output)))
+		case "reasoning":
+			// 只标记存在：思考过程不透出，也不属于工具循环诊断所需信息
+		default:
+			p += " UNKNOWN_TYPE"
+		}
+		parts = append(parts, p)
+	}
+	return strings.Join(parts, " ")
+}
+
+// responsesLogTail 取文本末尾 160 字符并压成单行，供 [CODEX-DEBUG] 汇总日志使用。
+// 模型"最后一轮只回了一句就收口"的措辞是判断它为何停止调工具的唯一线索，
+// 但整段输出进日志会膨胀，因此只保留尾部。所有空白（含换行）折叠成单空格，
+// 保证该字段始终是日志的一行，不会被多行输出打散成多条难以归属的记录。
+func responsesLogTail(s string) string {
+	if len(s) > 160 {
+		s = s[len(s)-160:]
+	}
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// digestCallID 空 call_id 会被 itemToMessage 现场合成，与历史里任何
+// function_call_output 都对不上——这正是悬空工具结果的成因之一，必须显式标出。
+func digestCallID(id string) string {
+	if id == "" {
+		return "SYNTH"
+	}
+	if len(id) > 28 {
+		return id[:16] + ".." + id[len(id)-8:]
+	}
+	return id
+}
+
+func jsonLen(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return -1
+	}
+	return len(b)
+}
+
+func jsonMarshalCompact(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // itemToMessage 把单个 type:"message"（或 type:"function_call"）item 转为 InternalMessage。
@@ -630,6 +768,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	var nDeltaEvents int
 	var nTextDeltas int
 	var nFuncArgsDeltas int
+	startedAt := time.Now()
 	createdSent := false
 	itemAdded := false
 	textDoneSent := false
@@ -933,9 +1072,23 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		})
 
 		// @AI_GUARD: RESPONSES_FINISH_REASON_LOG - 流结束必须落一条可 grep 的汇总日志
-		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d usage=%v",
+		// tail / fcs / took 是本次补充的字段，同样不要删：text_chars 只给总量，看不到
+		// "最后一轮只回了一句就收口"的具体措辞；func_calls 为 0 时没有任何线索说明模型
+		// 为什么不再调工具。tail 是模型实际输出的最后 160 字符，fcs 列出每个工具调用的
+		// call_id 与参数长度，两者结合才能判断是"模型认为已读过"还是被前面的工具结果带偏。
+		var fcDesc []string
+		for _, k := range funcCallOrder {
+			fc := funcCalls[k]
+			fcDesc = append(fcDesc, fmt.Sprintf("%s/%s/%d", fc.CallID, fc.Name, fc.argsBuffer.Len()))
+		}
+		if len(fcDesc) == 0 {
+			fcDesc = append(fcDesc, "none")
+		}
+		endedText := accumulatedText.String()
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] tail=%q",
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
-			nDeltaEvents, respPayload["usage"])
+			nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
+			respPayload["usage"], strings.Join(fcDesc, " "), responsesLogTail(endedText))
 
 		sendDoneSSE()
 	}
@@ -1023,10 +1176,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"type":     "response.completed",
 					"response": respPayload,
 				})
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d http=%d upstream_type=%q upstream_msg=%.200s",
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s tail=%q",
 					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
-					nDeltaEvents, nFuncArgsDeltas,
-					event.Error.Code, event.Error.Type, event.Error.Message)
+					nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
+					event.Error.Code, event.Error.Type, event.Error.Message, responsesLogTail(accumulatedText.String()))
 				sendDoneSSE()
 				return
 

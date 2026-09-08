@@ -3752,14 +3752,20 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.conn.SetWriteDeadline(time.Now().Add(qwsWriteDeadline)); err != nil {
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
 		return 0, err
 	}
 	if err := quickWriteWSFrame(w.conn, b); err != nil {
+		// WS 数据帧写出失败必须落日志：静默返回会让"WS 降级到 HTTPS"这类
+		// 客户端侧症状在代理日志里零线索，无法区分是客户端先关、还是我们写超时。
+		// v0.2.121 实测 13:23:53 后所有请求从 WS 变成 HTTPS，日志里查不到任何
+		// 失败记录——这条路径此前只 return err，err 在 handler 里被当成正常流结束吞掉。
+		// 必须与 gateway.go wsResponseWriter.Write 保持同步。
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
 		return 0, err
 	}
 	// @CODEX-DEBUG v0.2.98：每帧写出记录（生产可见，前 120 字节用于定位生命周期事件）
-	preview := strings.ReplaceAll(strings.TrimRight(string(b[:min(len(b), 120)]), "\n"), "\r", "")
-	log.Printf("[CODEX-DEBUG] WS frame → client: bytes=%d preview=%q", len(b), preview)
+	log.Printf("[CODEX-DEBUG] WS frame → client: bytes=%d preview=%q", len(b), wsPreview(b))
 	return len(b), nil
 }
 

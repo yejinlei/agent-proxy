@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"log"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
@@ -97,4 +100,87 @@ func TestBuildCCRequest_WithoutToolCallIDOmitted(t *testing.T) {
 		t.Fatalf("无工具结果时不应输出 tool_call_id: %s", raw)
 	}
 	t.Logf("✅ 无工具结果时 tool_call_id 已省略")
+}
+
+// TestBuildCCRequest_OrphanDetection 覆盖 buildCCRequest 的悬空工具结果检查（orphaned_tool_results）：
+// 配对完整时 orphaned_tool_results=0；tool_call_id 丢失（v0.2.121 修复前的形态）时必须 >0。
+// 这条断言保证下一轮回归时悬空工具结果在日志里立即可见，不必再靠 A/B 对照实验定位。
+func TestBuildCCRequest_OrphanDetection(t *testing.T) {
+	tc := schema.InternalToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: struct {
+			Name         string          `json:"name"`
+			Arguments    string          `json:"arguments"`
+			RawArguments json.RawMessage `json:"-"`
+		}{Name: "exec_command", Arguments: `{"cmd":"cat f.txt"}`},
+	}
+
+	cases := []struct {
+		name       string
+		msgs       []schema.InternalMessage
+		wantOrphan int
+	}{
+		{
+			name: "配对完整",
+			msgs: []schema.InternalMessage{
+				{Role: "user", Content: json.RawMessage(`"read f.txt"`)},
+				{Role: "assistant", ToolCalls: []schema.InternalToolCall{tc}},
+				{Role: "tool", ToolCallID: "call_1", Content: json.RawMessage(`"ok"`)},
+			},
+			wantOrphan: 0,
+		},
+		{
+			name: "tool_call_id 丢失即孤儿",
+			msgs: []schema.InternalMessage{
+				{Role: "user", Content: json.RawMessage(`"read f.txt"`)},
+				{Role: "assistant", ToolCalls: []schema.InternalToolCall{tc}},
+				{Role: "tool", Content: json.RawMessage(`"ok"`)}, // 缺 ToolCallID → 悬空
+			},
+			wantOrphan: 1,
+		},
+		{
+			name: "id 对不上也是孤儿",
+			msgs: []schema.InternalMessage{
+				{Role: "user", Content: json.RawMessage(`"read f.txt"`)},
+				{Role: "assistant", ToolCalls: []schema.InternalToolCall{tc}},
+				{Role: "tool", ToolCallID: "call_999", Content: json.RawMessage(`"ok"`)},
+			},
+			wantOrphan: 1,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
+			orig := log.Writer()
+			log.SetOutput(buf)
+			defer log.SetOutput(orig)
+			buf.Reset()
+
+			buildCCRequest(&schema.InternalRequest{Model: "vmodel", Messages: c.msgs}, "")
+			out := buf.String()
+
+			const key = "orphaned_tool_results="
+			i := strings.Index(out, key)
+			if i < 0 {
+				t.Fatalf("未打 buildCCRequest 形状日志: %q", out)
+			}
+			end := i + len(key)
+			for end < len(out) && out[end] >= '0' && out[end] <= '9' {
+				end++
+			}
+			got, err := strconv.Atoi(out[i+len(key) : end])
+			if err != nil {
+				t.Fatalf("orphaned_tool_results 不是数字: %q", out[i+len(key):])
+			}
+			if got != c.wantOrphan {
+				t.Fatalf("orphaned_tool_results = %d, want %d\n  %s", got, c.wantOrphan, out)
+			}
+			if !strings.Contains(out, "roles=[") || !strings.Contains(out, "fcs=[") {
+				t.Errorf("形状日志缺 roles/fcs 字段: %s", out)
+			}
+			t.Logf("log: %s", out)
+		})
+	}
 }
