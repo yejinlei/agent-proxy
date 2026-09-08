@@ -581,7 +581,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 		<-callFinished2
 		if err2 != nil {
 			log.Printf("[passthrough] fallback non-stream also failed: model=%s ctx_err=%v err=%v", realModel, ctx.Err(), err2)
-			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
+			writeUpstreamSSEError(w, flusher, ingressProtocol, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
 		// 过滤 thinking + description + 修复 usage
@@ -674,11 +674,7 @@ func (g *Gateway) handlePassthroughStream(ctx context.Context, w http.ResponseWr
 					<-callFinished2
 					if err2 != nil {
 						log.Printf("[passthrough] fallback non-stream also failed: model=%s ctx_err=%v err=%v", realModel, ctx.Err(), err2)
-						// 先发 message_start 再发 error
-						msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-						w.Write([]byte(`event: message_start` + "\n" +
-							fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID, realModel) + "\n\n"))
-						sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
+						writeUpstreamSSEError(w, flusher, ingressProtocol, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
 						return
 					}
 					respBody = stripThinkingContentBlocks(respBody)
