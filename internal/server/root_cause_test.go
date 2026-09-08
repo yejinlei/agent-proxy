@@ -33,9 +33,9 @@ func TestRootCause_ModelAliasMissing(t *testing.T) {
 func TestRootCause_LeakageFields(t *testing.T) {
 	t.Run("response_format_text_leak", func(t *testing.T) {
 		ir := &schema.InternalRequest{
-			Model:    "gpt-4o-mini",
-			Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
-			Stream:   true,
+			Model:          "gpt-4o-mini",
+			Messages:       []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+			Stream:         true,
 			ResponseFormat: &schema.InternalResponseFormat{Type: "text"},
 		}
 		cc := buildCCRequest(ir, "")
@@ -50,7 +50,7 @@ func TestRootCause_LeakageFields(t *testing.T) {
 	t.Run("stream_options_in_nonstream", func(t *testing.T) {
 		ir := &schema.InternalRequest{
 			Model:    "gpt-4o-mini",
-			Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
+			Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
 			Stream:   false,
 		}
 		cc := buildCCRequest(ir, "")
@@ -88,9 +88,9 @@ func TestEndToEnd_ModelAliasReplacement(t *testing.T) {
 	router := qg.Routes()
 
 	body := map[string]any{
-		"model": "gpt-4o-mini",
+		"model":    "gpt-4o-mini",
 		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-		"stream": false,
+		"stream":   false,
 	}
 	data, _ := json.Marshal(body)
 	req, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(data))
@@ -171,7 +171,7 @@ func TestCodex_SensenovaStreamOptionsFilter(t *testing.T) {
 func TestBuildCCRequest_EmptyToolSlotFiltered(t *testing.T) {
 	ir := &schema.InternalRequest{
 		Model:    "sensenova-6.8-flash-lite",
-		Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
+		Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
 		Tools: []schema.InternalTool{
 			{Type: "function"}, // nil Function
 			{Type: "function", Function: &schema.InternalFunction{Name: "read"}},

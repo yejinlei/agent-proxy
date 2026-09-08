@@ -93,7 +93,7 @@ func TestBuildCCRequest_PreservesToolCallID(t *testing.T) {
 func TestBuildCCRequest_WithoutToolCallIDOmitted(t *testing.T) {
 	ir := &schema.InternalRequest{
 		Model:    "sensenova-6.8-flash-lite",
-		Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`) }},
+		Messages: []schema.InternalMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
 	}
 	raw, _ := json.Marshal(buildCCRequest(ir, "https://token.sensenova.cn/v1"))
 	if bytes.Contains(raw, []byte(`tool_call_id`)) {
