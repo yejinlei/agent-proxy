@@ -12,6 +12,7 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"log"
 	"net"
 	"strings"
 	"testing"
@@ -277,5 +278,79 @@ func TestQWSResponseWriter_WriteFrames(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("frame payload mismatch: %q", got)
+	}
+}
+
+// TestWSWriteFailureLogged 覆盖 WS 数据帧写出失败日志：
+// WS 数据帧写出失败必须落 [CODEX-DEBUG] 日志且返回错误。
+// v0.2.121 实测 WS 静默降级 HTTPS 而日志零线索，根因就是这条路径只 return err。
+func TestWSWriteFailureLogged(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	for _, tc := range []struct {
+		name  string
+		write func() error
+	}{
+		{"quick", func() error {
+			peer, srv := net.Pipe()
+			defer peer.Close()
+			defer srv.Close()
+			peer.Close() // 对端先关，srv 侧写出必然失败
+			w := &qwsResponseWriter{conn: srv}
+			_, err := w.Write([]byte("event: response.created\ndata: {}\n\n"))
+			return err
+		}},
+		{"gateway", func() error {
+			peer, srv := net.Pipe()
+			defer peer.Close()
+			defer srv.Close()
+			peer.Close()
+			w := &wsResponseWriter{conn: srv}
+			_, err := w.Write([]byte("event: response.created\ndata: {}\n\n"))
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf.Reset()
+			if err := tc.write(); err == nil {
+				t.Fatal("expected write error against closed peer")
+			}
+			out := buf.String()
+			for _, frag := range []string{"WS frame → client FAILED", "err=", "preview="} {
+				if !strings.Contains(out, frag) {
+					t.Errorf("FAILED 日志缺片段 %q，实际: %q", frag, out)
+				}
+			}
+			if strings.Contains(out, "\n") && !strings.HasSuffix(out, "\n") {
+				t.Errorf("FAILED 日志不是单行（会被打散无法归属）: %q", out)
+			}
+			t.Logf("log: %s", out)
+		})
+	}
+}
+
+// TestWSPreview 双模式共用的帧头预览：截断到 120 字节并压成单行。
+func TestWSPreview(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"短帧原样", "event: ping", "event: ping"},
+		{"结尾换行去除", "event: done\ndata: [DONE]\n\n", "event: done data: [DONE]"},
+		{"内部换行压平", "line1\nline2", "line1 line2"},
+		{"回车压平", "a\r\nb\r", "a b"},
+		{"超长截断到120", strings.Repeat("x", 300), strings.Repeat("x", 120)},
+		{"空帧", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wsPreview([]byte(tc.in)); got != tc.want {
+				t.Errorf("wsPreview(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
