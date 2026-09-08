@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -1789,6 +1790,13 @@ type wsResponseWriter struct {
 	// @AI_GUARD: WS_FLUSHER_NOT_BUFFERED - Flush() 保持 no-op：每个 SSE 事件已是独立
 	//   WS 帧、原子到达客户端。若引入 bufio 缓冲，必须让 Flush 真正刷缓冲。
 	wroteHeader bool
+	// lastItemID 从 response.output_item.added 事件中抓取的 message id，供 WritePing
+	// 构造合法的 response.output_text.delta 心跳使用。流开始到首个真实 token 之间
+	// 上游可能静默数秒（实测 2–12s），期间没有任何活动信号会让 Codex 判定流被截断。
+	// 必须与 quick.go qwsResponseWriter 保持同步。
+	lastItemID string
+	// hbOn 是否还在发心跳。首个真实内容 delta 到达或收到 [DONE] 时置 false。
+	hbOn bool
 }
 
 func (w *wsResponseWriter) Header() http.Header {
@@ -1805,6 +1813,9 @@ func (w *wsResponseWriter) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	// 从已发出的事件里记录 item_id，供 WritePing 构造合法的 output_text.delta 心跳。
+	// 同时把「首 token 已到达」「流已收尾」这两个信号反映到 hbOn：之后不再保活。
+	w.observeHeartbeatState(b)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
@@ -1823,31 +1834,127 @@ func (w *wsResponseWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// WritePing 发送一个 RFC 6455 ping 控制帧（opcode 0x9，无 payload）。
+// WritePing 发送一个合法的 response.output_text.delta 事件（空 delta）作为 WS 保活。
 // 与 Write 共用 mu，保证与控制帧/数据帧不交错。必须同步 quick.go qwsResponseWriter.WritePing。
-// @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 ping 控制帧（opcode 0x9），不可用 text 帧（0x1）
-//   承载 `event: ping` 应用层事件：控制帧在 WS 栈内透明处理、应用层完全不可见，
-//   不会污染上层 SSE 事件流；而本项目的 handleStreamRequest 已在 isResponsesIngress 处
-//   明确禁用 Responses 入站的 SSE 层 event: ping（该 event 不属于 OpenAI Responses 事件集，
-//   插入会让 Codex 解析器状态机异常并报 stream closed before response.completed）。
-//   WS 层若继续发 text 帧 ping，等于把同一违规 payload 从另一条路送回去。
-// @RELATED: heartbeatEvent, quick.go qwsResponseWriter.WritePing, ws-keepalive-fix memory
+// @AI_GUARD: WS_HEARTBEAT_FORMAT - 必须用 Responses 事件集内的合法事件承载心跳：
+//   - v0.2.124 用 text 帧发 `event: ping`：该 event 不属于 Responses 事件集，Codex 解析器
+//     报 stream closed before response.completed（实测确认）
+//   - v0.2.125 改用 ping 控制帧（opcode 0x9）：控制帧在 WS 栈内透明处理，应用层完全
+//     不可见——按 RFC 6455 它不会重置客户端的应用层计时器，等于零保活。
+//     实测 10 轮上游首 token 延迟 2.4~12.0s，超过 10s 那几轮 Codex 仍然重连并降级 HTTPS
+//   - v0.2.126 起改用 response.output_text.delta（空 delta）：它在 Responses 事件集内，
+//     不会打挂解析器；且客户端看得见，能真正重置应用层计时器
+//
+// @CONSTRAINT: delta 的 item_id 必须与已发出的 response.output_item.added 的 item.id 一致，
+//
+//	否则 Codex 报序列异常；item 未注册前（output_item.added 未到）不发心跳
+//
+// @CONSTRAINT: 收到首个真实 token 或 output_item.done / response.completed / [DONE] 后
+//
+//	必须停止发心跳，否则会在流收尾后插入孤立 delta 事件
+//
+// @RELATED: observeHeartbeatState, quick.go qwsResponseWriter.WritePing, responses/translator.go sendSSE
 //
 // @AI_GUARD: WS_HEARTBEAT_LOG - 心跳必须打日志，否则无法区分"心跳没发"和"心跳发了但客户端没用"
-// @REASON: Write() 一直有 [CODEX-DEBUG] 日志，WritePing() 没有；v0.2.113~v0.2.116 的日志里
-//   event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区。
-//   v0.2.125 起 WritePing 从 text 帧改为控制帧：v0.2.124 实测（WS 探针，11.7s 上游静默）
-//   5s/10s 各发一个 text 帧 event: ping，Codex 仍报 stream closed before
-//   response.completed 并降级 HTTPS；同一请求走 HTTPS（全程零 ping）事件序列完整正常。
+// @REASON: Write() 一直有 [CODEX-DEBUG] WS frame 日志，WritePing() 没有；v0.2.113~v0.2.116
+//
+//	的日志里 event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区。
+//	v0.2.125 实测证明「控制帧保活」这一旧结论的前提不成立，故本约束改到合法事件上。
 func (w *wsResponseWriter) WritePing() error {
+	if !w.hbOn {
+		return nil
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.hbOn {
+		// 在判断 hbOn 与拿锁之间，handler 可能已收到首个真实 token 或流已收尾。
+		// 必须重新检查，否则往已收尾的流里塞一个孤立 delta 事件。
+		return nil
+	}
 	if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
 		return err
 	}
-	err := writeWSCtrl(w.conn, wsOpPing, nil)
-	log.Printf("[CODEX-DEBUG] WS ping → client: opcode=0x9 bytes=0 err=%v", err)
-	return err
+
+	// item 未注册阶段：只能发控制帧。它是应用层不可见的，但至少能保住 TCP 层保活，
+	// 覆盖「握手完成 -> output_item.added 到达」这段通常只有几十毫秒的空窗。
+	if w.lastItemID == "" {
+		if err := writeWSCtrl(w.conn, wsOpPing, nil); err != nil {
+			log.Printf("[CODEX-DEBUG] WS heartbeat -> client FAILED: opcode=0x9 err=%v", err)
+			return err
+		}
+		log.Printf("[CODEX-DEBUG] WS heartbeat -> client: opcode=0x9 bytes=0 (item 未注册) err=<nil>")
+		return nil
+	}
+
+	// item 已注册：发合法的 output_text.delta，格式与 responses/translator.go sendSSE 一致
+	ev := map[string]interface{}{
+		"type":          "response.output_text.delta",
+		"item_id":       w.lastItemID,
+		"output_index":  0,
+		"content_index": 0,
+		"delta":         "",
+	}
+	raw, _ := json.Marshal(ev)
+	frame := append([]byte("event: response.output_text.delta\ndata: "), raw...)
+	frame = append(frame, '\n', '\n')
+
+	if err := writeWSFrame(w.conn, frame); err != nil {
+		log.Printf("[CODEX-DEBUG] WS heartbeat -> client FAILED: bytes=%d err=%v preview=%q",
+			len(frame), err, wsPreview(frame))
+		return err
+	}
+	log.Printf("[CODEX-DEBUG] WS heartbeat -> client: bytes=%d event=response.output_text.delta item=%s err=<nil>",
+		len(frame), w.lastItemID)
+	return nil
+}
+
+// observeHeartbeatState 从写出的 SSE 帧里提取心跳需要的状态。
+// 只在 hbOn 期间做 JSON 解析（一次流最多解析到首个 delta 为止），正常路径零额外开销。
+// 必须与 quick.go qwsResponseWriter.observeHeartbeatState 保持同步。
+func (w *wsResponseWriter) observeHeartbeatState(b []byte) {
+	if !w.hbOn {
+		return
+	}
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+		// [DONE] 是终态，之后绝不能再发 delta 事件
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			w.hbOn = false
+			return
+		}
+		var ev struct {
+			Type        string `json:"type"`
+			OutputIndex int    `json:"output_index"`
+			Item        struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if json.Unmarshal(payload, &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "response.output_item.added":
+			// message item 的 id 在 item.id（不是顶层 item_id），这正是后续
+			// output_text.delta 要带的 item_id。function_call item 不产生文本 delta，跳过。
+			if ev.Item.Type == "message" && ev.Item.ID != "" {
+				w.lastItemID = ev.Item.ID
+			}
+		case "response.output_text.delta", "response.output_text.done",
+			"response.output_item.done", "response.completed":
+			// 首个真实 token 到达即代表上游开始流动，保活使命结束；
+			// 之后三个事件说明流已收尾，绝不能再插 delta。
+			w.hbOn = false
+		}
+		if !w.hbOn {
+			return
+		}
+	}
 }
 
 func (w *wsResponseWriter) WriteHeader(statusCode int) {
@@ -1907,13 +2014,17 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	wsReq.Header.Del("Sec-WebSocket-Key")
 	wsReq.Header.Del("Sec-WebSocket-Version")
 
-	wsWriter := &wsResponseWriter{conn: conn}
+	wsWriter := &wsResponseWriter{conn: conn, hbOn: true}
 
-	// WS 应用层心跳：每 15s 一个 ping 控制帧。
+	// WS 应用层心跳：每 5s 一个合法的 response.output_text.delta 事件（空 delta），
+	// 让 Codex 的应用层计时器真正重置。
 	// @AI_GUARD: WS_HEARTBEAT - 必须同步 quick.go handleResponsesWebSocket。
 	//   Responses 流式路径只在「静默 >500ms」时发 SSE ping；短内容快速回答整轮零心跳，
 	//   Codex/tungstenite keepalive 判定（~10s）可能误判停滞 → 降级 HTTP POST。
-	// @RELATED: sse_heartbeat.go StartSSEHeartbeat（SSE 层心跳，勿混用两种格式）
+	//   v0.2.124 用 text 帧 event: ping（不在 Responses 事件集内，Codex 报 stream closed
+	//   before response.completed）；v0.2.125 用 ping 控制帧（RFC 6455 下应用层不可见，
+	//   不重置应用层计时器，等于零保活）；v0.2.126 起改用合法 delta 事件。
+	// @RELATED: wsResponseWriter.WritePing, sse_heartbeat.go StartSSEHeartbeat
 	hbCtx, hbCancel := context.WithCancel(r.Context())
 	hbDone := make(chan struct{})
 	go func() {

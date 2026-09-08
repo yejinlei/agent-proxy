@@ -1,8 +1,8 @@
 package server
 
 import (
-	"testing"
 	"github.com/agent-proxy/agent-proxy/internal/db"
+	"testing"
 )
 
 func TestDefault_WithDBModelsMap(t *testing.T) {

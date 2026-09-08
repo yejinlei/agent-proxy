@@ -180,10 +180,10 @@ func getTestGatewayCache() *sync.Map {
 func TestBuildCCRequest_DevRoleMapToSystem(t *testing.T) {
 	content, _ := json.Marshal("hello")
 	req := &schema.InternalRequest{
-		Model:   "test-model",
-		Stream:  true,
+		Model:  "test-model",
+		Stream: true,
 		Messages: []schema.InternalMessage{
-			{Role: "developer", Content: content},   // should map → "system"
+			{Role: "developer", Content: content},     // should map → "system"
 			{Role: schema.RoleUser, Content: content}, // stays "user"
 		},
 	}
@@ -521,7 +521,6 @@ func TestSendUpstreamSSEError_DispatchesByIngress(t *testing.T) {
 	}
 }
 
-
 // TestE2E_ResponsesStream_UpstreamError_EmitsCompletedResponse 端到端验证：
 // 上游失败时，Responses 客户端必须拿到 response.completed 收尾，否则 Codex 报
 // "stream closed before response.completed" 并按 WS→HTTPS 降级重试。
@@ -632,96 +631,344 @@ func TestE2E_AnthropicStream_UpstreamError_KeepsMessageStart(t *testing.T) {
 	}
 }
 
-// TestWritePing_UsesControlFrameNotText 锁定 WS 心跳的帧形状。
-//
-// 背景：v0.2.124 的 WS 心跳是 text 帧（opcode 0x1），内容为 `event: ping`。
-// 但本项目的 handleStreamRequest 早已在 isResponsesIngress 处禁用 Responses 入站的
-// SSE 层 event: ping——理由写死在代码注释里：该 event 不属于 OpenAI Responses 事件集，
-// 插入会让 Codex 解析器报 "stream closed before response.completed"。WS 层却把同一个
-// 违规 payload 从另一条路送回去（WS text 帧内的内容正是按 SSE 格式解析的），
-// 导致 Responses 入站"应用层禁 ping、传输层照常 ping"，前后自相矛盾。
-//
-// v0.2.124 实测（WS 探针）：上游静默 11.7s 时 5s/10s 各收到一个 text 帧 event: ping，
-// Codex 仍报 stream closed before response.completed 并降级 HTTPS；同一请求走 HTTPS
-// （全程零 ping）事件序列完整正常。故心跳改为 RFC 6455 ping 控制帧（opcode 0x9）：
-// 控制帧在 WS 栈内透明处理、应用层完全不可见，不可能污染上层 SSE 事件流。
-func TestWritePing_UsesControlFrameNotText(t *testing.T) {
-	const (
-		opPing = 0x9
-		opText = 0x1
-		finBit = 0x80
-	)
+// TestObserveHeartbeatState_StateMachine 锁定心跳状态机：何时记下 item_id、何时停止保活。
+// 观测点只有两个：lastItemID（心跳 delta 要带的 item_id）与 hbOn（是否还在保活）。
+// 两个 writer 必须给出完全一致的结果——双模式同步约定。
+func TestObserveHeartbeatState_StateMachine(t *testing.T) {
+	qs := &qwsResponseWriter{hbOn: true}
+	gs := &wsResponseWriter{hbOn: true}
+	sse := func(eventType, data string) []byte {
+		b := []byte("event: ")
+		b = append(b, eventType...)
+		b = append(b, '\n', 'd', 'a', 't', 'a', ':', ' ')
+		b = append(b, data...)
+		b = append(b, '\n', '\n')
+		return b
+	}
+	for _, tc := range []struct {
+		name    string
+		observe func([]byte)
+		itemID  func() string
+		on      func() bool
+	}{
+		{"quick", qs.observeHeartbeatState, func() string { return qs.lastItemID }, func() bool { return qs.hbOn }},
+		{"gateway", gs.observeHeartbeatState, func() string { return gs.lastItemID }, func() bool { return gs.hbOn }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := func(itemID string, wantOn bool) {
+				if got := tc.itemID(); got != itemID {
+					t.Errorf("lastItemID = %q, want %q", got, itemID)
+				}
+				if got := tc.on(); got != wantOn {
+					t.Errorf("hbOn = %v, want %v", got, wantOn)
+				}
+			}
 
-	// check 自己持有管道两端：测试侧读 server 端，被测代码写 client 端。
-	check := func(t *testing.T, name string, ping func(net.Conn) error) {
-		t.Helper()
-		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+			// 非 message 事件不改变 item_id
+			tc.observe(sse("response.created", `{"type":"response.created"}`))
+			assert("", true)
 
-		got := make([]byte, 0, 16)
-		done := make(chan error, 1)
-		go func() {
-			buf := make([]byte, 2)
-			if _, err := io.ReadFull(server, buf); err != nil {
-				done <- err
+			// function_call item 不产生文本 delta，必须跳过：
+			// 否则心跳 delta 会挂在不能收文本的 item 上，Codex 报序列异常。
+			tc.observe(sse("response.output_item.added",
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call"}}`))
+			assert("", true)
+
+			// message item 才登记 item_id；它在 item.id 而非顶层 item_id
+			tc.observe(sse("response.output_item.added",
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_abc","type":"message"}}`))
+			assert("msg_abc", true)
+
+			// 首个真实 token 到达：item_id 保留，但保活使命结束
+			tc.observe(sse("response.output_text.delta", `{"type":"response.output_text.delta","delta":"hi"}`))
+			assert("msg_abc", false)
+
+			// 停止后不能再被 done 类事件或 [DONE] 改动（幂等，防重复收尾）
+			tc.observe(sse("response.output_text.done", `{"type":"response.output_text.done"}`))
+			tc.observe(sse("response.output_item.done", `{"type":"response.output_item.done"}`))
+			tc.observe(sse("response.completed", `{"type":"response.completed"}`))
+			tc.observe(sse("done", "[DONE]"))
+			assert("msg_abc", false)
+		})
+	}
+}
+
+// TestWritePing_HeartbeatFrames 锁定 WS 心跳在四种状态下发出的帧形状。
+//
+// 背景：v0.2.124 的 WS 心跳是 text 帧，内容为 event: ping——该 event 不属于 OpenAI
+// Responses 事件集，Codex 解析器报 stream closed before response.completed（实测确认），
+// 这是 WS 降级 HTTPS 的直接原因。v0.2.125 改用 ping 控制帧（opcode 0x9）：控制帧按
+// RFC 6455 在 WS 栈内透明处理、应用层完全不可见，因此不可能重置客户端的应用层计时器，
+// 等于零保活——实测 10 轮上游首 token 延迟 2.4~12.0s，超过 10s 那几轮 Codex 仍然重连。
+// v0.2.126 起改用 response.output_text.delta（空 delta）：它在事件集内、客户端看得见，
+// 能真正重置应用层计时器。
+func TestWritePing_HeartbeatFrames(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(net.Conn) error
+		want  byte
+	}{
+		{"quick/心跳未启用", func(c net.Conn) error {
+			return (&qwsResponseWriter{conn: c}).WritePing()
+		}, 0x0},
+		{"quick/item未注册", func(c net.Conn) error {
+			return (&qwsResponseWriter{conn: c, hbOn: true}).WritePing()
+		}, qwsOpPing},
+		{"gateway/心跳未启用", func(c net.Conn) error {
+			return (&wsResponseWriter{conn: c}).WritePing()
+		}, 0x0},
+		{"gateway/item未注册", func(c net.Conn) error {
+			return (&wsResponseWriter{conn: c, hbOn: true}).WritePing()
+		}, wsOpPing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := wsSendAndRead(t, tc.write)
+			if err != nil {
+				t.Fatalf("WritePing 出错: %v", err)
+			}
+			if tc.want == 0x0 {
+				if len(got) != 0 {
+					t.Fatalf("心跳未启用时不应发出任何字节，实际 %d 字节: % X", len(got), got)
+				}
 				return
 			}
-			done <- nil
-			got = append(got, buf...)
-		}()
-
-		if err := ping(client); err != nil {
-			t.Fatalf("%s: WritePing 出错: %v", name, err)
-		}
-
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("%s: 读帧失败: %v", name, err)
+			op, payload := wsFirstFrame(t, got)
+			if op != tc.want {
+				t.Fatalf("期望控制帧 opcode=0x9，实际 opcode=0x%X", op)
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("%s: 超时，未收到任何帧", name)
-		}
-
-		if len(got) < 2 {
-			t.Fatalf("%s: 帧过短: % X", name, got)
-		}
-		b0, b1 := got[0], got[1]
-		opcode := b0 & 0x0F
-		fin := b0&finBit != 0
-		masked := b1&0x80 != 0
-		payloadLen := int(b1 & 0x7F)
-
-		if !fin {
-			t.Errorf("%s: 控制帧必须 FIN=1，实际 b0=%#x", name, b0)
-		}
-		if masked {
-			t.Errorf("%s: 服务端控制帧不得掩码，实际 b1=%#x", name, b1)
-		}
-		if opcode != opPing {
-			t.Errorf("%s: 期望 ping 控制帧 opcode=0x9，实际 opcode=%#x", name, opcode)
-		}
-		if opcode == opText {
-			t.Errorf("%s: 期望 ping 控制帧，实际发来 text 帧——会把 SSE 事件注入应用层，"+
-				"这正是 Codex 报 stream closed before response.completed 的原因", name)
-		}
-		// RFC 6455 §5.5.2：控制帧 payload 不得超过 125 字节
-		if payloadLen > 125 {
-			t.Errorf("%s: 控制帧 payload 长度 %d 超过 125", name, payloadLen)
-		}
-		// 帧必须是完整且自洽的：声明的长度不能超出实际字节
-		if len(got) < 2+payloadLen {
-			t.Errorf("%s: 帧声明 payload %d 字节但只读到 %d 字节", name, payloadLen, len(got))
-		}
-		t.Logf("%s: b0=%#x b1=%#x opcode=%#x payloadLen=%d ✅", name, b0, b1, opcode, payloadLen)
+			if len(payload) != 0 {
+				t.Fatalf("控制帧 payload 应为空，实际 %d 字节", len(payload))
+			}
+			if got[0]&0x80 == 0 {
+				t.Fatalf("控制帧必须 FIN=1，实际 b0=%#x", got[0])
+			}
+			if got[1]&0x80 != 0 {
+				t.Fatalf("服务端控制帧不得掩码，实际 b1=%#x", got[1])
+			}
+		})
 	}
+}
 
-	check(t, "quick mode", func(c net.Conn) error {
-		return (&qwsResponseWriter{conn: c}).WritePing()
-	})
+// TestWritePing_EmitsLegalDelta 锁定 item 已注册后的心跳是合法 Responses 事件：
+// event 行、JSON 事件类型、item_id 与 output_item.added 的 item.id 一致、delta 为空串。
+func TestWritePing_EmitsLegalDelta(t *testing.T) {
+	added := sseHeartbeatFrame("response.output_item.added",
+		`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_abc","type":"message"}}`)
+	for _, tc := range []struct {
+		name  string
+		write func(net.Conn) error
+	}{
+		{"quick", func(c net.Conn) error {
+			w := &qwsResponseWriter{conn: c, hbOn: true}
+			if _, err := w.Write(added); err != nil {
+				return err
+			}
+			return w.WritePing()
+		}},
+		{"gateway", func(c net.Conn) error {
+			w := &wsResponseWriter{conn: c, hbOn: true}
+			if _, err := w.Write(added); err != nil {
+				return err
+			}
+			return w.WritePing()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := wsSendAndRead(t, tc.write)
+			if err != nil {
+				t.Fatalf("写出出错: %v", err)
+			}
+			// 第一个帧是测试写入的 output_item.added，第二个才是心跳
+			idx := 0
+			for i := 0; i < 2; i++ {
+				op, payload, used := wsParseFrame(t, got[idx:])
+				if op != qwsOpText {
+					t.Fatalf("第 %d 帧应为 text 帧，实际 opcode=0x%X", i+1, op)
+				}
+				idx += used
+				if i == 0 {
+					continue
+				}
+				lines := strings.Split(string(payload), "\n")
+				if lines[0] != "event: response.output_text.delta" {
+					t.Errorf("心跳 event 行 = %q", lines[0])
+				}
+				var ev map[string]interface{}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[1], "data: ")), &ev); err != nil {
+					t.Fatalf("心跳 data 行不是 JSON: %v: %q", err, lines[1])
+				}
+				if ev["type"] != "response.output_text.delta" {
+					t.Errorf("心跳事件类型 = %v，期望 response.output_text.delta", ev["type"])
+				}
+				if ev["item_id"] != "msg_abc" {
+					t.Errorf("心跳 item_id = %v，必须与 output_item.added 的 item.id 一致", ev["item_id"])
+				}
+				if d, ok := ev["delta"].(string); !ok || d != "" {
+					t.Errorf("心跳 delta 必须是空字符串，实际 %v", ev["delta"])
+				}
+				if oi, ok := ev["output_index"].(float64); !ok || oi != 0 {
+					t.Errorf("心跳 output_index = %v，期望 0", ev["output_index"])
+				}
+				if ci, ok := ev["content_index"].(float64); !ok || ci != 0 {
+					t.Errorf("心跳 content_index = %v，期望 0", ev["content_index"])
+				}
+			}
+		})
+	}
+}
 
-	check(t, "gateway mode", func(c net.Conn) error {
-		return (&wsResponseWriter{conn: c}).WritePing()
+// TestWritePing_StopsAfterStreamEnds 锁定 hbOn 的状态翻转：
+// 首个真实 delta 之后必须停止发心跳——否则会在流已收尾后插入孤立 delta 事件，
+// 这正是 v0.2.126 引入合法 delta 心跳后最危险的回退路径。
+func TestWritePing_StopsAfterStreamEnds(t *testing.T) {
+	qs := &qwsResponseWriter{conn: wsDrainingPipe(t), hbOn: true}
+	gs := &wsResponseWriter{conn: wsDrainingPipe(t), hbOn: true}
+	for _, tc := range []struct {
+		name      string
+		write     func([]byte) (int, error)
+		writePing func() error
+		itemID    func() string
+		on        func() bool
+	}{
+		{"quick", qs.Write, qs.WritePing,
+			func() string { return qs.lastItemID }, func() bool { return qs.hbOn }},
+		{"gateway", gs.Write, gs.WritePing,
+			func() string { return gs.lastItemID }, func() bool { return gs.hbOn }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			added := sseHeartbeatFrame("response.output_item.added",
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_abc","type":"message"}}`)
+			if _, err := tc.write(added); err != nil {
+				t.Fatalf("写入 output_item.added 失败: %v", err)
+			}
+			if !tc.on() {
+				t.Fatalf("output_item.added 不应停止保活")
+			}
+			if got := tc.itemID(); got != "msg_abc" {
+				t.Fatalf("item_id 未登记: %q", got)
+			}
+
+			delta := sseHeartbeatFrame("response.output_text.delta",
+				`{"type":"response.output_text.delta","delta":"hi"}`)
+			if _, err := tc.write(delta); err != nil {
+				t.Fatalf("写入 delta 失败: %v", err)
+			}
+			if tc.on() {
+				t.Errorf("首个真实 delta 后必须停止保活")
+			}
+
+			// 停发后 WritePing 必须静默返回 nil，不写任何字节
+			if err := tc.writePing(); err != nil {
+				t.Errorf("停止后 WritePing 出错: %v", err)
+			}
+
+			// 流收尾事件不应让 hbOn 重新打开
+			if _, err := tc.write(sseHeartbeatFrame("response.completed", `{"type":"response.completed"}`)); err != nil {
+				t.Fatalf("写入 completed 失败: %v", err)
+			}
+			if tc.on() {
+				t.Errorf("response.completed 后保活被意外重新打开")
+			}
+		})
+	}
+}
+
+// TestObserveHeartbeatState_MultiLineBatch 锁定一批多事件字节在一次 Write 里的处理：
+// 生产路径中上游可能把多个事件攒在一个 chunk 里发出，状态机必须按序处理而不是只看首个。
+func TestObserveHeartbeatState_MultiLineBatch(t *testing.T) {
+	qs := &qwsResponseWriter{hbOn: true}
+	gs := &wsResponseWriter{hbOn: true}
+	batch := append(sseHeartbeatFrame("response.output_item.added",
+		`{"type":"response.output_item.added","item":{"id":"msg_batch","type":"message"}}`),
+		sseHeartbeatFrame("response.output_text.delta", `{"type":"response.output_text.delta","delta":"x"}`)...)
+	qs.observeHeartbeatState(batch)
+	gs.observeHeartbeatState(batch)
+	if qs.lastItemID != "msg_batch" {
+		t.Errorf("quick: 批量处理后 item_id = %q, want msg_batch", qs.lastItemID)
+	}
+	if qs.hbOn {
+		t.Errorf("quick: 同一 chunk 内已出现真实 delta，保活应停止")
+	}
+	if gs.lastItemID != "msg_batch" {
+		t.Errorf("gateway: 批量处理后 item_id = %q, want msg_batch", gs.lastItemID)
+	}
+	if gs.hbOn {
+		t.Errorf("gateway: 同一 chunk 内已出现真实 delta，保活应停止")
+	}
+}
+
+// wsSendAndRead 在 net.Pipe 上跑一次写出并读回全部原始字节。
+// 管道两端由测试持有：被测代码写 client 端，测试侧读 server 端。
+// net.Pipe 忽略 write deadline，无人读取会无限阻塞，所以读端必须与写端配对启动。
+func wsSendAndRead(t *testing.T, write func(net.Conn) error) ([]byte, error) {
+	t.Helper()
+	client, srv := net.Pipe()
+	defer client.Close()
+	defer srv.Close()
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		var acc []byte
+		buf := make([]byte, 4096)
+		for {
+			n, err := srv.Read(buf)
+			if n > 0 {
+				acc = append(acc, buf[:n]...)
+			}
+			if err != nil {
+				ch <- readResult{acc, err}
+				return
+			}
+		}
+	}()
+
+	werr := write(client)
+	client.Close()
+
+	select {
+	case r := <-ch:
+		// 读端收到 EOF 是正常收尾（client 端已关闭，数据已全部排空），不算失败。
+		return r.data, werr
+	case <-time.After(3 * time.Second):
+		t.Fatal("超时，读端未退出（写端未返回或数据未被消费）")
+		return nil, werr
+	}
+}
+
+// wsDrainingPipe 返回一个可写端，对端自动排空。
+// net.Pipe 忽略 write deadline，必须有人读，否则写入会无限阻塞。
+func wsDrainingPipe(t *testing.T) net.Conn {
+	t.Helper()
+	client, srv := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			_, err := srv.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-done
+		srv.Close()
 	})
+	return client
+}
+
+// sseHeartbeatFrame 构造一个 SSE 事件帧，形状与 responses/translator.go sendSSE 一致。
+func sseHeartbeatFrame(eventType, data string) []byte {
+	b := []byte("event: ")
+	b = append(b, eventType...)
+	b = append(b, '\n', 'd', 'a', 't', 'a', ':', ' ')
+	b = append(b, data...)
+	b = append(b, '\n', '\n')
+	return b
 }
