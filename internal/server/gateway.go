@@ -184,12 +184,11 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	defer g.store.DecrActiveConns()
 
 	// 读取请求体
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readBody(r, startTime)
 	if err != nil {
-		if g.verboseLevel >= 2 {
-			log.Printf("[error] read body failed: %v", err)
-		}
-		g.sendError(w, ingressProtocol, http.StatusBadRequest, "invalid JSON", err.Error())
+		// 错误类型必须是 read_body：此处失败与 JSON 解析无关，
+		// 过去标 "invalid JSON" 会把读超时误报成客户端格式错误。
+		g.sendError(w, ingressProtocol, bodyErrStatus(err), "read_body", err.Error())
 		return
 	}
 
@@ -1664,8 +1663,10 @@ func computeAcceptKey(key string) string {
 
 // readWSFrame 读取下一个数据帧（text/binary），自动应答 ping、跳过 pong/close。
 // @AI_GUARD: WS_FRAME_CONTROL_FRAMES - 必须同步 quick.go quickReadWSFrame。
-//   Codex/tungstenite 可能在 response.create 之前先发 WS Ping（keepalive）；
-//   旧实现把任意首帧当请求体解析 → JSON 失败 → 空输入 → Codex 降级 HTTP POST。
+//
+//	Codex/tungstenite 可能在 response.create 之前先发 WS Ping（keepalive）；
+//	旧实现把任意首帧当请求体解析 → JSON 失败 → 空输入 → Codex 降级 HTTP POST。
+//
 // @CONSTRAINT: 控制帧按 RFC 6455 应答（ping→pong），close 回 1000 后断开。
 // @RELATED: quick.go quickReadWSFrame
 func readWSFrame(conn net.Conn) ([]byte, error) {

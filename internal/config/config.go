@@ -104,8 +104,12 @@ func DefaultConfig() *Config {
 
 	cfg.Server.Host = "0.0.0.0"
 	cfg.Server.Port = 8080
-	cfg.Server.ReadTimeout = 30
-	cfg.Server.WriteTimeout = 120
+	// 这两个值必须与 main.go 的启动默认值（120 / 600）保持一致。
+	// Load 先用 DefaultConfig 打底再 json.Unmarshal，配置文件里不写这两项时
+	// 保留的就是这里给的数；此处曾长期是 30 / 120，等于「配置文件一加载就把读超时
+	// 从 120s 悄悄收紧到 30s」，用户改了配置却看不到任何报错。
+	cfg.Server.ReadTimeout = 120
+	cfg.Server.WriteTimeout = 600
 	cfg.Server.MaxHeaderBytes = 1 << 20
 
 	cfg.ModelRouter.DefaultProvider = "default"
