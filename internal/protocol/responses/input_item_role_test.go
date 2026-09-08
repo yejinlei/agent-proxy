@@ -134,5 +134,24 @@ func TestInputToMessages_MixedHistory(t *testing.T) {
 	if got != "user/assistant/assistant/tool/assistant/tool/user/" {
 		t.Fatalf("role 序列不符预期，实际 %s", got)
 	}
-	t.Logf("✅ 混合历史 → %s", got)
+
+	// 工具调用的 ID 与工具结果的 tool_call_id 必须一一配对。
+	// 中枢这里保住了配对，若下游 buildCCRequest 丢了 ToolCallID，
+	// 上游就会收到悬空工具结果，模型误判文件未读取并停止调工具。
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			seen[tc.ID] = true
+		}
+		if m.Role == "tool" && m.ToolCallID == "" {
+			t.Fatalf("tool 消息缺 ToolCallID：Codex 的工具结果会变成悬空条目")
+		}
+		if m.Role == "tool" && !seen[m.ToolCallID] {
+			t.Fatalf("tool 消息 %q 在历史里没有对应的 function_call", m.ToolCallID)
+		}
+	}
+	if !seen["call_1"] || !seen["call_2"] {
+		t.Fatalf("function_call 的 call_id 未落到 ToolCalls[].ID: %v", seen)
+	}
+	t.Logf("✅ 混合历史 → %s，工具调用配对 %v", got, seen)
 }
