@@ -57,12 +57,35 @@ func (r *ResponseRequest) UnmarshalJSON(data []byte) error {
 }
 
 type InputItem struct {
-	Type       string      `json:"type"` // "message"
+	Type       string      `json:"type"` // "message" | "function_call" | "function_call_output" | "reasoning"
 	Role       string      `json:"role"`
 	Content    interface{} `json:"content"` // string | []ContentBlock
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
 	Name       string      `json:"name,omitempty"`
+
+	// @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - 非 message item 的专属字段，缺失会静默丢上下文
+	// @CONSTRAINT: Codex 会话历史里 assistant 的工具调用是 type:"function_call"
+	//   （name/call_id/arguments，arguments 为 JSON 字符串），工具执行结果紧随其后是
+	//   type:"function_call_output"（call_id/output）。这两个字段必须与 item 顶层字段并存，
+	//   否则入站侧只能靠 Content 里的 tool_calls/tool_result 兜底，客户端用标准 item 时上下文全丢。
+	// @REASON: v0.2.119 — 原先整个非 "message" item 被 inputToMessages 丢弃（26→18 条），
+	//   Codex 工具调用结果回灌历史时模型看不到真实输出，只能顺着幻觉编内容。
+	CallID    string          `json:"call_id,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
+	Output    interface{}     `json:"output,omitempty"`
+	RawFields map[string]any  `json:"-"` // 解析后的原始 item 字段，供日志统计未知 item 类型
+}
+
+// UnmarshalJSON 先按 map 解析原始字段（供日志统计），再按强类型字段解析。
+func (i *InputItem) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	i.RawFields = raw
+	type alias InputItem
+	return json.Unmarshal(data, (*alias)(i))
 }
 
 type Tool struct {

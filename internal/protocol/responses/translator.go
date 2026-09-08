@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -164,120 +165,263 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 
 func inputToMessages(items []InputItem) []schema.InternalMessage {
 	var msgs []schema.InternalMessage
+
+	// droppedTypes 统计无法映射到 InternalMessage 的 item 类型：
+	// function_call / function_call_output 现在有专门分支，只有 reasoning 等
+	// 仍会被忽略——必须留日志，否则 "26→18 条"这类静默丢失永远无法归因。
+	droppedTypes := map[string]int{}
+
 	for _, item := range items {
 		// type 为空时默认 "message"（部分客户端省略 type 字段）
 		itemType := item.Type
 		if itemType == "" {
 			itemType = "message"
 		}
-		if itemType != "message" {
-			continue
+
+		switch itemType {
+		case "message":
+			// @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - 非 message item 不再整条丢弃
+			// @CONSTRAINT: 每类 Responses input item 必须显式落在某个 case 上；新增类型时
+			//   必须加分支或确认 default 的丢弃是预期的（会打 [CODEX-DEBUG] 日志）。
+			// @REASON: v0.2.119 — 原实现 itemType != "message" 直接 continue，Codex 会话里
+			//   assistant 的 function_call 与 function_call_output 全部消失（26→18 / 28→20 / 30→22），
+			//   上游模型看不到自己发起过的工具调用和真实输出，只能顺着幻觉重复。
+			msg, ok := itemToMessage(item)
+			if ok {
+				msgs = append(msgs, msg)
+			}
+		case "function_call":
+			msg, ok := itemToMessage(item)
+			if ok {
+				msgs = append(msgs, msg)
+			} else {
+				droppedTypes[itemType]++
+			}
+		case "function_call_output":
+			msgs = append(msgs, functionCallOutputItemToMessage(item))
+		default:
+			droppedTypes[itemType]++
 		}
+	}
 
-		msg := schema.InternalMessage{Role: schema.Role(item.Role)}
+	if len(droppedTypes) > 0 {
+		names := make([]string, 0, len(droppedTypes))
+		for name, n := range droppedTypes {
+			names = append(names, fmt.Sprintf("%s=%d", name, n))
+		}
+		sort.Strings(names)
+		log.Printf("[CODEX-DEBUG] inputToMessages: input_items=%d messages=%d dropped=%s",
+			len(items), len(msgs), strings.Join(names, ","))
+	}
 
-		// 提取 text + 内容块
-		var text string
-		var textParts []string
-		var contentBlocks []schema.InternalContentBlock
-		switch c := item.Content.(type) {
-		case string:
-			text = c
-		case []interface{}:
-			// content blocks
-			for _, cb := range c {
-				block, ok := cb.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				switch block["type"] {
-				case "output_text", "input_text":
-					if t, ok := block["text"].(string); ok {
-						textParts = append(textParts, t)
-						contentBlocks = append(contentBlocks, schema.InternalContentBlock{
-							Type: "text",
-							Text: t,
-						})
-					}
-				case "input_image":
-					var icb schema.InternalContentBlock
-					icb.Type = "image"
-					if source, ok := block["source"].(map[string]interface{}); ok {
-						switch source["type"] {
-						case "base64":
-							if data, ok := source["data"].(string); ok {
-								icb.Data = data
-							}
-							if mediaType, ok := source["media_type"].(string); ok {
-								icb.MediaType = mediaType
-							}
-						case "url":
-							if url, ok := source["url"].(string); ok {
-								icb.URL = url
-							}
-						}
-					}
-					contentBlocks = append(contentBlocks, icb)
-				case "tool_result":
-					var toolCallID string
-					if tcid, ok := block["tool_call_id"].(string); ok {
-						toolCallID = tcid
-					}
-					if toolCallID == "" {
-						toolCallID = item.ToolCallID
-					}
-					var toolText string
-					switch toolContent := block["content"].(type) {
-					case string:
-						toolText = toolContent
-					case []interface{}:
-						for _, sub := range toolContent {
-							if subBlock, ok := sub.(map[string]interface{}); ok {
-								if subText, ok := subBlock["text"].(string); ok {
-									toolText += subText
-								}
-							}
-						}
-					}
-					toolContentJSON, _ := json.Marshal(toolText)
-					msgs = append(msgs, schema.InternalMessage{
-						Role:       schema.Role("tool"),
-						ToolCallID: toolCallID,
-						Content:    toolContentJSON,
+	return msgs
+}
+
+// itemToMessage 把单个 type:"message"（或 type:"function_call"）item 转为 InternalMessage。
+// 返回 false 表示该 item 无可转换内容（空文本 + 无内容块 + 无工具调用）。
+// @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - 工具调用有两种来源形态
+// @CONSTRAINT: 优先 item.ToolCalls（CC 嵌套形态）；没有时用 item.Name + item.Arguments。
+//   Arguments 必须保持 JSON 字符串原样，禁止 Unmarshal 成 map 再 Marshal（会丢顺序/转义，
+//   且与 @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING 冲突）。
+func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
+	msg := schema.InternalMessage{Role: schema.Role(item.Role)}
+
+	// 提取 text + 内容块
+	var text string
+	var textParts []string
+	var contentBlocks []schema.InternalContentBlock
+	switch c := item.Content.(type) {
+	case string:
+		text = c
+	case []interface{}:
+		// content blocks
+		for _, cb := range c {
+			block, ok := cb.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "output_text", "input_text", "text":
+				// @AI_GUARD: RESPONSES_TEXT_BLOCK_TYPES - "text" 块必须与 input_text/output_text 等价
+				// @CONSTRAINT: 非 Codex 客户端常发 {"type":"text","text":...}；此前被静默丢弃 →
+				//   请求变成"只有 system 没有 user" → 上游 400 "No user query found in messages."
+				// @REASON: v0.2.119 健壮性修复；Codex 自身用 input_text/output_text，不受影响。
+				if t, ok := block["text"].(string); ok {
+					textParts = append(textParts, t)
+					contentBlocks = append(contentBlocks, schema.InternalContentBlock{
+						Type: "text",
+						Text: t,
 					})
 				}
+			case "input_image":
+				var icb schema.InternalContentBlock
+				icb.Type = "image"
+				if source, ok := block["source"].(map[string]interface{}); ok {
+					switch source["type"] {
+					case "base64":
+						if data, ok := source["data"].(string); ok {
+							icb.Data = data
+						}
+						if mediaType, ok := source["media_type"].(string); ok {
+							icb.MediaType = mediaType
+						}
+					case "url":
+						if url, ok := source["url"].(string); ok {
+							icb.URL = url
+						}
+					}
+				}
+				contentBlocks = append(contentBlocks, icb)
+			case "tool_result":
+				var toolCallID string
+				if tcid, ok := block["tool_call_id"].(string); ok {
+					toolCallID = tcid
+				}
+				if toolCallID == "" {
+					toolCallID = item.ToolCallID
+				}
+				if toolCallID == "" {
+					toolCallID = item.CallID
+				}
+				var toolText string
+				switch toolContent := block["content"].(type) {
+				case string:
+					toolText = toolContent
+				case []interface{}:
+					for _, sub := range toolContent {
+						if subBlock, ok := sub.(map[string]interface{}); ok {
+							if subText, ok := subBlock["text"].(string); ok {
+								toolText += subText
+							}
+						}
+					}
+				}
+				toolContentJSON, _ := json.Marshal(toolText)
+				return schema.InternalMessage{
+					Role:       schema.Role("tool"),
+					ToolCallID: toolCallID,
+					Content:    toolContentJSON,
+				}, true
 			}
-			text = joinText(textParts)
 		}
-		msg.Content, _ = json.Marshal(text)
-		if len(contentBlocks) > 0 {
-			msg.ContentBlocks = contentBlocks
-		}
-
-		// Tool calls
-		for _, tc := range item.ToolCalls {
-			argsJSON, _ := json.Marshal(tc.Input)
-			msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
-				ID:   tc.ID,
-				Type: tc.Type,
-				Function: struct {
-					Name         string          `json:"name"`
-					Arguments    string          `json:"arguments"`
-					RawArguments json.RawMessage `json:"-"`
-				}{
-					Name:         tc.Name,
-					Arguments:    string(argsJSON),
-					RawArguments: argsJSON,
-				},
-			})
-		}
-
-		if text == "" && len(contentBlocks) == 0 && len(msg.ToolCalls) == 0 {
-			continue
-		}
-		msgs = append(msgs, msg)
+		text = joinText(textParts)
 	}
-	return msgs
+	msg.Content, _ = json.Marshal(text)
+	if len(contentBlocks) > 0 {
+		msg.ContentBlocks = contentBlocks
+	}
+
+	// Tool calls：优先 item.ToolCalls（旧/CC 嵌套形态）
+	for _, tc := range item.ToolCalls {
+		argsJSON, _ := json.Marshal(tc.Input)
+		msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
+			ID:   tc.ID,
+			Type: tc.Type,
+			Function: struct {
+				Name         string          `json:"name"`
+				Arguments    string          `json:"arguments"`
+				RawArguments json.RawMessage `json:"-"`
+			}{
+				Name:         tc.Name,
+				Arguments:    string(argsJSON),
+				RawArguments: argsJSON,
+			},
+		})
+	}
+
+	// 标准 Responses 形态：function_call item 的 name + arguments（JSON 字符串）
+	if len(item.ToolCalls) == 0 && item.Name != "" {
+		args := strings.TrimSpace(item.Arguments)
+		if args == "" {
+			args = "{}"
+		}
+		callID := item.CallID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%s_%d", item.Name, time.Now().UnixNano())
+		}
+		msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
+			ID:   callID,
+			Type: "function",
+			Function: struct {
+				Name         string          `json:"name"`
+				Arguments    string          `json:"arguments"`
+				RawArguments json.RawMessage `json:"-"`
+			}{
+				Name:         item.Name,
+				Arguments:    args,
+				RawArguments: json.RawMessage(args),
+			},
+		})
+	}
+
+	if text == "" && len(contentBlocks) == 0 && len(msg.ToolCalls) == 0 {
+		return msg, false
+	}
+	return msg, true
+}
+
+// functionCallOutputItemToMessage 把 type:"function_call_output" item 转为 role=tool 消息。
+// @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - output 字段形态不固定，必须逐级兜底
+// @CONSTRAINT: OpenAI 规范里 output 是数组（[{type:"text",text:...}] / [{type:"refusal"}]），
+//   实际客户端也可能发字符串或对象。任何提取失败仍要产出带 call_id 的 tool 消息，
+//   不能让上游出现"有调用无结果"的悬空配对。
+func functionCallOutputItemToMessage(item InputItem) schema.InternalMessage {
+	text := extractOutputText(item.Output)
+	if text == "" {
+		text = extractOutputText(item.Content)
+	}
+	contentJSON, _ := json.Marshal(text)
+	return schema.InternalMessage{
+		Role:       schema.Role("tool"),
+		ToolCallID: item.CallID,
+		Content:    contentJSON,
+	}
+}
+
+// extractOutputText 从 function_call_output 的 output/content 字段提取纯文本。
+func extractOutputText(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []interface{}:
+		var parts []string
+		for _, sub := range t {
+			if s, ok := sub.(map[string]interface{}); ok {
+				switch s["type"] {
+				case "text", "output_text", "input_text":
+					if st, ok := s["text"].(string); ok {
+						parts = append(parts, st)
+					}
+				case "refusal":
+					if sr, ok := s["refusal"].(string); ok {
+						parts = append(parts, sr)
+					}
+				default:
+					if nested := extractOutputText(s["content"]); nested != "" {
+						parts = append(parts, nested)
+					}
+					if st, ok := s["text"].(string); ok {
+						parts = append(parts, st)
+					}
+				}
+			}
+		}
+		return joinText(parts)
+	case map[string]interface{}:
+		if inner := extractOutputText(t["content"]); inner != "" {
+			return inner
+		}
+		if st, ok := t["text"].(string); ok {
+			return st
+		}
+		b, _ := json.Marshal(t)
+		return string(b)
+	case nil:
+		return ""
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -456,6 +600,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	var accumulatedText strings.Builder
 	var lastModel string
 	var lastUsage *Usage
+	// @AI_GUARD: RESPONSES_FINISH_REASON_LOG - finish_reason 必须在流末尾落日志
+	// @CONSTRAINT: quick.go/gateway.go 的翻译流 goroutine 只保留 accumulatedUsage，
+	//   上游 choice.FinishReason 在这里是唯一能被观测到的点。丢失后无法从日志区分
+	//   stop / length / tool_calls / content_filter，也就无法定位"模型被截断"这类故障。
+	// @REASON: v0.2.119 — 请求行长期显示 "Token: —"，Codex 幻觉循环无法归因。
+	var lastFinishReason string
+	var nDeltaEvents int
+	var nTextDeltas int
+	var nFuncArgsDeltas int
 	createdSent := false
 	itemAdded := false
 	textDoneSent := false
@@ -567,6 +720,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 	sendTextDelta := func(text string) {
 		sendOutputItemAddedMsg()
+		nTextDeltas++
 		sendSSE("response.output_text.delta", map[string]interface{}{
 			"type":          "response.output_text.delta",
 			"item_id":       messageID,
@@ -682,6 +836,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		if delta == "" {
 			return
 		}
+		nFuncArgsDeltas++
 		sendSSE("response.function_call_arguments.delta", map[string]interface{}{
 			"type":         "response.function_call_arguments.delta",
 			"item_id":      fc.CallID,
@@ -693,7 +848,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	// finalizeItems 按协议顺序收尾所有已打开的 item：
 	// 先关 message（output_text.done + output_item.done），再逐个关 function_call。
 	// @AI_GUARD: RESPONSES_ITEM_ORDER - completed 前必须关闭所有 opened item，且 added/done 一一配对
-	finalizeItems := func(status string) []interface{} {
+	// @AI_GUARD: RESPONSES_FINISH_REASON_LOG - 终态响应必须带 finish_reason/incomplete_details
+	// @CONSTRAINT: Codex 依赖 response.completed.response.finish_reason 判定本轮是否被截断；
+	//   缺失时它无法区分"模型说完了"和"上游掐断了"。有 function_call item 时为 "function_call"，
+	//   否则取上游 finish_reason（缺失回退 "stop"）。
+	finalizeItems := func(status, finishReason string) []interface{} {
 		sendCreated()      // 兜底：保证 created + msg added 存在
 		msgItem := closeMessageItem(status)
 		output := make([]interface{}, 0, 1+len(funcCallOrder))
@@ -720,12 +879,24 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	}
 
 	sendCompleted := func() {
-		output := finalizeItems("completed")
+		finishReason := lastFinishReason
+		if finishReason == "" {
+			if len(funcCallOrder) > 0 {
+				finishReason = "function_call"
+			} else {
+				finishReason = "stop"
+			}
+		}
+		output := finalizeItems("completed", finishReason)
 
 		respPayload := map[string]interface{}{
-			"id":     responseID,
-			"status": "completed",
-			"output": output,
+			"id":            responseID,
+			"status":        "completed",
+			"output":        output,
+			"finish_reason": finishReason,
+			"incomplete_details": map[string]interface{}{
+				"reason": nil,
+			},
 		}
 		if lastModel != "" {
 			respPayload["model"] = lastModel
@@ -739,6 +910,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			"type":     "response.completed",
 			"response": respPayload,
 		})
+
+		// @AI_GUARD: RESPONSES_FINISH_REASON_LOG - 流结束必须落一条可 grep 的汇总日志
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d usage=%v",
+			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
+			nDeltaEvents, respPayload["usage"])
 
 		sendDoneSSE()
 	}
@@ -771,24 +947,38 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			switch event.Type {
 			case "error":
 				// @AI_GUARD: RESPONSES_STREAM_ERROR_TEARDOWN - 上游错误时必须补发完整结束序列
-				// @CONSTRAINT: Codex 状态机要求 response.completed 作为终态标记；只发 response.failed + [DONE]
+				// @CONSTRAINT: Codex 状态机要求 response.completed 作为终态标记；只发 response.error + [DONE]
 				//   会让 Codex 报 "stream closed before response.completed"（见 CLAUDE.md Responses SSE 生命周期）
 				// @RELATED: sendCompleted() 正常结束路径, anthropic/translator.go 错误路径
 				// @REASON: v0.2.98 在限流(429 rpm exhausted)场景下 error 分支跳过 sendCompleted，
 				//   导致 Codex 永远收不到 response.completed，报 stream closed before response.completed
+				//   v0.2.119 在保留 completed 的前提下补发 response.error，
+				//   让按事件类型分发的客户端能看到真正的错误而非"干净完成 + 空内容"。
 				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
 					event.Error.Code, event.Error.Type, event.Error.Message)
-				streamErr := t.TranslateError(event.Error) // {"error":{...}} RawMessage
+				streamErr := t.TranslateError(event.Error) // {"error":{...}} RawMessage（协议级错误事件复用）
+				_ = streamErr
+				errObj := streamErrorObject(event.Error)   // 单层 error 对象，供 response.error/completed 内嵌
 
 				// 关闭所有已打开 item（message + 已出现的 fc），status=failed
-				output := finalizeItems("failed")
+				output := finalizeItems("failed", "stop")
 
-				// response.completed 作为终态，response.error 携带上游错误信息
+				// 独立 response.error 事件：按事件类型分发的客户端靠它识别失败
+				sendSSE("response.error", map[string]interface{}{
+					"type":  "response.error",
+					"error": errObj,
+				})
+
+				// response.completed 作为终态，携带同一 error 对象
 				respPayload := map[string]interface{}{
-					"id":     responseID,
-					"status": "failed",
-					"output": output,
-					"error":  json.RawMessage(streamErr),
+					"id":            responseID,
+					"status":        "failed",
+					"output":        output,
+					"error":         errObj,
+					"finish_reason": "stop",
+					"incomplete_details": map[string]interface{}{
+						"reason": "max_output_tokens",
+					},
 				}
 				if lastModel != "" {
 					respPayload["model"] = lastModel
@@ -802,6 +992,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"type":     "response.completed",
 					"response": respPayload,
 				})
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=stop text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d http=%d upstream_type=%q upstream_msg=%.200s",
+					lastModel, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
+					nDeltaEvents, nFuncArgsDeltas,
+					event.Error.Code, event.Error.Type, event.Error.Message)
 				sendDoneSSE()
 				return
 
@@ -814,8 +1008,12 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 			case "delta":
 				sendCreated()
+				nDeltaEvents++
 				if event.Data != nil && len(event.Data.Choices) > 0 {
 					choice := event.Data.Choices[0]
+					if choice.FinishReason != "" {
+						lastFinishReason = choice.FinishReason
+					}
 
 					if choice.Message.Content != nil {
 						var text string
@@ -1381,13 +1579,57 @@ func (t *ResponsesTranslator) TranslateStreamToCCSSE(ctx context.Context, events
 
 func (t *ResponsesTranslator) TranslateError(err *schema.StreamError) json.RawMessage {
 	errData, _ := json.Marshal(map[string]interface{}{
-		"error": map[string]interface{}{
-			"message": err.Message,
-			"type":    "invalid_request_error",
-			"code":    err.Type,
-		},
+		"error": streamErrorObject(err),
 	})
 	return errData
+}
+
+// streamErrorObject 返回 Responses 协议单层的 error 对象（不含外层 "error" 信封）。
+// @AI_GUARD: RESPONSES_ERROR_SHAPE - 错误对象必须单层，禁止信封套信封
+// @CONSTRAINT: TranslateError 产出 {"error":{...}} 信封供 writeData/writeStreamEvent
+//   直接作为 SSE data 行；TranslateStream 的 error 分支要把它嵌进
+//   response.completed.response.error，若复用信封就变成 {"error":{"error":{...}}}，
+//   Codex 取 response.error.message 得到 undefined。
+// @REASON: v0.2.119 — 上游 4xx 曾呈现为"成功但空内容"，且 error.message 是双重 JSON 编码
+//   （错误体被 json.Marshal 成字符串再塞进 message 字段），客户端完全无法归因。
+//   这里对 Message 是 JSON 对象时先解析还原，保持 message 为人类可读字符串。
+func streamErrorObject(err *schema.StreamError) map[string]interface{} {
+	obj := map[string]interface{}{}
+	if err == nil {
+		return obj
+	}
+
+	msg := strings.TrimSpace(err.Message)
+	// 上游错误体常见为 JSON 对象；优先抽出其自带 message/error 字段
+	if strings.HasPrefix(msg, "{") {
+		var body map[string]any
+		if json.Unmarshal([]byte(msg), &body) == nil {
+			if m, ok := body["message"].(string); ok && m != "" {
+				msg = m
+			} else if m, ok := body["error"].(string); ok && m != "" {
+				msg = m
+			} else if e, ok := body["error"].(map[string]any); ok {
+				if m2, ok2 := e["message"].(string); ok2 && m2 != "" {
+					msg = m2
+				}
+			}
+		}
+	}
+	if msg != "" {
+		obj["message"] = msg
+	} else {
+		obj["message"] = "upstream error"
+	}
+
+	if err.Type != "" {
+		obj["type"] = err.Type
+	} else {
+		obj["type"] = "invalid_request_error"
+	}
+	if err.Code != 0 {
+		obj["code"] = err.Code
+	}
+	return obj
 }
 
 // ToCCStreamChunk 构建 CC 格式流式块
