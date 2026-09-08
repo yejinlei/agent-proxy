@@ -1304,7 +1304,7 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 		<-callFinished2
 		if err2 != nil {
 			log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
-			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
+			sendUpstreamSSEError(w, flusher, r, nil, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
 		// 过滤 thinking + description + 修复 usage
@@ -1676,7 +1676,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		<-callFinished2
 		if err2 != nil {
 			log.Printf("[passthrough] fallback non-stream also failed: %s=%s ctx_err=%v err=%v", aliasModel, realModel, ctx.Err(), err2)
-			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
+			sendUpstreamSSEError(w, flusher, r, nil, fmt.Errorf("stream error: %w; fallback non-stream error: %w", err, err2))
 			return
 		}
 		// 过滤 thinking + description + 修复 usage
@@ -1770,7 +1770,7 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 						}
 						w.Write([]byte(`event: message_start` + "\n" +
 							fmt.Sprintf(`data: {"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`, msgID, echoModel) + "\n\n"))
-						sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
+						sendUpstreamSSEError(w, flusher, r, nil, fmt.Errorf("stream error: %s; fallback non-stream error: %w", errData, err2))
 						return
 					}
 					// 过滤 thinking + description + 修复 usage
@@ -1961,6 +1961,127 @@ func sendSSEErrorBody(w http.ResponseWriter, flusher http.Flusher, errorType, er
 	// 发送 message_stop 终止 SSE 流（带 event: 前缀）
 	w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	flusher.Flush()
+}
+
+// ingressProtocolOf 返回入站协议标识（"responses" / "chatcompletion" / "anthropic" / "gemini"）。
+// 从路径解析，与 Routes() 的分发规则保持一致：
+//   /v1/responses*                    → responses
+//   /v1/messages*                     → anthropic
+//   /v1/models/*:generateContent*     → gemini
+//   其余 /v1/*（含 /v1/chat/completions） → chatcompletion
+//
+// 只在 SSE 错误出口用。sseErrorProtocol 据此选择事件形状，避免把 Anthropic
+// 的 message_start 发给 Responses 客户端（详见 sendResponsesSSEError）。
+func ingressProtocolOf(r *http.Request) string {
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/v1/responses"):
+		return "responses"
+	case strings.HasPrefix(r.URL.Path, "/v1/messages"):
+		return "anthropic"
+	case strings.Contains(r.URL.Path, ":generateContent"):
+		return "gemini"
+	default:
+		return "chatcompletion"
+	}
+}
+
+// sseErrorProtocol 返回发 SSE 错误事件时应采用的入站协议。
+// 优先级：显式已知协议 > internalReq.Protocol > 从请求路径解析 > anthropic。
+// 复杂模式（gateway.go）直接持有 ingressProtocol 字符串；快速模式的调用点
+// 有请求对象或 internalReq。三条路径任一命中即可。
+func sseErrorProtocol(known string, r *http.Request, internalReq *schema.InternalRequest) string {
+	if known != "" {
+		return known
+	}
+	if r != nil {
+		if p := ingressProtocolOf(r); p != "" {
+			return p
+		}
+	}
+	if internalReq != nil && internalReq.Protocol != "" {
+		return internalReq.Protocol
+	}
+	return "anthropic"
+}
+
+// sendResponsesSSEError 向 Responses（OpenAI Responses API）客户端发 SSE 错误终态。
+//
+// 与 sendSSEErrorFromUpstream 的分工：后者产出 Anthropic 事件序列
+// （message_start → event: error → message_stop），Codex 等 Responses 客户端
+// 不认识这套事件，会一直等到超时。
+//
+// 这里产出 Responses 自己的终态序列，与 internal/protocol/responses/translator.go
+// TranslateStream 的 error 分支保持一致（error 对象单层、finish_reason 不用
+// max_output_tokens、incomplete_details.reason 为 null）：
+//
+//	response.error → response.completed(status=failed, 含 error) → event: done [DONE]
+//
+// 关键约束：Codex 只认 response.* 事件，且要求流以 response.completed 收尾。
+// 少了 completed 或 [DONE]，客户端报 "stream closed before response.completed"
+// 并按 WS→HTTPS 降级重试。error 对象必须是单层（不能信封套信封，否则
+// response.error.message 取到 undefined）。
+func sendResponsesSSEError(w http.ResponseWriter, flusher http.Flusher, err error) {
+	errorObj := map[string]interface{}{
+		"message": err.Error(),
+		"type":    "upstream_error",
+	}
+	// response.error 事件自身带 type 字段，与 translator 的 sendSSE 包装保持一致。
+	// error 对象放在 error 字段内，且保持单层——不能信封套信封。
+	respErrEv := map[string]interface{}{
+		"type":  "response.error",
+		"error": errorObj,
+	}
+	b, _ := json.Marshal(respErrEv)
+	w.Write([]byte("event: response.error\ndata: " + string(b) + "\n\n"))
+	completed := map[string]interface{}{
+		"type": "response.completed",
+		"response": map[string]interface{}{
+			"id":            fmt.Sprintf("resp_%d", time.Now().UnixNano()),
+			"status":        "failed",
+			"error":         errorObj,
+			"output":        []map[string]interface{}{},
+			"finish_reason": "stop",
+			"incomplete_details": map[string]interface{}{
+				"reason": nil,
+			},
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+				"total_tokens":  0,
+			},
+		},
+	}
+	cb, _ := json.Marshal(completed)
+	w.Write([]byte("event: response.completed\ndata: " + string(cb) + "\n\n"))
+
+	w.Write([]byte("event: done\ndata: [DONE]\n\n"))
+	flusher.Flush()
+}
+
+// sendUpstreamSSEError 是所有「SSE 头已发出后需要回错误」的唯一出口。
+// 按入站协议选择事件形状：Responses 走 sendResponsesSSEError，其余走
+// sendSSEErrorFromUpstream（Anthropic 形状，Claude Code 需要 message_start 开头）。
+//
+// 过去这里直连 sendSSEErrorFromUpstream，所有协议都拿到 Anthropic 事件序列。
+// Responses 客户端（Codex）只认 response.* 事件，收到 message_start 后一直等
+// response.completed，最终报 "stream closed before response.completed" 并
+// 触发 WS→HTTPS 降级重试。
+//
+// 所有调用点只传 (r, internalReq) 让 sseErrorProtocol 判定，调用方不需要
+// 各自知道协议，避免新增分支时漏掉某个协议。
+func sendUpstreamSSEError(w http.ResponseWriter, flusher http.Flusher, r *http.Request, internalReq *schema.InternalRequest, err error) {
+	writeUpstreamSSEError(w, flusher, sseErrorProtocol("", r, internalReq), err)
+}
+
+// writeUpstreamSSEError 在已知入站协议时选择 SSE 错误事件形状。
+// 供两个 dispatcher 共用：quick.go 从请求/internalReq 解析，gateway.go 直接
+// 传入已知的 ingressProtocol。集中在此避免两处各写一份协议分支。
+func writeUpstreamSSEError(w http.ResponseWriter, flusher http.Flusher, ingressProtocol string, err error) {
+	if ingressProtocol == "responses" {
+		sendResponsesSSEError(w, flusher, err)
+		return
+	}
+	sendSSEErrorFromUpstream(w, flusher, err)
 }
 
 // probeStreamPrefer 后台异步探测 SSE 速度，完成后写入 streamPrefer 偏好
@@ -2398,7 +2519,7 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 		if q.verboseLevel >= 2 {
 			log.Printf("[sse-error] passthrough-nonstream-as-sse → SSE error event (was JSON)")
 		}
-		sendSSEErrorFromUpstream(w, flusher, err)
+		sendUpstreamSSEError(w, flusher, r, nil, err)
 		flusher.Flush()
 		return
 	}
@@ -2576,7 +2697,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 		if q.verboseLevel >= 2 {
 			log.Printf("[sse-error] translation-nonstream-as-sse → SSE error event (was JSON)")
 		}
-		sendSSEErrorFromUpstream(w, flusher, err)
+		sendUpstreamSSEError(w, flusher, nil, internalReq, err)
 		flusher.Flush()
 		return
 	}
@@ -2593,7 +2714,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 			if q.verboseLevel >= 2 {
 				log.Printf("[sse-error] translation-nonstream-as-sse → TranslateFromProvider failed: %v", err)
 			}
-			sendSSEErrorFromUpstream(w, flusher, err)
+			sendUpstreamSSEError(w, flusher, nil, internalReq, err)
 			flusher.Flush()
 			return
 		}
@@ -2604,7 +2725,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 			if q.verboseLevel >= 2 {
 				log.Printf("[sse-error] translation-nonstream-as-sse → json.Unmarshal failed: %v", err)
 			}
-			sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("parse error: %w", err))
+			sendUpstreamSSEError(w, flusher, nil, internalReq, fmt.Errorf("parse error: %w", err))
 			return
 		}
 		internalResp = chatCompletionToInternal(&ccResp)
@@ -2718,7 +2839,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件
 		log.Printf("[stream] upstream stream error: %s err=%v", q.proxyBaseURL, err)
-		sendSSEErrorFromUpstream(w, flusher, fmt.Errorf("stream error: %w", err))
+		sendUpstreamSSEError(w, flusher, nil, internalReq, fmt.Errorf("stream error: %w", err))
 		return
 	}
 
