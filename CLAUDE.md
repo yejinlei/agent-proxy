@@ -232,7 +232,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 54 项；`grep -rn "@AI_GUARD:" internal/` 实际有 129 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 55 项；`grep -rn "@AI_GUARD:" internal/` 实际有 131 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -267,8 +267,9 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TRANSLATE_STREAM` | responses/translator.go | Responses SSE 流式出口（Codex 兼容，必须生成完整事件序列：response.created → output_item.added → output_text.delta → output_item.done → response.completed） |
 | `RESPONSES_TRANSLATE_STREAM_EVENT` | responses/translator.go | 上游 Responses SSE → InternalStreamEvent |
 | `RESPONSES_INPUT_ITEM_TYPES` | responses/types.go + translator.go | 入站 input 必须识别 `function_call`/`function_call_output`/`reasoning` item，禁止整条丢弃（Codex 工具回灌历史靠它） |
+| `RESPONSES_FC_ROLE_DEFAULT` | responses/translator.go | 入站 item 缺 `role` 必须补默认（`function_call`→assistant；`input_text` 块→user；其余→assistant），否则上游 400 `Messages[N].Role invalid` |
 | `RESPONSES_TEXT_BLOCK_TYPES` | responses/translator.go | 内容块必须同时接受 `text`/`input_text`/`output_text`，否则上游 400 No user query found |
-| `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`），禁止信封套信封；message 为 JSON 时需还原为字符串 |
+| `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`）；`status=failed` 时 `incomplete_details.reason` 必须为 null，写 `max_output_tokens` 会让客户端误判成输出截断 |
 | `RESPONSES_FINISH_REASON_LOG` | responses/translator.go | 流终态必须带 finish_reason/incomplete_details，并落一条 `[CODEX-DEBUG] TranslateStream END` 汇总日志 |
 | **模型别名** | | |
 | `ALIAS_RESOLVE` | db/aliasfile.go | 别名解析核心，三层优先级 |

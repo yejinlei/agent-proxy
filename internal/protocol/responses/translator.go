@@ -225,6 +225,27 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 //   且与 @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING 冲突）。
 func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 	msg := schema.InternalMessage{Role: schema.Role(item.Role)}
+	if msg.Role == "" {
+		// @AI_GUARD: RESPONSES_FC_ROLE_DEFAULT - 缺 role 的 item 必须补默认 role，否则上游 400
+		// @CONSTRAINT: OpenAI 系上游强校验 messages[].role 非空；空 role → 400
+		//   "field Messages[N].Role invalid, should be set"，整条流 0 delta 直接失败。
+		//   function_call item（Codex 历史里的工具调用）不带 role，且工具调用只能挂在 assistant 上；
+		//   message item 省略 role 时按内容块类型推断：input_text 属用户，其余视为 assistant。
+		// @REASON: v0.2.119 修好「非 message item 整条丢弃」后，历史里的 function_call 第一次真正
+		//   送到上游，立刻暴露这个空 role 回归（实测两次 400，全部 0 delta）。
+		// @RELATED: inputToMessages 的 "function_call" 分支、functionCallOutputItemToMessage
+		msg.Role = schema.Role("assistant")
+		if item.Type != "function_call" {
+			if blocks, ok := item.Content.([]interface{}); ok {
+				for _, cb := range blocks {
+					if m, ok := cb.(map[string]interface{}); ok && m["type"] == "input_text" {
+						msg.Role = schema.Role("user")
+						break
+					}
+				}
+			}
+		}
+	}
 
 	// 提取 text + 内容块
 	var text string
@@ -852,7 +873,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	// @CONSTRAINT: Codex 依赖 response.completed.response.finish_reason 判定本轮是否被截断；
 	//   缺失时它无法区分"模型说完了"和"上游掐断了"。有 function_call item 时为 "function_call"，
 	//   否则取上游 finish_reason（缺失回退 "stop"）。
-	finalizeItems := func(status, finishReason string) []interface{} {
+	finalizeItems := func(status string) []interface{} {
 		sendCreated()      // 兜底：保证 created + msg added 存在
 		msgItem := closeMessageItem(status)
 		output := make([]interface{}, 0, 1+len(funcCallOrder))
@@ -887,7 +908,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				finishReason = "stop"
 			}
 		}
-		output := finalizeItems("completed", finishReason)
+		output := finalizeItems("completed")
 
 		respPayload := map[string]interface{}{
 			"id":            responseID,
@@ -956,12 +977,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				//   让按事件类型分发的客户端能看到真正的错误而非"干净完成 + 空内容"。
 				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
 					event.Error.Code, event.Error.Type, event.Error.Message)
-				streamErr := t.TranslateError(event.Error) // {"error":{...}} RawMessage（协议级错误事件复用）
-				_ = streamErr
 				errObj := streamErrorObject(event.Error)   // 单层 error 对象，供 response.error/completed 内嵌
 
 				// 关闭所有已打开 item（message + 已出现的 fc），status=failed
-				output := finalizeItems("failed", "stop")
+				output := finalizeItems("failed")
 
 				// 独立 response.error 事件：按事件类型分发的客户端靠它识别失败
 				sendSSE("response.error", map[string]interface{}{
@@ -969,15 +988,27 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"error": errObj,
 				})
 
+				// 失败终态的 finish_reason 与 incomplete_details：status=failed 表示请求从未成功，
+				// 不能写成 "max_output_tokens"（会让客户端把「上游 400 拒绝请求」误判成「输出太长」，
+				// 走错恢复路径）。无 function_call 时 finish_reason 无真实语义，取 "stop" 占位。
+				// @AI_GUARD: RESPONSES_ERROR_SHAPE - 见本分支顶部的约束注释
+				errFinishReason := lastFinishReason
+				if errFinishReason == "" {
+					if len(funcCallOrder) > 0 {
+						errFinishReason = "function_call"
+					} else {
+						errFinishReason = "stop"
+					}
+				}
 				// response.completed 作为终态，携带同一 error 对象
 				respPayload := map[string]interface{}{
 					"id":            responseID,
 					"status":        "failed",
 					"output":        output,
 					"error":         errObj,
-					"finish_reason": "stop",
+					"finish_reason": errFinishReason,
 					"incomplete_details": map[string]interface{}{
-						"reason": "max_output_tokens",
+						"reason": nil,
 					},
 				}
 				if lastModel != "" {
@@ -992,8 +1023,8 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"type":     "response.completed",
 					"response": respPayload,
 				})
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=stop text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d http=%d upstream_type=%q upstream_msg=%.200s",
-					lastModel, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d http=%d upstream_type=%q upstream_msg=%.200s",
+					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
 					nDeltaEvents, nFuncArgsDeltas,
 					event.Error.Code, event.Error.Type, event.Error.Message)
 				sendDoneSSE()
