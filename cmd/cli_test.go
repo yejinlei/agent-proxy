@@ -106,7 +106,13 @@ func startMockServer(t *testing.T, openAIModels []string) *httptest.Server {
 		json.NewEncoder(w).Encode(map[string]string{"model": "claude-3-opus"})
 	})
 
-	mux.HandleFunc("/v1/models/gemini-pro:generateContent", func(w http.ResponseWriter, r *http.Request) {
+	// gemini 探测按候选模型列表逐个试（见 sniffAll 的 geminiPreferred），
+	// 硬编码单个模型名会随候选列表变更而过时——按路径后缀匹配，与模型名解耦。
+	mux.HandleFunc("/v1/models/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, ":generateContent") {
+			http.NotFound(w, r)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"candidates": "[]"})
 	})

@@ -1273,6 +1273,14 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 			Role: mapRoleToCC(string(msg.Role)),
 			Name: msg.Name,
 		}
+		// @AI_GUARD: CC_TOOL_CALL_ID_LINKAGE - role:tool 消息必须带上 tool_call_id
+		// @CONSTRAINT: 缺失时上游不报 400，但工具调用与结果失去配对，模型会把已读的
+		//   文件当成"没读过"，转成自由发挥并停止发起工具调用——表现为 Codex 一直不回读。
+		// @REASON: 直连实测同一 payload：缺 tool_call_id → finish 非 tool_calls 且声称
+		//   "我找过别的文件名了"；补上 → 正常 tool_calls。Responses 的 function_call_output
+		//   在中枢里 ToolCallID 是完好的，只在出口这里被丢弃。
+		// @RELATED: functionCallOutputItemToMessage（写入 ToolCallID）、itemToMessage（ToolCalls[].ID）
+		im.ToolCallID = msg.ToolCallID
 		// 优先使用 ContentBlocks（含图片等多模态内容），否则回退到 Content 纯文本
 		if len(msg.ContentBlocks) > 0 {
 			im.Content = buildCCContentFromBlocks(msg.ContentBlocks)
