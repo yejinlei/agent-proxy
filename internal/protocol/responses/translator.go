@@ -115,7 +115,7 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
 		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
 
-	// @CODEX-DEBUG v0.2.121：input items 逐条形状摘要。
+	// input items 逐条形状摘要。
 	// 上游请求体日志被 formatJSON 截到 20KB+8KB（quick.go），大请求的 messages 中段
 	// 完整内容进不了日志；排查"模型最后一轮决定收口而不再调工具"这类问题时，
 	// 看不到历史里到底有哪些 function_call / function_call_output 往返，无法判断
