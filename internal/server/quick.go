@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -442,9 +443,9 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 	}
 
 	// 读取请求体
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readBody(r, startTime)
 	if err != nil {
-		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		q.sendError(w, bodyErrStatus(err), "read_body", err.Error())
 		return
 	}
 	// 重新包装 r.Body，让下游处理函数能再次读取
@@ -1512,9 +1513,9 @@ func (q *QuickGateway) handlePassthroughNonStream(p provider.Provider, ctx conte
 	defer cancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readBody(r, startTime)
 	if err != nil {
-		q.sendError(w, http.StatusBadRequest, "read_body", err.Error())
+		q.sendError(w, bodyErrStatus(err), "read_body", err.Error())
 		return
 	}
 	// 上游类型自适应字段过滤：必须在 alias 字符串替换之前处理
@@ -1622,14 +1623,13 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 	defer cancel()
 
 	callInfo := makeQuickPassthroughInfo(q.info, realModel)
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readBody(r, startTime)
 	if err != nil {
 		// @AI_GUARD: READ_BODY_ERROR - 必须先停止心跳再写错误，防止并发写
 		close(callDone) // 停止心跳
 		<-callFinished  // 等待心跳 goroutine 退出
-		if q.verboseLevel >= 2 {
-			log.Printf("[sse-error] passthrough-stream → read body failed: %v", err)
-		}
+		log.Printf("[sse-error] passthrough-stream → read body failed: status=%d err=%v",
+			bodyErrStatus(err), err)
 		sendSSEErrorBody(w, flusher, "invalid_request_error", fmt.Sprintf("read body: %v", err))
 		return
 	}
@@ -3781,7 +3781,8 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 //
 // @AI_GUARD: WS_HEARTBEAT_LOG - 心跳必须打日志，否则无法区分"心跳没发"和"心跳发了但客户端没用"
 // @REASON: Write() 一直有 [CODEX-DEBUG] WS frame 日志，WritePing() 没有；v0.2.113~v0.2.116
-//   的日志里 event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区
+//
+//	的日志里 event: ping 恒为 0，导致心跳是否真的发出一直是不可验证的盲区
 func (w *qwsResponseWriter) WritePing() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -3896,4 +3897,73 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	// @REASON: v0.2.114 Plan B 修好首字节延迟后，暴露出收尾缺 close 帧的协议问题；日志全程
 	//   0 条 WS-ERR 但 Codex 仍报 Connection reset without closing handshake
 	_ = quickWriteWSCtrl(conn, qwsOpClose, []byte{0x03, 0xE8}) // 1000 normal closure
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  入站请求体读取
+//
+//  quick.go 与 gateway.go 共用下面这一组（同 package），四个调用点一致：
+//    quick.go  handleRequest / handlePassthroughNonStream / handlePassthroughStream
+//    gateway.go handleRequest
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// maxBodyBytes 是入站请求体的硬上限。超过的部分会被截断，上游收到的是残缺 JSON。
+// quick.go 与 gateway.go 共用同一个常量，避免两边数值漂移。
+const maxBodyBytes = 1 << 20
+
+// errBodyExceedsLimit 标记「请求体超过 maxBodyBytes」。
+// 调用方据此回 413（客户端确实发了太大数据），而不是 400（数据损坏）。
+var errBodyExceedsLimit = errors.New("request body exceeds limit")
+
+// readBody 读取入站请求体，并把两类过去被静默吞掉的情况变成显式结果：
+//
+//  1. 读失败（典型是 http.Server.ReadTimeout 到期）：打一行日志再返回。
+//     日志带已读字节数、Content-Length、耗时、对端地址。此前三处 read_body 路径
+//     只回 400 不记日志，服务端日志看起来像「请求开始了然后没了」。
+//  2. 超过 maxBodyBytes：直接返回 errBodyExceedsLimit（413），不把残缺 JSON 发给上游。
+//     截断后请求体必然是残缺 JSON，发给上游只会换回一个 400，还额外消耗重试配额。
+//
+// 截断判定用 io.LimitReader(r.Body, maxBodyBytes+1) 多读一字节：
+// len > maxBodyBytes 即说明客户端还有剩余数据。不用「读完后再多读一字节探测」，
+// 那种做法在 keep-alive 连接上会越过本请求的 body 边界、吞掉下一个请求的字节。
+// net/http 对 body 分层的 chunk 解码不会越过 body 边界，所以上限内读取是安全的。
+func readBody(r *http.Request, start time.Time) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		logReadBodyFailure(r, start, int64(len(body)), err)
+		return body, err
+	}
+	if int64(len(body)) > maxBodyBytes {
+		return body, errBodyTooLarge(r)
+	}
+	return body, nil
+}
+
+func errBodyTooLarge(r *http.Request) error {
+	if r.ContentLength > 0 {
+		return fmt.Errorf("%w: got %d bytes, limit %d", errBodyExceedsLimit, r.ContentLength, maxBodyBytes)
+	}
+	return fmt.Errorf("%w: limit %d bytes (content-length unknown)", errBodyExceedsLimit, maxBodyBytes)
+}
+
+// bodyErrStatus 把 readBody 的错误映射到 HTTP 状态码。
+// 超上限回 413（客户端发了太大数据，缩小请求就能过）；
+// 读失败回 400（连接读超时或数据损坏，重试也未必有用）。
+func bodyErrStatus(err error) int {
+	if errors.Is(err, errBodyExceedsLimit) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+func logReadBodyFailure(r *http.Request, start time.Time, read int64, err error) {
+	if err == nil || errors.Is(err, io.EOF) {
+		return
+	}
+	cl := "unknown"
+	if r.ContentLength >= 0 {
+		cl = strconv.FormatInt(r.ContentLength, 10)
+	}
+	log.Printf("[read-body] FAILED: read %d bytes (content-length %s) in %v, remote=%s, path=%s, err=%v",
+		read, cl, time.Since(start).Round(time.Millisecond), r.RemoteAddr, r.URL.Path, err)
 }

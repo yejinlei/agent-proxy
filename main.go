@@ -20,7 +20,7 @@ import (
 )
 
 // version 可通过 ldflags 在构建时注入：go build -ldflags "-X main.version=v0.2.56"
-var version = "v0.2.122"
+var version = "v0.2.123"
 
 var verboseLevel int // 0=关闭 1=-v 2=-vv（仅快速模式生效）
 
@@ -222,6 +222,7 @@ var validRunFlags = map[string]bool{
 	"--host": true, "--port": true, "--mode": true,
 	"--db": true, "--conf": true, "--key": true, "--nokey": true,
 	"--aliases": true, "--timeout": true,
+	"--read-timeout": true, "--write-timeout": true,
 	"-v": true, "-vv": true,
 }
 
@@ -241,6 +242,14 @@ func runServer(args []string) {
 	noClientKey := false
 	aliasPath := ""
 	timeout := 300
+	readTimeout := 120
+	writeTimeout := 600
+	// 这两个标志位区分「命令行显式给了」和「用默认值」：
+	// 配置文件里的 server.read_timeout/write_timeout 只在命令行没给时生效，
+	// 否则命令行会被配置悄悄覆盖。默认值与 config.DefaultConfig 一致，
+	// 所以两边不冲突时结果是同一个数。
+	readTimeoutSet := false
+	writeTimeoutSet := false
 
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
@@ -249,6 +258,7 @@ func runServer(args []string) {
 			fmt.Fprintf(os.Stderr, "用法: agent-proxy run [--mode <simple|complex>] [--db <id>]\n")
 			fmt.Fprintf(os.Stderr, "      [--host <h>] [--port <p>] [--conf <f>]\n")
 			fmt.Fprintf(os.Stderr, "      [--key <k> | --nokey] [--aliases <f>] [--timeout <seconds>]\n")
+			fmt.Fprintf(os.Stderr, "      [--read-timeout <seconds>] [--write-timeout <seconds>]\n")
 			os.Exit(1)
 		}
 		switch flag {
@@ -295,6 +305,18 @@ func runServer(args []string) {
 			i++
 			if i < len(args) {
 				timeout, _ = strconv.Atoi(args[i])
+			}
+		case "--read-timeout":
+			i++
+			if i < len(args) {
+				readTimeout, _ = strconv.Atoi(args[i])
+				readTimeoutSet = true
+			}
+		case "--write-timeout":
+			i++
+			if i < len(args) {
+				writeTimeout, _ = strconv.Atoi(args[i])
+				writeTimeoutSet = true
 			}
 		case "-v":
 			verboseLevel = 1
@@ -350,11 +372,29 @@ func runServer(args []string) {
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
+	// 从配置文件取超时（快速模式没有配置文件，conf 为空时 Load 返回默认配置，
+	// 而默认值与上面的命令行默认值一致，所以不冲突）。命令行显式给的值优先，
+	// 避免「命令行写了、配置文件偷偷盖掉」。
+	if !readTimeoutSet || !writeTimeoutSet {
+		if cfgFile, err := config.Load(conf); err == nil {
+			if !readTimeoutSet && cfgFile.Server.ReadTimeout > 0 {
+				readTimeout = cfgFile.Server.ReadTimeout
+			}
+			if !writeTimeoutSet && cfgFile.Server.WriteTimeout > 0 {
+				writeTimeout = cfgFile.Server.WriteTimeout
+			}
+		}
+		// err 忽略：startComplexMode 会重新加载该文件，失败时在那里报错退出
+	}
+	// ReadTimeout 覆盖「整个请求读取」（头+体），不是只看 header——
+	// 上传较慢时大请求体会在这里被掐断，报 read_body i/o timeout。
+	// 所以调大前先确认是不是真的在等 body。
+	// WriteTimeout 管 SSE 长连接，短了会让长推理的流在 response.completed 前被掐。
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        handler,
-		ReadTimeout:    120 * time.Second,
-		WriteTimeout:   600 * time.Second,
+		ReadTimeout:    time.Duration(readTimeout) * time.Second,
+		WriteTimeout:   time.Duration(writeTimeout) * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -541,6 +581,8 @@ func printUsage() {
     --key <k>    快速模式客户端密钥（默认随机生成并显示）
     --nokey      快速模式不要求客户端密钥（本地开发用）
     --timeout <seconds>  上游请求超时秒数（默认 300，即 5 分钟）
+    --read-timeout <seconds>   入站请求读取超时秒数（默认 120；超时后请求报 read_body i/o timeout）
+    --write-timeout <seconds>  响应写出超时秒数（默认 600；SSE 长推理需要更长）
     -v           快速模式请求日志：客户端 IP / 入站协议 / 上游 / token 用量 / 耗时
     -vv          快速模式四向日志：依次显示 [Guest→代理] [代理→LLM] [LLM→代理] [代理→Guest]
 

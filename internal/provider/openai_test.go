@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,5 +155,84 @@ func TestGeminiClient_DefaultHeaders(t *testing.T) {
 	}
 	if h.Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type: got %q", h.Get("Content-Type"))
+	}
+}
+
+// ── 重试策略 ──
+
+func TestRetryableStatus(t *testing.T) {
+	retryable := []int{408, 429, 500, 502, 503, 504}
+	for _, code := range retryable {
+		if !retryableStatus(code) {
+			t.Errorf("retryableStatus(%d) = false, want true", code)
+		}
+	}
+	// 400/401/403/404/413 是请求本身的问题，重发必然同样失败
+	notRetryable := []int{400, 401, 403, 404, 413}
+	for _, code := range notRetryable {
+		if retryableStatus(code) {
+			t.Errorf("retryableStatus(%d) = true, want false", code)
+		}
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	if retryDelay(0) != 0 {
+		t.Errorf("retryDelay(0) = %v, want 0", retryDelay(0))
+	}
+	if d := retryDelay(1); d != 100*time.Millisecond {
+		t.Errorf("retryDelay(1) = %v, want 100ms", d)
+	}
+	if d := retryDelay(2); d != 400*time.Millisecond {
+		t.Errorf("retryDelay(2) = %v, want 400ms", d)
+	}
+}
+
+func TestRetryAfterDelay(t *testing.T) {
+	cases := []struct {
+		name string
+		h    http.Header
+		want time.Duration
+	}{
+		{name: "无 Retry-After 用下限", h: http.Header{}, want: retryAfterFloor},
+		{name: "整数秒", h: http.Header{"Retry-After": []string{"7"}}, want: 7 * time.Second},
+		{name: "小于下限取下限", h: http.Header{"Retry-After": []string{"1"}}, want: retryAfterFloor},
+		{name: "超过上限取上限", h: http.Header{"Retry-After": []string{"600"}}, want: retryAfterCap},
+		{name: "非法值回退下限", h: http.Header{"Retry-After": []string{"soon"}}, want: retryAfterFloor},
+		{name: "带空白的整数秒", h: http.Header{"Retry-After": []string{"  12  "}}, want: 12 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryAfterDelay(tc.h); got != tc.want {
+				t.Errorf("retryAfterDelay = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// HTTP-date 形式。注意 time.Parse 在 UTC 下会把 RFC1123 的 Z 区格式化成字面
+	// "UTC"，而 http.ParseTime 只认 "GMT"——所以下面的字符串手写 GMT 结尾。
+	futureUTC := time.Now().UTC().Add(20 * time.Second)
+	h := http.Header{"Retry-After": []string{strings.Replace(futureUTC.Format(time.RFC1123), " UTC", " GMT", 1)}}
+	if got := retryAfterDelay(h); got < 18*time.Second || got > 22*time.Second {
+		t.Errorf("retryAfterDelay(RFC1123 GMT) = %v, want ~20s (got=%s)", got, h.Get("Retry-After"))
+	}
+
+	// 带偏移量的日期（部分上游用 +0000 而非 GMT）
+	h = http.Header{"Retry-After": []string{futureUTC.Format(time.RFC1123Z)}}
+	if got := retryAfterDelay(h); got < 18*time.Second || got > 22*time.Second {
+		t.Errorf("retryAfterDelay(RFC1123Z) = %v, want ~20s (got=%s)", got, h.Get("Retry-After"))
+	}
+}
+
+func TestParseRetryAfter_InvalidDateFallsThrough(t *testing.T) {
+	// 非法日期不能把结果变成一个大数值（time.Parse 对 RFC1123 的 Z 区容错会返回 zero time + nil error）
+	if got := parseRetryAfter("not-a-date"); got != 0 {
+		t.Errorf("parseRetryAfter(invalid) = %v, want 0", got)
+	}
+	if got := parseRetryAfter("Mon, 08 Sep 2026 20:52:31 CST"); got != 0 {
+		t.Errorf("parseRetryAfter(non-GMT literal) = %v, want 0", got)
+	}
+	if got := parseRetryAfter("-5"); got != -5*time.Second {
+		t.Errorf("parseRetryAfter(-5) = %v, want -5s (下限由调用方套)", got)
 	}
 }

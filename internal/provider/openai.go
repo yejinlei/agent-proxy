@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,23 +22,30 @@ const maxRetries = 2
 // streamHeaderTimeout 上游返回响应头的最长等待时间。
 // @AI_GUARD: STREAM_HEADER_TIMEOUT - 上游挂死时必须在有限时间内失败，才能触发既有重试/降级路径
 // @CONSTRAINT: SenseNova 等上游存在"已接受请求但长时间不返回响应头"的挂死形态；
-//   http.Client.Timeout（默认 300s）只管整请求总时长，不管"多久没等到响应头"。
-//   不设本值时上游可静默 148s 才返回 500，Codex（~3m25s 自判死）会先断开。
-//   60s 的取值必须满足两个条件：
-//   ① 长于实测正常轮次的首字节延迟（3–20s），不误杀慢轮；
-//   ② 短到"超时 + 一次重试"仍能在 Codex 的 ~205s 判死窗口内完成，
-//      这样超时后至少还有一次机会成功，而不是直接把失败抛给客户端。
+//
+//	http.Client.Timeout（默认 300s）只管整请求总时长，不管"多久没等到响应头"。
+//	不设本值时上游可静默 148s 才返回 500，Codex（~3m25s 自判死）会先断开。
+//	60s 的取值必须满足两个条件：
+//	① 长于实测正常轮次的首字节延迟（3–20s），不误杀慢轮；
+//	② 短到"超时 + 一次重试"仍能在 Codex 的 ~205s 判死窗口内完成，
+//	   这样超时后至少还有一次机会成功，而不是直接把失败抛给客户端。
+//
 // @RELATED: newOpenAIClient, NewResponsesClient, CallStream, callWithRetry
-//   （仅 OpenAI/Responses 客户端设置；Anthropic/Gemini 客户端不加此约束，见 ANTHROPIC_PROTOCOL_FROZEN）
+//
+//	（仅 OpenAI/Responses 客户端设置；Anthropic/Gemini 客户端不加此约束，见 ANTHROPIC_PROTOCOL_FROZEN）
+//
 // @REASON: v0.2.116 日志实测 13:59:34 发出的请求，14:02:03（148s）才收到上游 500，
-//   期间 agent-proxy 无任何输出，无静默检测；60s 可将其提前 88s 截断
+//
+//	期间 agent-proxy 无任何输出，无静默检测；60s 可将其提前 88s 截断
 const streamHeaderTimeout = 60 * time.Second
 
 // defaultTransport 连接池配置。
 // @AI_GUARD: CONNECTION_POOL_CONFIG - 所有 Provider 必须使用相同的连接池配置
 // @CONSTRAINT: 4 个 Provider (OpenAI/Anthropic/Gemini/Responses) 必须保持连接池配置一致：
-//   MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 300s
-//   - 修改连接池参数，必须同步修改 Anthropic/Gemini/Responses 客户端
+//
+//	MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 300s
+//	- 修改连接池参数，必须同步修改 Anthropic/Gemini/Responses 客户端
+//
 // @RELATED: newOpenAIClient, NewResponsesClient, NewAnthropicClient, NewGeminiClient
 func defaultTransport() *http.Transport {
 	return &http.Transport{
@@ -51,8 +59,10 @@ func defaultTransport() *http.Transport {
 // 仅额外限制"请求写完 → 收到响应头"的等待时间。
 // @AI_GUARD: STREAM_HEADER_TIMEOUT - 上游挂死时必须在有限时间内失败，才能触发既有重试/降级路径
 // @CONSTRAINT: ResponseHeaderTimeout 属于 http.Transport（非 http.Client）。
-//   不得修改 MaxIdleConns/MaxIdleConnsPerHost/IdleConnTimeout 三个池参数——
-//   那会破坏 CONNECTION_POOL_CONFIG 的四 Provider 一致性约束。
+//
+//	不得修改 MaxIdleConns/MaxIdleConnsPerHost/IdleConnTimeout 三个池参数——
+//	那会破坏 CONNECTION_POOL_CONFIG 的四 Provider 一致性约束。
+//
 // @RELATED: defaultTransport, streamClient
 func streamTransport() *http.Transport {
 	t := defaultTransport()
@@ -60,17 +70,72 @@ func streamTransport() *http.Transport {
 	return t
 }
 
-// retryableStatus 判断 HTTP 状态码是否值得重试
+// retryableStatus 判断 HTTP 状态码是否值得重试。
+//
+// 400 不算可重试：它表示请求本身有问题（参数非法、schema 不对、body 被截断），
+// 同一个请求体重发必然得到同一个 400，重试只浪费上游配额和客户端等待时间。
+// v0.2.123 起把 400 移出重试列表；此前的行为会让上游报 400 时连续打 3 次。
+// 其余状态码保持原行为：408/429/5xx 是上游侧的暂时性失败。
 func retryableStatus(status int) bool {
-	return status == 400 || status == 408 || status == 429 || status >= 500
+	return status == 408 || status == 429 || status >= 500
 }
 
-// retryDelay 重试等待时间（指数退避）
+// retryDelay 重试等待时间（指数退避），用于 408/5xx 与响应头超时。
 func retryDelay(attempt int) time.Duration {
 	if attempt <= 0 {
 		return 0
 	}
 	return time.Duration(attempt*attempt) * 100 * time.Millisecond
+}
+
+// retryAfterDelay 计算 429（限流）的重试间隔。
+//
+// 429 走这里而不是 retryDelay，因为指数退避对限流是负作用：attempt 1 只等 100ms，
+// 而 RPM 窗口是按分钟计的——100ms 后立刻重发只会让窗口更难恢复，代理实际帮限流加料。
+// v0.2.123 实测同一时刻连发各 10 次，deepseek-v4-flash 10/10 全 429、
+// sensenova-6.8-flash-lite 10/10 全 200，说明限流按模型算且额度差异大；
+// 叠加"代理每 100ms 再打一发"后，Codex 14 个请求被打成 30 次上游请求。
+//
+// 优先级：上游 Retry-After 头 > 固定 5 秒下限。
+// 下限取 5 秒是折中——RPM 窗口是 60 秒，等满一个窗口会让用户看到十几秒无响应，
+// 5 秒足以跨越短窗口的重置边界，又不至于让单次失败拖成不可用。
+// 上限 clamp 到 30 秒：上游若返回 "Retry-After: 600" 之类的大值，
+// 与其让用户等十分钟，不如快速失败让它看到错误、自己决定重试。
+const retryAfterFloor = 5 * time.Second
+const retryAfterCap = 30 * time.Second
+
+func retryAfterDelay(h http.Header) time.Duration {
+	d := retryAfterFloor
+	if v := h.Get("Retry-After"); v != "" {
+		d = parseRetryAfter(v)
+	}
+	if d < retryAfterFloor {
+		d = retryAfterFloor
+	}
+	if d > retryAfterCap {
+		d = retryAfterCap
+	}
+	return d
+}
+
+// parseRetryAfter 解析 Retry-After 头，两种合法形式：
+// 秒数（"120"）或 HTTP 日期。都解析不了时返回 0，由调用方套用下限。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
+	}
+	// 先试 http.ParseTime：它同时认 GMT 结尾的 RFC 1123 和 ASCII 数字偏移的 RFC 1123Z。
+	// 不能直接用 time.Parse(time.RFC1123, ...)——它的 Z 区（"MST"）会容错匹配任意三个字符，
+	// 把 "Mon, 08 Sep 2026 20:52:31 CST" 解析成 zero time 且 err == nil，
+	// time.Until(zero time) 会得到几百年的值，然后被 clamp 成 30s 的假 Retry-After。
+	if t, err := http.ParseTime(v); err == nil {
+		return time.Until(t)
+	}
+	if t, err := time.Parse(time.RFC1123Z, v); err == nil {
+		return time.Until(t)
+	}
+	return 0
 }
 
 // openaiClient 内部表示，支持可配置端点
@@ -90,9 +155,11 @@ type OpenAIClient openaiClient
 // NewOpenAIClient OpenAI 兼容 API 客户端（Chat Completions 端点）
 // @AI_GUARD: CONNECTION_POOL_CONFIG - 所有 Provider 必须使用相同的连接池配置
 // @CONSTRAINT: 4 个 Provider (OpenAI/Anthropic/Gemini/Responses) 必须保持连接池配置一致：
-//   MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 300s
-//   - 修改任一 Provider 的连接池配置，必须同步修改其他 3 个
-//   - 非流式请求使用独立 http.Client，与 SSE 连接池隔离
+//
+//	MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 300s
+//	- 修改任一 Provider 的连接池配置，必须同步修改其他 3 个
+//	- 非流式请求使用独立 http.Client，与 SSE 连接池隔离
+//
 // @RELATED: NewAnthropicClient, NewGeminiClient, NewResponsesClient (必须同步)
 //
 // @AI_GUARD: OPENAI_ENDPOINT_PREFIX - endpointPrefix 必须透传给 BuildURL
@@ -180,9 +247,13 @@ func (c *OpenAIClient) Endpoint(model string, stream bool) (method string, url s
 // streamHTTPClient 返回流式 SSE 请求所用 http.Client（带"等待响应头"超时）。
 // @AI_GUARD: STREAM_HEADER_TIMEOUT - 上游挂死时必须在有限时间内失败，才能触发既有重试/降级路径
 // @CONSTRAINT: 仅 CallStream 经由本方法取 client；非流式 callWithRetry 必须继续使用 c.client。
-//   非流式请求（上游 thinking 可达数十秒）加 header 超时会把正常慢请求误判为挂死。
+//
+//	非流式请求（上游 thinking 可达数十秒）加 header 超时会把正常慢请求误判为挂死。
+//
 // @REASON: v0.2.116 日志实测流式上游 148s 零响应头，期间 agent-proxy 无任何输出；
-//   非流式 40/60s 上界会破坏 reasoning_effort=high 的合法长思考
+//
+//	非流式 40/60s 上界会破坏 reasoning_effort=high 的合法长思考
+//
 // @RELATED: streamTransport, newOpenAIClient, NewResponsesClient
 func (c *OpenAIClient) streamHTTPClient() *http.Client {
 	if c.streamClient != nil {
@@ -203,7 +274,8 @@ func (c *OpenAIClient) Call(ctx context.Context, req json.RawMessage, info *sche
 // @CONSTRAINT: 重试必须保持幂等性——同一请求体重发，不修改请求体
 // @RELATED: OpenAIClient.Call, OpenAIClient.CallStream
 // @REASON: Sensenova 等上游存在非确定性行为（同请求体有时 200 有时 400），
-//   重试可消除服务端负载均衡/限流波动造成的偶发失败
+//
+//	重试可消除服务端负载均衡/限流波动造成的偶发失败
 func (c *OpenAIClient) callWithRetry(ctx context.Context, req json.RawMessage, info *schema.ProviderInfo, url string, isStream bool, maxRetries int) (json.RawMessage, http.Header, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
@@ -249,6 +321,16 @@ func (c *OpenAIClient) callWithRetry(ctx context.Context, req json.RawMessage, i
 
 		if resp.StatusCode >= 400 && retryableStatus(resp.StatusCode) && attempt < maxRetries {
 			log.Printf("[retry] HTTP %d on attempt %d/%d, body=%s", resp.StatusCode, attempt, maxRetries, string(respBody))
+			delay := retryDelay(attempt)
+			if resp.StatusCode == http.StatusTooManyRequests {
+				delay = retryAfterDelay(respHeaders)
+			}
+			log.Printf("[retry] attempt %d/%d, waiting %v (model=%s)", attempt+1, maxRetries, delay, extractModel(req))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
 			continue
 		}
 
@@ -286,6 +368,10 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 		defer close(linesCh)
 		url := c.BuildURL(info, info.Name, true)
 
+		// nextDelay 是「上一次失败」给出的下次重试等待时间。
+		// 429 用 Retry-After（重试窗口由上游决定），其余用指数退避。
+		nextDelay := time.Duration(0)
+
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(req))
 			if err != nil {
@@ -303,11 +389,10 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 			headers.Set("Connection", "keep-alive")
 			httpReq.Header = headers
 
-			if attempt > 0 {
-				delay := retryDelay(attempt)
-				log.Printf("[retry] attempt %d/%d, waiting %v (model=%s)", attempt, maxRetries, delay, extractModel(req))
+			if attempt > 0 && nextDelay > 0 {
+				log.Printf("[retry] attempt %d/%d, waiting %v (model=%s)", attempt, maxRetries, nextDelay, extractModel(req))
 				select {
-				case <-time.After(delay):
+				case <-time.After(nextDelay):
 				case <-ctx.Done():
 					return
 				}
@@ -324,6 +409,7 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 				// @RELATED: streamHeaderTimeout, retryDelay, quick.go:1728 _type:error 降级路径
 				if errors.Is(err, context.DeadlineExceeded) && attempt < maxRetries {
 					log.Printf("[retry] upstream header timeout on SSE attempt %d/%d: %v", attempt, maxRetries, err)
+					nextDelay = retryDelay(attempt)
 					continue
 				}
 				errMsg, _ := json.Marshal(map[string]interface{}{
@@ -345,6 +431,10 @@ func (c *OpenAIClient) CallStream(ctx context.Context, req json.RawMessage, info
 				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 				resp.Body.Close()
 				log.Printf("[retry] HTTP %d on SSE attempt %d/%d, body=%s", resp.StatusCode, attempt, maxRetries, string(errBody))
+				nextDelay = retryDelay(attempt)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					nextDelay = retryAfterDelay(respHeaders)
+				}
 				continue
 			}
 
