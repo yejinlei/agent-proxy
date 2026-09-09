@@ -3,46 +3,14 @@
   "diagram_type": "sequence",
   "meta": {
     "title": "翻译路径 — Central Schema 往返图",
-    "output": "docs/translate-path.html",
+    "output": "docs/interactive/translate-path.html",
     "viewBox": [
-      1100,
-      970
+      1800,
+      990
     ],
     "column_fit": "spread",
     "animation": "trace",
-    "quality_profile": "showcase",
-    "views": [
-      {
-        "id": "request-ingress",
-        "label": "Ingress & translate",
-        "focus": [
-          "client",
-          "proxy",
-          "treg"
-        ],
-        "note": "The ingress request is detected and normalized into InternalRequest."
-      },
-      {
-        "id": "upstream-call",
-        "label": "Upstream call",
-        "focus": [
-          "proxy",
-          "upstream"
-        ],
-        "note": "The translated body is sent to the upstream provider."
-      },
-      {
-        "id": "sse-return",
-        "label": "SSE return",
-        "focus": [
-          "upstream",
-          "treg",
-          "proxy",
-          "client"
-        ],
-        "note": "Upstream SSE is translated back through the Central Schema and streamed to the client."
-      }
-    ]
+    "quality_profile": "showcase"
   },
   "participants": [
     {
@@ -227,7 +195,8 @@
       "items": [
         "当入站协议属于上游能力时，跳过翻译",
         "只解析模型别名；请求体原样转发",
-        "自适应流包装 / 拆包让透传客户端毫无察觉"
+        "自适应流包装 / 拆包让透传客户端毫无察觉",
+        "body > 100 KB 时改走非流式→SSE，delta 必须按白名单重建 role / content / tool_calls"
       ]
     },
     {

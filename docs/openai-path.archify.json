@@ -3,45 +3,13 @@
   "diagram_type": "dataflow",
   "meta": {
     "title": "OpenAIPath 传递链 — 从探测到 BuildURL",
-    "output": "docs/openai-path.html",
+    "output": "docs/interactive/openai-path.html",
     "viewBox": [
-      1100,
+      1800,
       950
     ],
     "animation": "trace",
-    "quality_profile": "showcase",
-    "views": [
-      {
-        "id": "discovery-store",
-        "label": "Discovery & store",
-        "focus": [
-          "sniff",
-          "rec",
-          "db"
-        ],
-        "note": "sniffAll discovers the prefix; CLI persists it into the record and SQLite."
-      },
-      {
-        "id": "runtime",
-        "label": "Runtime load",
-        "focus": [
-          "db",
-          "qg",
-          "prov"
-        ],
-        "note": "run --db <id> loads the record and threads openAIPath into the provider."
-      },
-      {
-        "id": "url-build",
-        "label": "Build the URL",
-        "focus": [
-          "prov",
-          "burl",
-          "req"
-        ],
-        "note": "NewOpenAIClientWithPath normalizes empty to /v1; BuildURL concatenates base + prefix + endpoint."
-      }
-    ]
+    "quality_profile": "showcase"
   },
   "stages": [
     {

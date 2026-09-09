@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Codex HTTP-SSE — 与 WS 同协议、不同传输",
+    "output": "docs/interactive/codex-sse.html",
+    "viewBox": [
+      1800,
+      990
+    ],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    {
+      "id": "codex",
+      "type": "external",
+      "label": "Codex CLI",
+      "sublabel": "POST https://…/v1/responses"
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "代理",
+      "sublabel": "handleResponses → handleRequest"
+    },
+    {
+      "id": "treg",
+      "type": "backend",
+      "label": "TranslatorRegistry",
+      "sublabel": "Central Schema"
+    },
+    {
+      "id": "upstream",
+      "type": "external",
+      "label": "上游 API",
+      "sublabel": "SenseNova / OpenAI"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 240,
+      "label": "① HTTP 入口"
+    },
+    {
+      "from": 250,
+      "to": 400,
+      "label": "② 翻译与上游调用"
+    },
+    {
+      "from": 410,
+      "to": 630,
+      "label": "③ 保活与流式翻译"
+    },
+    {
+      "from": 640,
+      "to": 900,
+      "label": "④ SSE 回传与收尾"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "codex",
+      "to": "proxy",
+      "y": 165,
+      "label": "POST /v1/responses · Accept: text/event-stream",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "proxy",
+      "to": "codex",
+      "y": 201,
+      "label": "200 · Content-Type: text/event-stream",
+      "variant": "return",
+      "note": "无 Upgrade 头即走此分支；先 WriteHeader(200) 加 Flush 开启 chunked transfer"
+    },
+    {
+      "id": "m4",
+      "from": "proxy",
+      "to": "treg",
+      "y": 285,
+      "label": "TranslateRequest(raw)",
+      "variant": "default"
+    },
+    {
+      "id": "m5",
+      "from": "treg",
+      "to": "proxy",
+      "y": 321,
+      "label": "InternalRequest",
+      "variant": "return"
+    },
+    {
+      "id": "m6",
+      "from": "proxy",
+      "to": "treg",
+      "y": 357,
+      "label": "TranslateToProvider(openai)",
+      "variant": "default"
+    },
+    {
+      "id": "m7",
+      "from": "treg",
+      "to": "proxy",
+      "y": 393,
+      "label": "provider body (json.RawMessage)",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 440,
+      "label": "POST /v1/chat/completions · stream: true",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m9",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 476,
+      "label": "SSE: message_start → delta…",
+      "variant": "return"
+    },
+    {
+      "id": "m10",
+      "from": "proxy",
+      "to": "codex",
+      "y": 523,
+      "label": "event: ping · data: {\"type\":\"ping\"}",
+      "variant": "dashed",
+      "note": "与 WS 共用同一心跳工厂，必须带 event: 前缀"
+    },
+    {
+      "id": "m11",
+      "from": "proxy",
+      "to": "treg",
+      "y": 560,
+      "label": "TranslateStreamEvent(rawEvent)",
+      "variant": "default"
+    },
+    {
+      "id": "m12",
+      "from": "treg",
+      "to": "proxy",
+      "y": 596,
+      "label": "InternalStreamEvent",
+      "variant": "return"
+    },
+    {
+      "id": "m13",
+      "from": "proxy",
+      "to": "treg",
+      "y": 632,
+      "label": "TranslateStream(eventChan, outFn)",
+      "variant": "default"
+    },
+    {
+      "id": "m14",
+      "from": "treg",
+      "to": "proxy",
+      "y": 668,
+      "label": "data: {\"response\":{…}}",
+      "variant": "return"
+    },
+    {
+      "id": "m15",
+      "from": "proxy",
+      "to": "codex",
+      "y": 716,
+      "label": "data: {\"type\":\"response.created\"}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m16",
+      "from": "proxy",
+      "to": "codex",
+      "y": 752,
+      "label": "data: {\"type\":\"response.output_item.added\"}",
+      "variant": "default"
+    },
+    {
+      "id": "m17",
+      "from": "proxy",
+      "to": "codex",
+      "y": 788,
+      "label": "data: {\"type\":\"response.output_text.delta\"} ×N",
+      "variant": "default"
+    },
+    {
+      "id": "m18",
+      "from": "proxy",
+      "to": "codex",
+      "y": 824,
+      "label": "data: {\"type\":\"response.output_item.done\"}",
+      "variant": "default"
+    },
+    {
+      "id": "m19",
+      "from": "proxy",
+      "to": "codex",
+      "y": 860,
+      "label": "data: {\"type\":\"response.completed\"}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m20",
+      "from": "proxy",
+      "to": "codex",
+      "y": 896,
+      "label": "data: [DONE]",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "codex",
+      "from": 165,
+      "to": 901,
+      "type": "external"
+    },
+    {
+      "participant": "proxy",
+      "from": 165,
+      "to": 901,
+      "type": "backend"
+    },
+    {
+      "participant": "treg",
+      "from": 280,
+      "to": 673,
+      "type": "backend"
+    },
+    {
+      "participant": "upstream",
+      "from": 435,
+      "to": 481,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "同协议两种传输",
+      "items": [
+        "入站协议识别完全相同：ingress=responses，翻译与上游调用两路一致",
+        "不假设 Codex 用哪种传输，来什么处理什么",
+        "只有出站封装不同，事件序列逐字节相同"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "无握手路径",
+      "items": [
+        "handleResponses 里 Upgrade 头缺失即走 handleRequest",
+        "省掉 SHA-1 握手与帧编解码，直接复用 HTTP 长连接",
+        "WriteTimeout 默认 600s 管这条 SSE 长连接"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "事件序列不变",
+      "items": [
+        "WriteHeader(200) 加 Flush 才能开 chunked，WS 靠帧边界 SSE 靠空行",
+        "SSE 下每条事件仍是 data: 前缀加单行 JSON",
+        "[DONE] 必须紧跟 response.completed 之后，不可反序"
+      ]
+    }
+  ]
+}

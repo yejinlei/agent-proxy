@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Codex WebSocket — 从握手到 response.completed",
+    "output": "docs/interactive/codex-ws.html",
+    "viewBox": [
+      1800,
+      990
+    ],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    {
+      "id": "codex",
+      "type": "external",
+      "label": "Codex CLI",
+      "sublabel": "ws://agent-proxy/v1/responses"
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "代理",
+      "sublabel": "handleResponsesWebSocket"
+    },
+    {
+      "id": "treg",
+      "type": "backend",
+      "label": "TranslatorRegistry",
+      "sublabel": "Central Schema"
+    },
+    {
+      "id": "upstream",
+      "type": "external",
+      "label": "上游 API",
+      "sublabel": "SenseNova / OpenAI"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 250,
+      "label": "① WS 握手"
+    },
+    {
+      "from": 260,
+      "to": 410,
+      "label": "② 翻译与上游调用"
+    },
+    {
+      "from": 420,
+      "to": 640,
+      "label": "③ 保活与流式翻译"
+    },
+    {
+      "from": 650,
+      "to": 900,
+      "label": "④ 逐帧回传与收尾"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "codex",
+      "to": "proxy",
+      "y": 165,
+      "label": "GET /v1/responses · Upgrade: websocket",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "proxy",
+      "to": "codex",
+      "y": 201,
+      "label": "101 Switching Protocols · Sec-WebSocket-Accept",
+      "variant": "return",
+      "note": "Accept = base64(SHA1(key + GUID))；缺 Sec-WebSocket-Key 直接 ABORT"
+    },
+    {
+      "id": "m3",
+      "from": "codex",
+      "to": "proxy",
+      "y": 237,
+      "label": "WS frame → POST /responses 请求体",
+      "variant": "default",
+      "note": "剥离 Upgrade / Connection / Sec-WebSocket-* 等连接管理 header 后再走普通 handler"
+    },
+    {
+      "id": "m4",
+      "from": "proxy",
+      "to": "treg",
+      "y": 285,
+      "label": "TranslateRequest(raw)",
+      "variant": "default"
+    },
+    {
+      "id": "m5",
+      "from": "treg",
+      "to": "proxy",
+      "y": 321,
+      "label": "InternalRequest",
+      "variant": "return"
+    },
+    {
+      "id": "m6",
+      "from": "proxy",
+      "to": "treg",
+      "y": 357,
+      "label": "TranslateToProvider(openai)",
+      "variant": "default"
+    },
+    {
+      "id": "m7",
+      "from": "treg",
+      "to": "proxy",
+      "y": 393,
+      "label": "provider body (json.RawMessage)",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 440,
+      "label": "POST /v1/chat/completions · stream: true",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m9",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 476,
+      "label": "SSE: message_start → delta…",
+      "variant": "return"
+    },
+    {
+      "id": "m10",
+      "from": "proxy",
+      "to": "codex",
+      "y": 523,
+      "label": "event: ping · data: {\"type\":\"ping\"}",
+      "variant": "dashed",
+      "note": "上游首帧 10-35s 才到，Codex 约 10s 无内容即断连；心跳必须带 event: 前缀才算内容活动"
+    },
+    {
+      "id": "m11",
+      "from": "proxy",
+      "to": "treg",
+      "y": 560,
+      "label": "TranslateStreamEvent(rawEvent)",
+      "variant": "default"
+    },
+    {
+      "id": "m12",
+      "from": "treg",
+      "to": "proxy",
+      "y": 596,
+      "label": "InternalStreamEvent",
+      "variant": "return"
+    },
+    {
+      "id": "m13",
+      "from": "proxy",
+      "to": "treg",
+      "y": 632,
+      "label": "TranslateStream(eventChan, outFn)",
+      "variant": "default"
+    },
+    {
+      "id": "m14",
+      "from": "treg",
+      "to": "proxy",
+      "y": 668,
+      "label": "data: {\"response\":{…}}",
+      "variant": "return"
+    },
+    {
+      "id": "m15",
+      "from": "proxy",
+      "to": "codex",
+      "y": 716,
+      "label": "WS frame: response.created",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m16",
+      "from": "proxy",
+      "to": "codex",
+      "y": 752,
+      "label": "WS frame: response.output_item.added",
+      "variant": "default"
+    },
+    {
+      "id": "m17",
+      "from": "proxy",
+      "to": "codex",
+      "y": 788,
+      "label": "WS frame: response.output_text.delta ×N",
+      "variant": "default"
+    },
+    {
+      "id": "m18",
+      "from": "proxy",
+      "to": "codex",
+      "y": 824,
+      "label": "WS frame: response.output_item.done",
+      "variant": "default"
+    },
+    {
+      "id": "m19",
+      "from": "proxy",
+      "to": "codex",
+      "y": 860,
+      "label": "WS frame: response.completed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m20",
+      "from": "proxy",
+      "to": "codex",
+      "y": 896,
+      "label": "WS frame: [DONE]",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "codex",
+      "from": 165,
+      "to": 901,
+      "type": "external"
+    },
+    {
+      "participant": "proxy",
+      "from": 165,
+      "to": 901,
+      "type": "backend"
+    },
+    {
+      "participant": "treg",
+      "from": 280,
+      "to": 673,
+      "type": "backend"
+    },
+    {
+      "participant": "upstream",
+      "from": 435,
+      "to": 481,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "握手与 header 剥离",
+      "items": [
+        "handleResponses 先判 Upgrade 头，否则 Codex 的 GET 会被 405 拒掉",
+        "Sec-WebSocket-Accept = base64(SHA1(key + 固定 GUID))，缺 key 直接 ABORT",
+        "转上游前剥离 Upgrade / Connection / Sec-WebSocket-* header"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "首帧保活",
+      "items": [
+        "Codex 约 10s 无内容即断开，而上游首帧常要 10-35s",
+        "心跳固定 event: ping 加 data: {\"type\":\"ping\"}，两路共用同一工厂",
+        "SSE 注释 : heartbeat 或空 data 行不算内容活动，不重置客户端超时"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "帧语义与事件序列",
+      "items": [
+        "一个 SSE chunk 封装成一条 WS text frame，不合并",
+        "created → output_item.added → output_text.delta* → output_item.done → response.completed",
+        "ctx.Done() 时也必须补发 output_item.done 加 response.completed"
+      ]
+    }
+  ]
+}

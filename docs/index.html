@@ -41,7 +41,7 @@
     <p>4×4 AI 协议网关 — OpenAI · Anthropic · Gemini · Responses 协议互转</p>
     <div class="meta">
       <a href="https://github.com/yejinlei/agent-proxy">GitHub</a>
-      <a href="https://github.com/yejinlei/agent-proxy/releases/tag/v0.2.107">v0.2.107</a>
+      <a href="https://github.com/yejinlei/agent-proxy/releases/tag/v0.2.129">v0.2.129</a>
       <a href="md-viewer.html?file=ARCHITECTURE.md">ARCHITECTURE.md</a>
       <a href="md-viewer.html?file=DESIGN.md">DESIGN.md</a>
       <a href="https://github.com/yejinlei/agent-proxy/blob/master/MANUAL.md">MANUAL.md</a>
@@ -55,8 +55,8 @@
     <div class="grid">
       <a class="card" href="interactive/architecture.html">
         <div class="k"><span class="dot" style="background:#10b981"></span>System architecture</div>
-        <div class="desc">Central Schema 路由：入口检测 → 翻译注册表 → ModelRouter → Provider → 上游</div>
-        <div class="meta"><span>architecture</span><span>route detection · registry · providers</span></div>
+        <div class="desc">Central Schema 路由：入口检测 → 翻译注册表 → ModelRouter → Provider → 上游，含 body > 100 KB 的非流式→SSE 包装分支</div>
+        <div class="meta"><span>architecture</span><span>route detection · registry · providers · wrap</span></div>
       </a>
       <a class="card" href="interactive/translate-path.html">
         <div class="k"><span class="dot" style="background:#06b6d4"></span>Translate path</div>
@@ -67,6 +67,26 @@
         <div class="k"><span class="dot" style="background:#8b5cf6"></span>OpenAIPath propagation</div>
         <div class="desc">从 sniffAll 探测到 provider.BuildURL 的 /v1beta/openai 前缀传递链</div>
         <div class="meta"><span>dataflow</span><span>sniff → DB → QuickGateway/Gateway → provider</span></div>
+      </a>
+      <a class="card" href="interactive/codex-ws.html">
+        <div class="k"><span class="dot" style="background:#3b82f6"></span>Codex WebSocket</div>
+        <div class="desc">SHA-1 握手 → 剥离连接管理 header → 上游翻译 → event: ping 保活 → 逐帧 response.created … response.completed</div>
+        <div class="meta"><span>sequence</span><span>handshake · keepalive · frame semantics</span></div>
+      </a>
+      <a class="card" href="interactive/codex-sse.html">
+        <div class="k"><span class="dot" style="background:#3b82f6"></span>Codex HTTP-SSE</div>
+        <div class="desc">同协议不同传输：无握手路径，WriteHeader(200)+Flush 开 chunked，事件序列与 WS 逐字节一致</div>
+        <div class="meta"><span>sequence</span><span>plain POST · chunked · identical events</span></div>
+      </a>
+      <a class="card" href="interactive/claude-code.html">
+        <div class="k"><span class="dot" style="background:#e879f9"></span>Claude Code</div>
+        <div class="desc">Anthropic Messages 翻译路径：message_start → content_block_* → message_delta → message_stop，token 计数与取消安全约束</div>
+        <div class="meta"><span>sequence</span><span>anthropic sse · usage · tool_call_id</span></div>
+      </a>
+      <a class="card" href="interactive/kimi-code.html">
+        <div class="k"><span class="dot" style="background:#22d3ee"></span>Kimi Code</div>
+        <div class="desc">大请求体透传与 v0.2.129 修复：非流式→SSE 包装按白名单重建 delta，tool_calls 不再丢失</div>
+        <div class="meta"><span>sequence</span><span>passthrough · 100 KB threshold · tool loop</span></div>
       </a>
     </div>
   </section>
@@ -98,7 +118,7 @@
   </section>
 
   <footer>
-    Agent-Proxy v0.2.107 · <a href="https://github.com/yejinlei/agent-proxy/releases/tag/v0.2.107">GitHub Release</a> · <a href="https://github.com/yejinlei/agent-proxy">github.com/yejinlei/agent-proxy</a>
+    Agent-Proxy v0.2.129 · <a href="https://github.com/yejinlei/agent-proxy/releases/tag/v0.2.129">GitHub Release</a> · <a href="https://github.com/yejinlei/agent-proxy">github.com/yejinlei/agent-proxy</a>
   </footer>
 </main>
 </body>
