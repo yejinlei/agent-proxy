@@ -1657,6 +1657,20 @@ const (
 	wsMaxPayload = 64 << 20
 )
 
+// wsFirstFrameTimeout 是「已回 101 切换到 WebSocket 之后、第一个响应事件发出之前」
+// 读取 Codex 首个 WS 数据帧的最长等待时间。必须与 quick.go qwsFirstFrameTimeout 一致。
+//
+// 为什么必须有限：这段窗口内的 conn.Read 没有 ReadTimeout 保护。http.Server 的
+// ReadTimeout（默认 120s）在 Hijack 之后就停止适用，所以一旦 Codex 开了连接
+// 却没在合理时间内发帧（或中途停住），readWSFrame 里的 io.ReadFull 会无限期
+// 阻塞，goroutine 与连接都泄漏。此前该窗口没有任何日志，服务端表现为「请求来了
+// 然后消失了」，客户端表现为转圈卡死。
+//
+// 90s 的取值依据：实测上游首 token 延迟最坏 35s，加上 Codex 侧组帧开销仍有充足
+// 余量；同时远小于客户端的 300s 应用层超时，先由代理失败并留下明确日志，而不是
+// 让客户端干等到超时。
+const wsFirstFrameTimeout = 90 * time.Second
+
 // computeAcceptKey 计算 WebSocket Sec-WebSocket-Accept 值
 func computeAcceptKey(key string) string {
 	h := sha1.New()
@@ -2144,6 +2158,7 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (hijack failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 	defer conn.Close()
@@ -2151,6 +2166,8 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	// WebSocket 握手
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
+		// 缺 Upgrade 头时 handleResponses 就不会分派到这里，正常不应发生。
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (missing Sec-WebSocket-Key) client=%s", r.RemoteAddr)
 		return
 	}
 	acceptKey := computeAcceptKey(key)
@@ -2161,18 +2178,38 @@ func (g *Gateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	bufrw.WriteString("Sec-WebSocket-Accept: " + acceptKey + "\r\n")
 	bufrw.WriteString("\r\n")
 	if err := bufrw.Flush(); err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (101 flush failed) client=%s err=%v", r.RemoteAddr, err)
+		return
+	}
+
+	// 101 之后到首个事件之间必须有读超时：这段窗口内的 conn.Read 无 http.Server.ReadTimeout
+	// 保护（Hijack 之后失效），不设上限时 Codex 开了连接却不发帧会让 handler 永久阻塞、
+	// 连接泄漏，且服务端零日志——表现为「请求消失了」，客户端表现为无限转圈。deadline
+	// 在读首帧之前设置，读到帧后清除（后续心跳与响应写出走各自的 wsWriteDeadline）。
+	// 线上现象：Codex 第 5 次连接只留下 [incoming] GET /v1/responses 就没有后续，
+	// 没有 handshake OK 也没有请求体，进程被手动关闭前卡住 2 分 40 秒。此前该路径的
+	// err != nil 全是裸 return，把失败静默吞掉。
+	if err := conn.SetReadDeadline(time.Now().Add(wsFirstFrameTimeout)); err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (SetReadDeadline failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 
 	// 读取第一个 WebSocket 帧（JSON 请求体）
 	payload, err := readWSFrame(conn)
 	if err != nil {
+		// 覆盖两类静默丢失：首帧根本没到（超时/半关），以及首帧到了但不是 text 帧。
+		// 不带这行日志时，服务端看起来只是「请求来了然后没了」。
+		log.Printf("[CODEX-DEBUG] WS first frame NOT received client=%s err=%v deadline=%v",
+			r.RemoteAddr, err, wsFirstFrameTimeout)
 		return
 	}
+	// 首帧已到手，恢复正常读：后续帧由心跳 goroutine 与 conn.Close 负责，读超时不再需要。
+	_ = conn.SetReadDeadline(time.Time{})
 
 	// 构造内部 HTTP 请求，复用 handleRequest 处理逻辑
 	wsReq, err := http.NewRequestWithContext(r.Context(), "POST", r.URL.String(), io.NopCloser(strings.NewReader(string(payload))))
 	if err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (build request failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 	wsReq.Header = r.Header.Clone()

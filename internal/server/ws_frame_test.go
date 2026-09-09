@@ -648,3 +648,88 @@ func TestReadWSFrame_FragmentedMessage_Gateway(t *testing.T) {
 		t.Fatalf("pong payload = %q, must echo the ping payload", payload)
 	}
 }
+
+// TestWSReadDeadlineBehaviour pins the guard added for the v0.2.127 incident:
+// after sending HTTP 101 the handler had NO read timeout. http.Server's
+// ReadTimeout stops applying once the connection is Hijacked, so a Codex client
+// that opened the connection but never sent a frame blocked io.ReadFull
+// forever - the handler goroutine and the connection leaked, and the server log
+// showed nothing at all ([incoming] and then silence). The client spun for
+// minutes.
+//
+// The fix sets a finite deadline before the first frame and CLEARS it afterwards,
+// so the deadline protects only the handshake window. Both properties matter:
+//   - no deadline => a half-open client holds a goroutine forever (the bug)
+//   - deadline left on => every later frame read inherits a timeout and a
+//     legitimately quiet upstream turn can be reported as a broken stream
+//
+// The test sets an aggressive deadline itself (100ms instead of the 90s default)
+// so the timeout path is exercised in milliseconds rather than real time.
+func TestWSReadDeadlineBehaviour(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(net.Conn) ([]byte, error)
+	}{
+		{"quick", quickReadWSFrame},
+		{"gateway", readWSFrame},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blank, _ := net.Pipe()
+			defer blank.Close()
+
+			// With a deadline and no frame arriving, the read must return instead
+			// of parking forever. This is the exact symptom of the incident.
+			if err := blank.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatalf("SetReadDeadline: %v", err)
+			}
+			errc := make(chan error, 1)
+			go func() { _, err := tc.read(blank); errc <- err }()
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Fatal("expected a timeout reading with no frame sent")
+				}
+				if !strings.Contains(err.Error(), "timeout") {
+					t.Fatalf("expected a read timeout, got %q", err.Error())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("read ignored the deadline and blocked forever - this is the v0.2.127 bug")
+			}
+
+			// The handler clears the deadline once the first frame is in hand. If it
+			// did not, a legitimately quiet upstream turn would be misreported as a
+			// broken stream - so this is asserted on the error kind, not by timing.
+			// The read is parked in a goroutine because "still blocking" IS the
+			// assertion; nothing unblocks it until the deferred Close.
+			if err := blank.SetReadDeadline(time.Time{}); err != nil {
+				t.Fatalf("clear deadline: %v", err)
+			}
+			errc2 := make(chan error, 1)
+			go func() { _, err := tc.read(blank); errc2 <- err }()
+			select {
+			case err := <-errc2:
+				if err == nil {
+					t.Fatal("read returned with no data and no error")
+				}
+				// A timeout here means the cleared deadline is still active.
+				t.Fatalf("deadline was not cleared: a later frame read timed out (%v)", err)
+			case <-time.After(300 * time.Millisecond):
+				// Still blocked: the deadline is gone, as the handler intended.
+			}
+		})
+	}
+}
+
+// TestWSReadDeadlineDoesNotBreakValidFrames confirms the handshake deadline
+// does not reject a well-formed request. Without this, someone could "fix" the
+// timeout by shortening the window and cut off large or slowly-assembled
+// responses.create messages.
+func TestWSReadDeadlineDoesNotBreakValidFrames(t *testing.T) {
+	got, err, _ := runWSCase(t, quickReadWSFrame, wsClientFrame(qwsOpText, wcBody))
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(got) != string(wcBody) {
+		t.Fatalf("message mismatch: got %d bytes, want %d", len(got), len(wcBody))
+	}
+}
