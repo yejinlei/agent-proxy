@@ -3724,6 +3724,20 @@ const (
 	qwsMaxPayload = 64 << 20
 )
 
+// qwsFirstFrameTimeout 是「已回 101 切换到 WebSocket 之后、第一个响应事件发出之前」
+// 读取 Codex 首个 WS 数据帧的最长等待时间。
+//
+// 为什么必须有限：这段窗口内的 conn.Read 没有 ReadTimeout 保护。http.Server 的
+// ReadTimeout（默认 120s）在 Hijack 之后就停止适用，所以一旦 Codex 开了连接
+// 却没在合理时间内发帧（或中途停住），quickReadWSFrame 里的 io.ReadFull 会无限期
+// 阻塞，goroutine 与连接都泄漏。此前该窗口没有任何日志，服务端表现为「请求来了
+// 然后消失了」，客户端表现为转圈卡死。
+//
+// 90s 的取值依据：实测上游首 token 延迟最坏 35s，加上 Codex 侧组帧开销仍有充足
+// 余量；同时远小于客户端的 300s 应用层超时，先由代理失败并留下明确日志，而不是
+// 让客户端干等到超时。
+const qwsFirstFrameTimeout = 90 * time.Second
+
 // @AI_GUARD: QUICK_WEBSOCKET_SUPPORT - 快速模式 Codex 支持（需同步 gateway.go handleResponsesWebSocket）
 // @CONSTRAINT: handleResponses 入口必须用 mux.HandleFunc 注册（不能用 mux.Post），否则 chi 在方法过滤阶段就返回 405，handler 不会被调用
 // @REASON: 历史血泪教训 - 之前用 mux.Post 注册，Codex 的 ws:// 连接（GET + Upgrade）被 chi 直接 405，handleResponses 完全收不到请求
@@ -3958,6 +3972,8 @@ func quickWriteWSCtrl(conn net.Conn, opcode byte, payload []byte) error {
 	return err
 }
 
+// quickWriteWSFrame 写一个未掩码的 WebSocket 文本帧（RFC 6455：服务端帧不带掩码）。
+// 服务端是帧的唯一生产方，帧头与 payload 在同一次 Write 中发出，不会被拆成两段。
 func quickWriteWSFrame(conn net.Conn, payload []byte) error {
 	length := len(payload)
 	var frame []byte
@@ -4259,12 +4275,15 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	}
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (hijack failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 	defer conn.Close()
 
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
+		// 缺 Upgrade 头时 handleResponses 就不会分派到这里，正常不应发生。
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (missing Sec-WebSocket-Key) client=%s", r.RemoteAddr)
 		return
 	}
 	acceptKey := quickComputeAcceptKey(key)
@@ -4275,13 +4294,32 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	bufrw.WriteString("Sec-WebSocket-Accept: " + acceptKey + "\r\n")
 	bufrw.WriteString("\r\n")
 	if err := bufrw.Flush(); err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (101 flush failed) client=%s err=%v", r.RemoteAddr, err)
+		return
+	}
+
+	// 101 之后到首个事件之间必须有读超时：这段窗口内的 conn.Read 无 http.Server.ReadTimeout
+	// 保护（Hijack 之后失效），不设上限时 Codex 开了连接却不发帧会让 handler 永久阻塞、
+	// 连接泄漏，且服务端零日志——表现为「请求消失了」，客户端表现为无限转圈。deadline
+	// 在读首帧之前设置，读到帧后清除（后续心跳与响应写出走各自的 qwsWriteDeadline）。
+	// 线上现象：Codex 第 5 次连接只留下 [incoming] GET /v1/responses 就没有后续，
+	// 没有 handshake OK 也没有请求体，进程被手动关闭前卡住 2 分 40 秒。此前该路径的
+	// err != nil 全是裸 return，把失败静默吞掉。
+	if err := conn.SetReadDeadline(time.Now().Add(qwsFirstFrameTimeout)); err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (SetReadDeadline failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 
 	payload, err := quickReadWSFrame(conn)
 	if err != nil {
+		// 覆盖两类静默丢失：首帧根本没到（超时/半关），以及首帧到了但不是 text 帧。
+		// 不带这行日志时，服务端看起来只是「请求来了然后没了」。
+		log.Printf("[CODEX-DEBUG] WS first frame NOT received client=%s err=%v deadline=%v",
+			r.RemoteAddr, err, qwsFirstFrameTimeout)
 		return
 	}
+	// 首帧已到手，恢复正常读：后续帧由心跳 goroutine 与 conn.Close 负责，读超时不再需要。
+	_ = conn.SetReadDeadline(time.Time{})
 
 	// @CODEX-DEBUG v0.2.98：记录握手成功 + 入站帧大小 + 前 200 字节（用于定位入站请求形状问题）
 	inboundPreview := strings.ReplaceAll(strings.TrimRight(string(payload[:min(len(payload), 200)]), "\n"), "\r", "")
@@ -4290,6 +4328,7 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 	wsReq, err := http.NewRequestWithContext(r.Context(), "POST", r.URL.String(), io.NopCloser(strings.NewReader(string(payload))))
 	if err != nil {
+		log.Printf("[CODEX-DEBUG] WS handshake ABORTED (build request failed) client=%s err=%v", r.RemoteAddr, err)
 		return
 	}
 	wsReq.Header = r.Header.Clone()
