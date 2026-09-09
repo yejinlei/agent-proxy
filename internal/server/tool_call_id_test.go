@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -182,5 +183,167 @@ func TestBuildCCRequest_OrphanDetection(t *testing.T) {
 			}
 			t.Logf("log: %s", out)
 		})
+	}
+}
+
+// TestWriteNonStreamAsSSE_KeepsToolCalls 复现 Kimi Code「无法调用工具」的根因：
+//
+// 上游非流式响应里 tool_calls 挂在 choices[].message 下，而客户端又要求 stream=true、
+// 请求体超过 100KB 走了「非流式→SSE」包装。修复前那段包装只把 message 的 role/content
+// 搬进 delta，tool_calls 被整段丢弃，客户端收到 finish_reason="tool_calls" 却没有任何
+// 工具调用，没有东西可执行，界面就停死在输入提示符。
+// 这条测试断言工具调用必须完整到达客户端，而不是只看 finish_reason。
+func TestWriteNonStreamAsSSE_KeepsToolCalls(t *testing.T) {
+	upstream := []byte(`{
+	  "id": "chatcmpl_test",
+	  "object": "chat.completion",
+	  "created": 1788936427,
+	  "model": "sensenova-6.8-flash-lite",
+	  "choices": [{
+	    "index": 0,
+	    "finish_reason": "tool_calls",
+	    "message": {
+	      "role": "assistant",
+	      "content": "\n\n",
+	      "reasoning": "The user wants me to read a file.",
+	      "tool_calls": [{
+	        "index": 0,
+	        "id": "call_a76c86eee4494f7abc2caef7",
+	        "type": "function",
+	        "function": {"name": "Read", "arguments": "{\"path\": \"F:/src/deepseek_det2/_batch_out.txt\"}"}
+	      }]
+	    }
+	  }],
+	  "usage": {"prompt_tokens": 31969, "completion_tokens": 61, "total_tokens": 32030}
+	}`)
+
+	rr := httptest.NewRecorder()
+	// httptest.ResponseRecorder 本身实现 http.Flusher
+	writeNonStreamAsSSE(rr, rr, upstream, "vmodel")
+	out := rr.Body.String()
+	t.Logf("SSE 输出:\n%s", out)
+
+	lines := strings.Split(out, "\n\n")
+	var payload []byte
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "data: ") && !strings.HasPrefix(trimmed, "data: [DONE]") {
+			payload = []byte(strings.TrimPrefix(trimmed, "data: "))
+		}
+	}
+	if len(payload) == 0 {
+		t.Fatalf("未找到 data 载荷:\n%s", out)
+	}
+
+	var chunk map[string]interface{}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("SSE 载荷不是合法 JSON: %v\n%s", err, payload)
+	}
+	if chunk["object"] != "chat.completion.chunk" {
+		t.Errorf("object = %v, want chat.completion.chunk", chunk["object"])
+	}
+	choices, _ := chunk["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("choices 长度 = %d, want 1", len(choices))
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+	delta, _ := choice["delta"].(map[string]interface{})
+	if delta == nil {
+		t.Fatalf("delta 缺失: %s", payload)
+	}
+
+	// 核心断言：tool_calls 不能丢。
+	tcs, _ := delta["tool_calls"].([]interface{})
+	if len(tcs) != 1 {
+		t.Fatalf("delta.tool_calls 丢失（这是「无法调用工具」的根因）: %s", payload)
+	}
+	tc, _ := tcs[0].(map[string]interface{})
+	if tc["id"] != "call_a76c86eee4494f7abc2caef7" {
+		t.Errorf("tool_calls[0].id = %v", tc["id"])
+	}
+	// json.Unmarshal 把数字解成 float64，用 JSON 文本比较 index 更稳。
+	if b, _ := json.Marshal(tc["index"]); string(b) != "0" {
+		t.Errorf("tool_calls[0].index = %s, want 0", b)
+	}
+	if tc["type"] != "function" {
+		t.Errorf("tool_calls[0].type = %v, want function", tc["type"])
+	}
+	fn, _ := tc["function"].(map[string]interface{})
+	if fn == nil {
+		t.Fatalf("tool_calls[0].function 缺失: %s", payload)
+	}
+	if fn["name"] != "Read" {
+		t.Errorf("function.name = %v, want Read", fn["name"])
+	}
+	args, isString := fn["arguments"].(string)
+	if !isString {
+		t.Errorf("function.arguments 必须是字符串增量: %T %v", fn["arguments"], fn["arguments"])
+	} else if args != `{"path": "F:/src/deepseek_det2/_batch_out.txt"}` {
+		t.Errorf("function.arguments = %q", args)
+	}
+
+	// 反向断言：非标准字段不能被整个 message 灌进 delta，严格客户端会拒收。
+	if _, leaked := delta["reasoning"]; leaked {
+		t.Errorf("delta 泄漏了非标准字段 reasoning: %s", payload)
+	}
+	if delta["role"] != "assistant" || delta["content"] != "\n\n" {
+		t.Errorf("delta.role/content = %v / %v", delta["role"], delta["content"])
+	}
+}
+
+// TestWriteNonStreamAsSSE_TextOnlyUnchanged 确保只有文本的普通回复形态不变，
+// 并且 content 缺省时补空字符串而不是 null（部分客户端对 null 会解析失败）。
+func TestWriteNonStreamAsSSE_TextOnlyUnchanged(t *testing.T) {
+	upstream := []byte(`{
+	  "id": "chatcmpl_t", "object": "chat.completion", "created": 1,
+	  "model": "m",
+	  "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "你好"}}]
+	}`)
+	rr := httptest.NewRecorder()
+	writeNonStreamAsSSE(rr, rr, upstream, "m")
+
+	var chunk map[string]interface{}
+	payload := []byte{}
+	for _, l := range strings.Split(rr.Body.String(), "\n\n") {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "data: ") && !strings.HasPrefix(trimmed, "data: [DONE]") {
+			payload = []byte(strings.TrimPrefix(trimmed, "data: "))
+		}
+	}
+	if len(payload) == 0 {
+		t.Fatalf("未找到 data 载荷: %s", rr.Body.String())
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("载荷不是合法 JSON: %v", err)
+	}
+	choice := chunk["choices"].([]interface{})[0].(map[string]interface{})
+	delta := choice["delta"].(map[string]interface{})
+	if delta["content"] != "你好" || delta["role"] != "assistant" {
+		t.Errorf("delta = %v", delta)
+	}
+	if _, has := delta["tool_calls"]; has {
+		t.Errorf("纯文本回复不应出现 tool_calls: %s", payload)
+	}
+
+	// content 缺失时必须补空串，不能是 null。
+	rr2 := httptest.NewRecorder()
+	writeNonStreamAsSSE(rr2, rr2, []byte(`{"object":"chat.completion","choices":[{"finish_reason":"stop","message":{"role":"assistant"}}]}`), "m")
+	payload2 := []byte{}
+	for _, l := range strings.Split(rr2.Body.String(), "\n\n") {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "data: ") && !strings.HasPrefix(trimmed, "data: [DONE]") {
+			payload2 = []byte(strings.TrimPrefix(trimmed, "data: "))
+		}
+	}
+	if err := json.Unmarshal(payload2, &chunk); err != nil {
+		t.Fatalf("载荷不是合法 JSON: %v", err)
+	}
+	choice2 := chunk["choices"].([]interface{})[0].(map[string]interface{})
+	delta2 := choice2["delta"].(map[string]interface{})
+	if c, ok := delta2["content"].(string); !ok || c != "" {
+		t.Errorf("content 缺省时应为空字符串，实际 %T %v", delta2["content"], delta2["content"])
 	}
 }

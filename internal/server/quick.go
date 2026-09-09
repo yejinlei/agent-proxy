@@ -2336,10 +2336,51 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 			}
 			msgMap, ok := choiceMap["message"].(map[string]interface{})
 			if !ok {
-				msgMap = map[string]interface{}{"role": "assistant", "content": ""}
+				msgMap = map[string]interface{}{}
 			}
-			if _, hasModel := msgMap["model"]; !hasModel {
-				msgMap["model"] = effectiveModel
+			// delta 必须带上 message 的完整语义，不能只取 role/content：
+			// 只搬这两个字段时，上游的 tool_calls 会被整段丢掉，客户端收到
+			// finish_reason="tool_calls" 却没有工具调用列表，无工具可执行、
+			// 表现为一直停在输入提示符（Kimi Code 读文件这一轮即此症状）。
+			// 反向也不能把 msgMap 整个塞进 delta —— 上游常带 reasoning 等非标准
+			// 字段，严格客户端会拒收，所以这里按白名单挑字段。
+			role := "assistant"
+			if r, ok := msgMap["role"].(string); ok && r != "" {
+				role = r
+			}
+			content := ""
+			if c, ok := msgMap["content"].(string); ok {
+				content = c
+			}
+			delta := map[string]interface{}{"role": role, "content": content}
+			if tools, ok := msgMap["tool_calls"].([]interface{}); ok {
+				normalized := make([]interface{}, 0, len(tools))
+				for ti, tAny := range tools {
+					tm, ok := tAny.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if _, ok := tm["type"]; !ok {
+						tm["type"] = "function"
+					}
+					tm["index"] = ti
+					if fn, ok := tm["function"].(map[string]interface{}); ok {
+						// 非流式里 arguments 是完整 JSON 字符串，流式增量按 OpenAI
+						// 约定也是字符串（可增量拼接），这里整串作为一次增量发出。
+						switch v := fn["arguments"].(type) {
+						case string:
+							fn["arguments"] = v
+						case nil:
+							fn["arguments"] = ""
+						default:
+							if a, e := json.Marshal(v); e == nil {
+								fn["arguments"] = string(a)
+							}
+						}
+					}
+					normalized = append(normalized, tm)
+				}
+				delta["tool_calls"] = normalized
 			}
 			chunk := map[string]interface{}{
 				"id":      fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
@@ -2349,10 +2390,7 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 				"choices": []interface{}{
 					map[string]interface{}{
 						"index": 0,
-						"delta": map[string]interface{}{
-							"role":    "assistant",
-							"content": msgMap["content"],
-						},
+						"delta": delta,
 						"finish_reason": choiceMap["finish_reason"],
 					},
 				},
