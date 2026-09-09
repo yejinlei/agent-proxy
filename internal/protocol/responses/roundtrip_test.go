@@ -116,7 +116,86 @@ func TestOutbound_BuildInputArray_WithImage(t *testing.T) {
 	if blocks[1].Type != "input_image" {
 		t.Fatalf("image block type: got %q", blocks[1].Type)
 	}
-	if blocks[1].Source["type"] != "base64" || blocks[1].Source["data"] != imgData {
-		t.Errorf("source: %+v", blocks[1].Source)
+	if got := blocks[1].ImageURL; got != "data:image/png;base64,"+imgData {
+		t.Errorf("image_url: got %q, want data:image/png;base64,<imgData>", got)
+	}
+	if blocks[1].Source != nil {
+		t.Errorf("image block must not carry Anthropic-style source: %+v", blocks[1].Source)
+	}
+}
+
+// TestInbound_ImageURL_CodexFormat 验证 Codex CLI 的 input_image 形状能被解析，
+// 而不是静默丢图。image_url 在块顶层（非 source 嵌套），data URL 带 media type，
+// 另带 detail 字段。Codex 线格式见 codex-rs/protocol/src/models.rs ContentItem::InputImage。
+// 用原始 JSON 而非构造 ContentBlock，因为线上入站本来就是 map[string]interface{}。
+func TestInbound_ImageURL_CodexFormat(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := []byte(`{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[` +
+		`{"type":"input_text","text":"describe this"},` +
+		`{"type":"input_image","image_url":"data:image/png;base64,` + imgData + `","detail":"high"}` +
+		`]}]}`)
+
+	req, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	msg := req.Messages[0]
+	if len(msg.ContentBlocks) != 2 {
+		t.Fatalf("ContentBlocks: got %d, want 2", len(msg.ContentBlocks))
+	}
+	ib := msg.ContentBlocks[1]
+	if ib.Type != "image" || ib.Data != imgData || ib.MediaType != "image/png" {
+		t.Errorf("image block: %+v", ib)
+	}
+}
+
+// TestInbound_ImageURL_CodexPlainURL 验证 Codex 顶层 image_url 是普通 URL 时也走 URL 分支
+func TestInbound_ImageURL_CodexPlainURL(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := []byte(`{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[` +
+		`{"type":"input_image","image_url":"https://example.com/photo.jpg"}` + `]}]}`)
+
+	req, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	ib := req.Messages[0].ContentBlocks[0]
+	if ib.Type != "image" || ib.URL != "https://example.com/photo.jpg" || ib.Data != "" {
+		t.Errorf("image block: %+v", ib)
+	}
+}
+
+// TestInbound_ImageNoData_Skipped 验证既无 source 又无 image_url 的空 input_image 被丢弃
+// 而不是写成空 image 块（空块出站无信息量，还会让上游收到一个必然失败的图引用）。
+func TestInbound_ImageNoData_Skipped(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := []byte(`{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[` +
+		`{"type":"input_text","text":"hi"},` + `{"type":"input_image"}` + `]}]}`)
+
+	req, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	msg := req.Messages[0]
+	if len(msg.ContentBlocks) != 1 || msg.ContentBlocks[0].Type != "text" {
+		t.Errorf("empty image block must be dropped, got %+v", msg.ContentBlocks)
+	}
+}
+
+// TestInbound_ImageSourceAndImageURL_Both 两种形状同时存在时 image_url 优先
+// （Codex 分支后于 source 分支执行，故意保留这个顺序让顶层字段覆盖嵌套字段）
+func TestInbound_ImageSourceAndImageURL_Both(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := []byte(`{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[` +
+		`{"type":"input_image","source":{"type":"base64","data":"AAA","media_type":"image/jpeg"},` +
+		`"image_url":"data:image/png;base64,` + imgData + `"}]}]}`)
+
+	req, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	ib := req.Messages[0].ContentBlocks[0]
+	if ib.Data != imgData || ib.MediaType != "image/png" {
+		t.Errorf("image_url should win over source: %+v", ib)
 	}
 }

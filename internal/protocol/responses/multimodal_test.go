@@ -23,8 +23,12 @@ func TestBuildResponsesContentBlocks_Image(t *testing.T) {
 	if out[1].Type != "input_image" {
 		t.Fatalf("image type: got %q", out[1].Type)
 	}
-	if out[1].Source["type"] != "base64" || out[1].Source["data"] != sampleBase64 {
-		t.Errorf("source: %+v", out[1].Source)
+	// Responses 图片走顶层 image_url（OpenAI 官方 + Codex 线格式），不是 Anthropic 的 source
+	if out[1].ImageURL != "data:image/png;base64,"+sampleBase64 {
+		t.Errorf("image_url: got %q", out[1].ImageURL)
+	}
+	if out[1].Source != nil {
+		t.Errorf("image block must not carry source: %+v", out[1].Source)
 	}
 }
 
@@ -36,10 +40,35 @@ func TestBuildResponsesContentBlocks_ImageURL(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("len: got %d", len(out))
 	}
-	if out[0].Type != "input_image" || out[0].Source["type"] != "url" {
-		t.Errorf("source: %+v", out[0].Source)
+	if out[0].Type != "input_image" || out[0].ImageURL != "https://example.com/photo.jpg" {
+		t.Errorf("image_url: %+v", out[0])
 	}
-	if out[0].Source["url"] != "https://example.com/photo.jpg" {
-		t.Errorf("url: %+v", out[0].Source)
+}
+
+// TestBuildResponsesContentBlocks_ImageNoMediaType 缺 media_type 时兜底 image/png，
+// 而不是产出 "data:;base64," 这种坏 URL
+func TestBuildResponsesContentBlocks_ImageNoMediaType(t *testing.T) {
+	out := buildResponsesContentBlocks([]schema.InternalContentBlock{
+		{Type: "image", Data: sampleBase64},
+	})
+	if len(out) != 1 {
+		t.Fatalf("len: got %d", len(out))
+	}
+	if out[0].ImageURL != "data:image/png;base64,"+sampleBase64 {
+		t.Errorf("image_url: got %q", out[0].ImageURL)
+	}
+}
+
+// TestBuildResponsesContentBlocks_ImageEmpty_Dropped 无 Data 无 URL 的空 image 块必须跳过
+func TestBuildResponsesContentBlocks_ImageEmpty_Dropped(t *testing.T) {
+	out := buildResponsesContentBlocks([]schema.InternalContentBlock{
+		{Type: "text", Text: "hi"},
+		{Type: "image"},
+	})
+	if len(out) != 1 {
+		t.Fatalf("len: got %d, want 1", len(out))
+	}
+	if out[0].Type != "input_text" {
+		t.Errorf("type: got %q", out[0].Type)
 	}
 }

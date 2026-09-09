@@ -355,12 +355,80 @@ func jsonMarshalCompact(v interface{}) []byte {
 	return b
 }
 
+// parseResponsesImageBlock 解析 Responses 协议的 input_image 内容块，返回中枢 image 块。
+// 返回 nil 表示该块没有任何可用图像数据，调用方必须跳过——写进 ContentBlocks 会变成
+// 一个空 image 块，出站时被「无 Data 无 URL」的分支静默丢弃，上游永远收不到图。
+//
+// 两种线格式都接受，因为入站 Responses 请求的来源不止一种：
+//   - OpenAI Responses API 官方格式：{type:"input_image", source:{type:"base64"|"url", ...}}
+//   - Codex CLI 格式：{type:"input_image", image_url:"data:image/png;base64,...", detail:"high"}
+//     （见 codex-rs/protocol/src/models.rs ContentItem::InputImage，image_url 在块顶层）
+//
+// Codex 分支此前完全缺失：入站只读 source，Codex 的 image_url 读不到 → 空块 → 图片
+// 静默丢失，且全程无任何报错。image_url 既可能是 data URL 也可能是普通 URL，两种都处理。
+// 解析出的数据统一落进 Data/MediaType/URL，与 chatcompletion.ParseCCContentBlocks 的
+// data URL 拆分逻辑一致（参考已验证可用的 Anthropic 上游路径）。
+func parseResponsesImageBlock(block map[string]interface{}) *schema.InternalContentBlock {
+	icb := schema.InternalContentBlock{Type: "image"}
+	if source, ok := block["source"].(map[string]interface{}); ok {
+		switch source["type"] {
+		case "base64":
+			icb.Data, _ = source["data"].(string)
+			icb.MediaType, _ = source["media_type"].(string)
+		case "url":
+			icb.URL, _ = source["url"].(string)
+			icb.MediaType, _ = source["media_type"].(string)
+		}
+	}
+	if url, ok := block["image_url"].(string); ok && url != "" {
+		if strings.HasPrefix(url, "data:") {
+			if comma := strings.Index(url, ","); comma > 0 {
+				// "data:image/png;base64" → MediaType 取分号前的媒体类型
+				mediaType := strings.TrimPrefix(url[:comma], "data:")
+				if semi := strings.Index(mediaType, ";"); semi > 0 {
+					mediaType = mediaType[:semi]
+				}
+				icb.MediaType = mediaType
+				icb.Data = url[comma+1:]
+			} else {
+				icb.URL = url
+			}
+		} else {
+			icb.URL = url
+		}
+	}
+	if icb.Data == "" && icb.URL == "" {
+		return nil
+	}
+	return &icb
+}
+
+// responsesImageDataURL 把中枢 image 块转回 Responses 顶层 image_url 字段值。
+// Data 优先（base64 内联），URL 兜底。Data 为空且无 URL 时返回空串，调用方据此跳过该块。
+// 注意：Responses 顶层 image_url 只有这个字段，没有 detail —— detail 是客户端到
+// 服务端的方向上（Codex 请求）才带，出站响应不需要也不应重复。
+func responsesImageDataURL(cb schema.InternalContentBlock) string {
+	if cb.Data != "" {
+		mt := cb.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		if strings.HasPrefix(mt, "data:") {
+			// 防御：MediaType 已经是完整 data URL 前缀时直接拼，不再二次包装
+			return mt + cb.Data
+		}
+		return "data:" + mt + ";base64," + cb.Data
+	}
+	return cb.URL
+}
+
 // itemToMessage 把单个 type:"message"（或 type:"function_call"）item 转为 InternalMessage。
 // 返回 false 表示该 item 无可转换内容（空文本 + 无内容块 + 无工具调用）。
 // @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - 工具调用有两种来源形态
 // @CONSTRAINT: 优先 item.ToolCalls（CC 嵌套形态）；没有时用 item.Name + item.Arguments。
-//   Arguments 必须保持 JSON 字符串原样，禁止 Unmarshal 成 map 再 Marshal（会丢顺序/转义，
-//   且与 @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING 冲突）。
+//
+//	Arguments 必须保持 JSON 字符串原样，禁止 Unmarshal 成 map 再 Marshal（会丢顺序/转义，
+//	且与 @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING 冲突）。
 func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 	msg := schema.InternalMessage{Role: schema.Role(item.Role)}
 	if msg.Role == "" {
@@ -413,24 +481,9 @@ func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 					})
 				}
 			case "input_image":
-				var icb schema.InternalContentBlock
-				icb.Type = "image"
-				if source, ok := block["source"].(map[string]interface{}); ok {
-					switch source["type"] {
-					case "base64":
-						if data, ok := source["data"].(string); ok {
-							icb.Data = data
-						}
-						if mediaType, ok := source["media_type"].(string); ok {
-							icb.MediaType = mediaType
-						}
-					case "url":
-						if url, ok := source["url"].(string); ok {
-							icb.URL = url
-						}
-					}
+				if icb := parseResponsesImageBlock(block); icb != nil {
+					contentBlocks = append(contentBlocks, *icb)
 				}
-				contentBlocks = append(contentBlocks, icb)
 			case "tool_result":
 				var toolCallID string
 				if tcid, ok := block["tool_call_id"].(string); ok {
@@ -522,8 +575,9 @@ func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 // functionCallOutputItemToMessage 把 type:"function_call_output" item 转为 role=tool 消息。
 // @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - output 字段形态不固定，必须逐级兜底
 // @CONSTRAINT: OpenAI 规范里 output 是数组（[{type:"text",text:...}] / [{type:"refusal"}]），
-//   实际客户端也可能发字符串或对象。任何提取失败仍要产出带 call_id 的 tool 消息，
-//   不能让上游出现"有调用无结果"的悬空配对。
+//
+//	实际客户端也可能发字符串或对象。任何提取失败仍要产出带 call_id 的 tool 消息，
+//	不能让上游出现"有调用无结果"的悬空配对。
 func functionCallOutputItemToMessage(item InputItem) schema.InternalMessage {
 	text := extractOutputText(item.Output)
 	if text == "" {
@@ -1013,7 +1067,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	//   缺失时它无法区分"模型说完了"和"上游掐断了"。有 function_call item 时为 "function_call"，
 	//   否则取上游 finish_reason（缺失回退 "stop"）。
 	finalizeItems := func(status string) []interface{} {
-		sendCreated()      // 兜底：保证 created + msg added 存在
+		sendCreated() // 兜底：保证 created + msg added 存在
 		msgItem := closeMessageItem(status)
 		output := make([]interface{}, 0, 1+len(funcCallOrder))
 		output = append(output, msgItem)
@@ -1130,7 +1184,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				//   让按事件类型分发的客户端能看到真正的错误而非"干净完成 + 空内容"。
 				log.Printf("[CODEX-DEBUG] TranslateStream upstream error: status=%d type=%q message=%q",
 					event.Error.Code, event.Error.Type, event.Error.Message)
-				errObj := streamErrorObject(event.Error)   // 单层 error 对象，供 response.error/completed 内嵌
+				errObj := streamErrorObject(event.Error) // 单层 error 对象，供 response.error/completed 内嵌
 
 				// 关闭所有已打开 item（message + 已出现的 fc），status=failed
 				output := finalizeItems("failed")
@@ -1287,25 +1341,25 @@ func (t *ResponsesTranslator) TranslateToProvider(req *schema.InternalRequest) (
 		req.Model, len(input), len(instructions), len(tools), req.Stream)
 
 	// @AI_GUARD: RESPONSES_TOP_P_FILTER - SenseNova 要求 top_p ∈ (0, 1]
-		var topP *float64
-		if req.TopP != nil && *req.TopP > 0 {
-			topP = req.TopP
-		}
-
-		return &ResponseRequest{
-			Model:           req.Model,
-			Input:           input,
-			Tools:           tools,
-			Stream:          req.Stream,
-			Temperature:     req.Temperature,
-			TopP:            topP,
-			MaxOutputTokens: req.MaxOutputTokens,
-			StopSequences:   req.StopSequences,
-			ResponseFormat:  responseFormatToResponses(req.ResponseFormat),
-			Metadata:        &Metadata{UserID: req.UserID, Seed: req.Seed},
-			Instructions:    instructions,
-		}, nil
+	var topP *float64
+	if req.TopP != nil && *req.TopP > 0 {
+		topP = req.TopP
 	}
+
+	return &ResponseRequest{
+		Model:           req.Model,
+		Input:           input,
+		Tools:           tools,
+		Stream:          req.Stream,
+		Temperature:     req.Temperature,
+		TopP:            topP,
+		MaxOutputTokens: req.MaxOutputTokens,
+		StopSequences:   req.StopSequences,
+		ResponseFormat:  responseFormatToResponses(req.ResponseFormat),
+		Metadata:        &Metadata{UserID: req.UserID, Seed: req.Seed},
+		Instructions:    instructions,
+	}, nil
+}
 
 func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 	var items []InputItem
@@ -1408,7 +1462,13 @@ func toolsToResponses(tools []schema.InternalTool) []Tool {
 
 // buildResponsesContentBlocks 将 InternalContentBlock 转为 Responses 请求内容块
 // 文本 → {type:"input_text", text:"..."}
-// 图片 → {type:"input_image", source:{type:"base64"|"url", data/url, media_type}}
+// 图片 → {type:"input_image", image_url:"data:<mt>;base64,<data>"|"<url>"}
+//
+// image_url 是 Responses 协议规范（OpenAI 官方）的字段，Codex CLI 发的也是这个
+// （codex-rs/protocol/src/models.rs ContentItem::InputImage.image_url）。此前这里写
+// 的是 Anthropic 的 source:{type,data,media_type} 形状——那个形状 Anthropic 上游认，
+// OpenAI 系上游不认，图片被静默丢弃。source 保留在结构体里是因为上游
+// TranslateFromProvider 的 output_image 分支仍需要解析它。
 func buildResponsesContentBlocks(blocks []schema.InternalContentBlock) []ContentBlock {
 	var result []ContentBlock
 	for _, cb := range blocks {
@@ -1416,22 +1476,12 @@ func buildResponsesContentBlocks(blocks []schema.InternalContentBlock) []Content
 		case "text":
 			result = append(result, ContentBlock{Type: "input_text", Text: cb.Text})
 		case "image":
-			var source map[string]interface{}
-			if cb.Data != "" {
-				source = map[string]interface{}{
-					"type":       "base64",
-					"data":       cb.Data,
-					"media_type": cb.MediaType,
-				}
-			} else if cb.URL != "" {
-				source = map[string]interface{}{
-					"type": "url",
-					"url":  cb.URL,
-				}
+			url := responsesImageDataURL(cb)
+			if url == "" {
+				// 无数据无 URL 的空 image 块：写出去也没有信息量，跳过
+				continue
 			}
-			if source != nil {
-				result = append(result, ContentBlock{Type: "input_image", Source: source})
-			}
+			result = append(result, ContentBlock{Type: "input_image", ImageURL: url})
 		}
 	}
 	return result
@@ -1771,12 +1821,15 @@ func (t *ResponsesTranslator) TranslateError(err *schema.StreamError) json.RawMe
 // streamErrorObject 返回 Responses 协议单层的 error 对象（不含外层 "error" 信封）。
 // @AI_GUARD: RESPONSES_ERROR_SHAPE - 错误对象必须单层，禁止信封套信封
 // @CONSTRAINT: TranslateError 产出 {"error":{...}} 信封供 writeData/writeStreamEvent
-//   直接作为 SSE data 行；TranslateStream 的 error 分支要把它嵌进
-//   response.completed.response.error，若复用信封就变成 {"error":{"error":{...}}}，
-//   Codex 取 response.error.message 得到 undefined。
+//
+//	直接作为 SSE data 行；TranslateStream 的 error 分支要把它嵌进
+//	response.completed.response.error，若复用信封就变成 {"error":{"error":{...}}}，
+//	Codex 取 response.error.message 得到 undefined。
+//
 // @REASON: v0.2.119 — 上游 4xx 曾呈现为"成功但空内容"，且 error.message 是双重 JSON 编码
-//   （错误体被 json.Marshal 成字符串再塞进 message 字段），客户端完全无法归因。
-//   这里对 Message 是 JSON 对象时先解析还原，保持 message 为人类可读字符串。
+//
+//	（错误体被 json.Marshal 成字符串再塞进 message 字段），客户端完全无法归因。
+//	这里对 Message 是 JSON 对象时先解析还原，保持 message 为人类可读字符串。
 func streamErrorObject(err *schema.StreamError) map[string]interface{} {
 	obj := map[string]interface{}{}
 	if err == nil {

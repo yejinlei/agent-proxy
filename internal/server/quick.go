@@ -3788,6 +3788,147 @@ func quickReadWSFrame(conn net.Conn) ([]byte, error) {
 			}
 		}
 
+		// RFC 6455 permits a message to arrive as an initial frame plus
+		// continuation frames, with control frames interleaved (section 5.5).
+		// Reassemble before returning: a truncated message fails JSON parse
+		// on the codex side and triggers an HTTPS fallback. qwsMaxPayload caps it.
+		if opcode == qwsOpText && header[0]&0x80 == 0 {
+			msg := append([]byte(nil), payload...)
+			for header[0]&0x80 == 0 {
+				hd := make([]byte, 2)
+				if _, err := io.ReadFull(conn, hd); err != nil {
+					return nil, err
+				}
+				ln := uint64(hd[1] & 0x7F)
+				if ln == 126 {
+					ext := make([]byte, 2)
+					if _, err := io.ReadFull(conn, ext); err != nil {
+						return nil, err
+					}
+					ln = uint64(binary.BigEndian.Uint16(ext))
+				} else if ln == 127 {
+					ext := make([]byte, 8)
+					if _, err := io.ReadFull(conn, ext); err != nil {
+						return nil, err
+					}
+					ln = binary.BigEndian.Uint64(ext)
+				}
+				if ln > qwsMaxPayload {
+					return nil, fmt.Errorf("websocket: frame payload too large (%d bytes)", ln)
+				}
+				op2 := hd[0] & 0x0F
+				if op2 == qwsOpPing {
+					// RFC 6455 5.5: a control frame may split a fragmented message.
+					// Answer the ping instead of failing - otherwise a keepalive arriving
+					// mid-request would be misreported as a broken stream.
+					var mk [4]byte
+					if hd[1]&qwsMask != 0 {
+						if _, err := io.ReadFull(conn, mk[:]); err != nil {
+							return nil, err
+						}
+					}
+					pm := make([]byte, ln)
+					if _, err := io.ReadFull(conn, pm); err != nil {
+						return nil, err
+					}
+					if hd[1]&qwsMask != 0 {
+						for i := range pm {
+							pm[i] ^= mk[i%4]
+						}
+					}
+					if err := writeWSCtrl(conn, qwsOpPong, pm); err != nil {
+						return nil, err
+					}
+					continue
+				} else if op2 == qwsOpPong {
+					// unsolicited pong mid-message: consume and ignore, as the outer
+					// switch does for a top-level pong.
+					var mk [4]byte
+					if hd[1]&qwsMask != 0 {
+						if _, err := io.ReadFull(conn, mk[:]); err != nil {
+							return nil, err
+						}
+					}
+					pm := make([]byte, ln)
+					if _, err := io.ReadFull(conn, pm); err != nil {
+						return nil, err
+					}
+					if hd[1]&qwsMask != 0 {
+						for i := range pm {
+							pm[i] ^= mk[i%4]
+						}
+					}
+					_ = pm
+					continue
+				} else if op2 == qwsOpClose {
+					// peer closed mid-message: echo close for a proper handshake instead
+					// of a bare TCP reset, then fail the request.
+					var mk [4]byte
+					if hd[1]&qwsMask != 0 {
+						if _, err := io.ReadFull(conn, mk[:]); err != nil {
+							return nil, err
+						}
+					}
+					pm := make([]byte, ln)
+					if _, err := io.ReadFull(conn, pm); err != nil {
+						return nil, err
+					}
+					if hd[1]&qwsMask != 0 {
+						for i := range pm {
+							pm[i] ^= mk[i%4]
+						}
+					}
+					_ = pm
+					if err := writeWSCtrl(conn, qwsOpClose, []byte{0x03, 0xE8}); err != nil {
+						return nil, err
+					}
+					return nil, fmt.Errorf("websocket: closed by peer")
+				} else if op2 != 0x0 {
+					if op2 == qwsOpText {
+						// a fresh text message inside a fragmented one: consume its body so
+						// the stream stays synchronised, then report the interruption.
+						var mk [4]byte
+						if hd[1]&qwsMask != 0 {
+							if _, err := io.ReadFull(conn, mk[:]); err != nil {
+								return nil, err
+							}
+						}
+						pm := make([]byte, ln)
+						if _, err := io.ReadFull(conn, pm); err != nil {
+							return nil, err
+						}
+						if hd[1]&qwsMask != 0 {
+							for i := range pm {
+								pm[i] ^= mk[i%4]
+							}
+						}
+						_ = pm
+					}
+					return nil, fmt.Errorf("websocket: message interrupted by opcode 0x%x", op2)
+				}
+				var mk [4]byte
+				if hd[1]&qwsMask != 0 {
+					if _, err := io.ReadFull(conn, mk[:]); err != nil {
+						return nil, err
+					}
+				}
+				part := make([]byte, ln)
+				if _, err := io.ReadFull(conn, part); err != nil {
+					return nil, err
+				}
+				if hd[1]&qwsMask != 0 {
+					for i := range part {
+						part[i] ^= mk[i%4]
+					}
+				}
+				if uint64(len(msg)+len(part)) > qwsMaxPayload {
+					return nil, fmt.Errorf("websocket: message payload too large (%d bytes)", uint64(len(msg)+len(part)))
+				}
+				msg = append(msg, part...)
+				header = hd
+			}
+			payload = msg
+		}
 		switch opcode {
 		case qwsOpText:
 			return payload, nil
@@ -3864,6 +4005,77 @@ type qwsResponseWriter struct {
 	hbOn bool
 }
 
+// quickWriteWSCodexEvents 把剥信封后的事件体按行拆分，逐个写成独立 WS 帧。
+// 单事件时只有一个帧，与旧行为一致；多事件批（如一次 Write 带多个 SSE 事件）
+// 必须拆帧，否则整帧不是单个 JSON 对象，Codex 解析失败静默丢弃。
+func quickWriteWSCodexEvents(conn net.Conn, events []byte) error {
+	for _, ev := range bytes.Split(events, []byte("\n")) {
+		if len(ev) == 0 {
+			continue
+		}
+		if err := quickWriteWSFrame(conn, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// unwrapWSSEFrame strips the Responses SSE envelope (event: line, data: prefix,
+// trailing blank line) so only the raw JSON event body is left.
+//
+// WS and HTTPS are two different wire protocols: the same event stream is bare
+// JSON on the WebSocket and SSE on HTTPS. Unwrapping is required because Codex
+// parses the whole WS frame with serde_json::from_str, which does not strip an
+// SSE prefix (unlike the HTTPS SSE parser). Before v0.2.126 the frames went out
+// with the envelope, every event failed to parse and was silently dropped, so
+// response.completed never arrived and Codex reported
+// "websocket closed by server before response.completed".
+//
+// Rules that matter:
+//   - event: / id: / retry: / ":" lines are SSE control lines, not event bodies.
+//   - "data: " has one space in the spec but OpenAI writes two; trim all spaces.
+//   - a bare "data: " line is only a separator in a multi-event batch.
+//   - [DONE] is not JSON, and the real response.completed event already
+//     breaks the Codex loop, so a bare terminal marker would be dropped by
+//     serde_json::from_str. [DONE] is dropped on the WS path, not rewritten:
+//     ResponseCompleted requires an id field, so a fabricated completed event
+//     fails to parse and returns an Err that aborts the whole stream.
+//   - when the input is not an SSE envelope, return it unchanged (defensive).
+func unwrapWSSEFrame(b []byte) []byte {
+	lines := bytes.Split(b, []byte("\n"))
+	out := make([]byte, 0, len(b))
+	for _, raw := range lines {
+		line := bytes.TrimSpace(raw)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			line = bytes.TrimLeft(bytes.TrimPrefix(line, []byte("data:")), " ")
+		} else {
+			// event: name, id:, retry: and ":" comment lines are not event bodies.
+			// Keeping them would splice the event name into the JSON payload.
+			continue
+		}
+		if len(line) == 0 {
+			continue
+		}
+		if bytes.Equal(line, []byte("[DONE]")) {
+			continue
+		}
+		if len(out) > 0 {
+			out = append(out, '\n')
+		}
+		out = append(out, line...)
+	}
+	if len(out) == 0 {
+		return b
+	}
+	return out
+}
+
+// heartbeatEventFrame 把心跳事件体装成 WS 帧内容。心跳和事件流走同一个信封规则，
+// 否则会出现「事件流是裸 JSON、心跳是 SSE」的不对称，心跳仍然解析失败。
+func heartbeatEventFrame(frame []byte) []byte {
+	return unwrapWSSEFrame(frame)
+}
+
 func (w *qwsResponseWriter) Header() http.Header {
 	if w.header == nil {
 		w.header = make(http.Header)
@@ -3878,27 +4090,33 @@ func (w *qwsResponseWriter) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	// 从已发出的事件里记录 item_id，供 WritePing 构造合法的 output_text.delta 心跳。
-	// 同时把「首 token 已到达」「流已收尾」这两个信号反映到 hbOn：之后不再保活。
-	w.observeHeartbeatState(b)
+	// Codex WS 路径按裸 JSON 解析整帧（serde_json::from_str，无 SSE 解包），
+	// 必须先剥掉 event:/data: 信封，否则每个事件都解析失败被静默丢弃。
+	// 拆成多个事件时每个事件单独一帧：Codex 对整个帧做一次 from_str，
+	// 一个帧里塞多个 JSON 对象同样解析失败，等于全部丢失。
+	events := unwrapWSSEFrame(b)
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// 心跳状态必须在同一把锁内更新：WritePing 在另一 goroutine 里读 hbOn/
+	// lastItemID（也在锁内）。此前在锁外调用属于数据竞争，最爱死后是发出
+	// 孤立空 delta（Codex 接受但序列噪音），这里改成真正互斥。
+	w.observeHeartbeatState(b)
 	if err := w.conn.SetWriteDeadline(time.Now().Add(qwsWriteDeadline)); err != nil {
-		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(events), err, wsPreview(events))
 		return 0, err
 	}
-	if err := quickWriteWSFrame(w.conn, b); err != nil {
+	if err := quickWriteWSCodexEvents(w.conn, events); err != nil {
 		// WS 数据帧写出失败必须落日志：静默返回会让"WS 降级到 HTTPS"这类
 		// 客户端侧症状在代理日志里零线索，无法区分是客户端先关、还是我们写超时。
 		// v0.2.121 实测 13:23:53 后所有请求从 WS 变成 HTTPS，日志里查不到任何
 		// 失败记录——这条路径此前只 return err，err 在 handler 里被当成正常流结束吞掉。
 		// 必须与 gateway.go wsResponseWriter.Write 保持同步。
-		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(b), err, wsPreview(b))
+		log.Printf("[CODEX-DEBUG] WS frame → client FAILED: bytes=%d err=%v preview=%q", len(events), err, wsPreview(events))
 		return 0, err
 	}
 	// @CODEX-DEBUG v0.2.98：每帧写出记录（生产可见，前 120 字节用于定位生命周期事件）
-	log.Printf("[CODEX-DEBUG] WS frame → client: bytes=%d preview=%q", len(b), wsPreview(b))
-	return len(b), nil
+	log.Printf("[CODEX-DEBUG] WS frame → client: bytes=%d preview=%q", len(events), wsPreview(events))
+	return len(events), nil
 }
 
 // observeHeartbeatState 从写出的 SSE 帧里提取心跳需要的状态。
@@ -4012,7 +4230,7 @@ func (w *qwsResponseWriter) WritePing() error {
 	frame := append([]byte("event: response.output_text.delta\ndata: "), raw...)
 	frame = append(frame, '\n', '\n')
 
-	if err := quickWriteWSFrame(w.conn, frame); err != nil {
+	if err := quickWriteWSFrame(w.conn, heartbeatEventFrame(frame)); err != nil {
 		log.Printf("[CODEX-DEBUG] WS heartbeat → client FAILED: bytes=%d err=%v preview=%q",
 			len(frame), err, wsPreview(frame))
 		return err
