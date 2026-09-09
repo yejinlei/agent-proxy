@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Claude Code — Anthropic Messages 翻译路径",
+    "output": "docs/interactive/claude-code.html",
+    "viewBox": [
+      1800,
+      990
+    ],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "Claude Code",
+      "sublabel": "POST /v1/messages"
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "代理",
+      "sublabel": "quick.go / gateway.go"
+    },
+    {
+      "id": "treg",
+      "type": "backend",
+      "label": "TranslatorRegistry",
+      "sublabel": "Central Schema"
+    },
+    {
+      "id": "upstream",
+      "type": "external",
+      "label": "上游 API",
+      "sublabel": "SenseNova / OpenAI"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 320,
+      "label": "① 入站 Anthropic → Central Schema"
+    },
+    {
+      "from": 330,
+      "to": 500,
+      "label": "② 出站整形与上游调用"
+    },
+    {
+      "from": 510,
+      "to": 700,
+      "label": "③ 上游 SSE → InternalStreamEvent"
+    },
+    {
+      "from": 710,
+      "to": 938,
+      "label": "④ Anthropic 事件序列"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "client",
+      "to": "proxy",
+      "y": 165,
+      "label": "POST /v1/messages · stream: true",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "proxy",
+      "to": "treg",
+      "y": 200,
+      "label": "TranslateRequest(raw)",
+      "variant": "default",
+      "note": "system 抽出到 InternalRequest.SystemPrompt，绝不留在 Messages 里"
+    },
+    {
+      "id": "m3",
+      "from": "treg",
+      "to": "proxy",
+      "y": 235,
+      "label": "InternalRequest",
+      "variant": "return"
+    },
+    {
+      "id": "m4",
+      "from": "proxy",
+      "to": "treg",
+      "y": 270,
+      "label": "TranslateToProvider(openai)",
+      "variant": "default"
+    },
+    {
+      "id": "m5",
+      "from": "treg",
+      "to": "proxy",
+      "y": 305,
+      "label": "provider body (json.RawMessage)",
+      "variant": "return",
+      "note": "buildCCRequest 在此为 role:tool 消息配对 tool_call_id，thinking 块一并剥离"
+    },
+    {
+      "id": "m6",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 420,
+      "label": "POST /v1/chat/completions · stream: true",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m7",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 475,
+      "label": "SSE chunks: content → finish_reason",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "proxy",
+      "to": "client",
+      "y": 520,
+      "label": "event: ping · data: {\"type\":\"ping\"}",
+      "variant": "dashed"
+    },
+    {
+      "id": "m9",
+      "from": "proxy",
+      "to": "treg",
+      "y": 560,
+      "label": "TranslateStreamEvent(rawEvent)",
+      "variant": "default"
+    },
+    {
+      "id": "m10",
+      "from": "treg",
+      "to": "proxy",
+      "y": 595,
+      "label": "InternalStreamEvent",
+      "variant": "return"
+    },
+    {
+      "id": "m11",
+      "from": "proxy",
+      "to": "treg",
+      "y": 630,
+      "label": "TranslateStream(eventChan, outFn)",
+      "variant": "default"
+    },
+    {
+      "id": "m12",
+      "from": "treg",
+      "to": "proxy",
+      "y": 665,
+      "label": "data: {\"type\":\"message_start\"}",
+      "variant": "return"
+    },
+    {
+      "id": "m13",
+      "from": "proxy",
+      "to": "client",
+      "y": 735,
+      "label": "message_start · content: [] · id: msg_…",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m14",
+      "from": "proxy",
+      "to": "client",
+      "y": 770,
+      "label": "content_block_start · citations: []",
+      "variant": "default"
+    },
+    {
+      "id": "m15",
+      "from": "proxy",
+      "to": "client",
+      "y": 805,
+      "label": "content_block_delta ×N",
+      "variant": "default"
+    },
+    {
+      "id": "m16",
+      "from": "proxy",
+      "to": "client",
+      "y": 840,
+      "label": "content_block_stop",
+      "variant": "default"
+    },
+    {
+      "id": "m17",
+      "from": "proxy",
+      "to": "client",
+      "y": 872,
+      "label": "message_delta · output_tokens",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m18",
+      "from": "proxy",
+      "to": "client",
+      "y": 906,
+      "label": "message_stop",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "client",
+      "from": 165,
+      "to": 905,
+      "type": "external"
+    },
+    {
+      "participant": "proxy",
+      "from": 165,
+      "to": 905,
+      "type": "backend"
+    },
+    {
+      "participant": "treg",
+      "from": 195,
+      "to": 670,
+      "type": "backend"
+    },
+    {
+      "participant": "upstream",
+      "from": 415,
+      "to": 480,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "事件序列硬约束",
+      "items": [
+        "message_start → content_block_start → content_block_delta* → content_block_stop → message_delta → message_stop",
+        "message_start.content 必须是 [] 而非 null，id 必须 msg_ 前缀非空",
+        "content_block_start 必须带 citations: []，且先于第一个 delta"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Token 计数",
+      "items": [
+        "message_start.output_tokens 必须为 0，最终数写在 message_delta",
+        "usage 恒为非空对象，Claude Code 校验 K.usage.input_tokens",
+        "CC SSE 请求必须注入 stream_options:{include_usage:true}"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "取消安全与工具配对",
+      "items": [
+        "流被取消也补发 content_block_stop 加 message_delta 加 message_stop",
+        "buildCCRequest 为 role:tool 消息配对 tool_call_id，否则模型误判文件未读",
+        "thinking 块在出口剥离，非流式与流式两路都要过滤"
+      ]
+    }
+  ]
+}

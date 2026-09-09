@@ -3,7 +3,7 @@
   "diagram_type": "architecture",
   "meta": {
     "title": "Agent-Proxy 系统架构",
-    "output": "docs/architecture.html",
+    "output": "docs/interactive/architecture.html",
     "viewBox": [
       1400,
       640
@@ -51,7 +51,7 @@
       "id": "clients",
       "type": "external",
       "label": "Clients",
-      "sublabel": "Claude Code · Codex · AI 工具",
+      "sublabel": "Claude Code · Codex · Kimi Code",
       "pos": [
         40,
         260
@@ -138,6 +138,21 @@
       "tag": "provider/"
     },
     {
+      "id": "wrap",
+      "type": "backend",
+      "label": "非流式→SSE 包装",
+      "sublabel": "body > 100 KB 时启用",
+      "pos": [
+        860,
+        470
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "tag": "writeNonStreamAsSSE"
+    },
+    {
       "id": "upstream",
       "type": "external",
       "label": "上游 LLM API",
@@ -162,7 +177,8 @@
         "registry",
         "alias",
         "router",
-        "providers"
+        "providers",
+        "wrap"
       ]
     }
   ],
@@ -224,6 +240,41 @@
       "to": "upstream",
       "label": "HTTP",
       "variant": "emphasis"
+    },
+    {
+      "from": "providers",
+      "to": "wrap",
+      "label": "非流式完整响应",
+      "variant": "dashed",
+      "labelAt": [
+        970,
+        445
+      ]
+    },
+    {
+      "from": "wrap",
+      "to": "clients",
+      "label": "SSE chunk（delta 白名单）",
+      "variant": "emphasis",
+      "route": "orthogonal-h",
+      "via": [
+        [
+          860,
+          580
+        ],
+        [
+          100,
+          580
+        ],
+        [
+          100,
+          292
+        ]
+      ],
+      "labelAt": [
+        400,
+        565
+      ]
     }
   ],
   "cards": [
@@ -238,11 +289,11 @@
     },
     {
       "dot": "cyan",
-      "title": "Two modes, one core",
+      "title": "Large body wrap",
       "items": [
-        "快速模式：run --db <id> 从 SQLite 读取一条 ProxyRecord",
-        "复杂模式：run --mode complex 读取配置文件 + Web UI",
-        "两种模式共享图中这一层翻译器"
+        "stream: true 且 body > 100 KB 时改走非流式→SSE 包装",
+        "Kimi Code 系统提示词约 50407 字符，首轮 body 已 125581 B，必中阈值",
+        "wrap 只挑 role / content / tool_calls 重建 delta，防非标准字段泄漏"
       ]
     },
     {

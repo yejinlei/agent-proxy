@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Kimi Code — 大请求体透传与非流式→SSE 包装",
+    "output": "docs/interactive/kimi-code.html",
+    "viewBox": [
+      1800,
+      990
+    ],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    {
+      "id": "kimi",
+      "type": "external",
+      "label": "Kimi Code CLI",
+      "sublabel": "v0.31.0 · OpenAI Chat Completions"
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "代理",
+      "sublabel": "handlePassthroughNonStreamAsSSE"
+    },
+    {
+      "id": "upstream",
+      "type": "external",
+      "label": "上游 API",
+      "sublabel": "SenseNova token.sensenova.cn"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 225,
+      "label": "① 入站与路由决策"
+    },
+    {
+      "from": 235,
+      "to": 455,
+      "label": "② 上游非流式请求与保活"
+    },
+    {
+      "from": 465,
+      "to": 600,
+      "label": "③ SSE 包装与回传"
+    },
+    {
+      "from": 610,
+      "to": 940,
+      "label": "④ 工具回灌续轮"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "kimi",
+      "to": "proxy",
+      "y": 168,
+      "label": "POST /v1/chat/completions · stream: true",
+      "variant": "emphasis",
+      "note": "body 125997 B；系统提示词约 50407 字符、工具 24 个。别名 vmodel→sensenova-6.8-flash-lite，ingress=openai 与 provider=openai 一致故走透传，仅换 model 名；body > 100KB 阈值即改走非流式→SSE"
+    },
+    {
+      "id": "m2",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 262,
+      "label": "POST /v1/chat/completions（去掉 stream）",
+      "variant": "emphasis",
+      "note": "largeBodyThreshold = 100*1024，为避开实测 12-18s 才失败的长流式等待"
+    },
+    {
+      "id": "m3",
+      "from": "proxy",
+      "to": "kimi",
+      "y": 305,
+      "label": "event: ping · data: {\"type\":\"ping\"}",
+      "variant": "dashed",
+      "note": "上游 5.5s 才回包，心跳每 500ms 一次，本轮共 10 次；必须带 event: 前缀"
+    },
+    {
+      "id": "m4",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 380,
+      "label": "完整响应 · finish_reason: \"tool_calls\"",
+      "variant": "return"
+    },
+    {
+      "id": "m5",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 425,
+      "label": "message.tool_calls: Read(path) · usage 31969/61",
+      "variant": "return",
+      "note": "id: call_a76c…；type: function；function.arguments 是完整 JSON 字符串"
+    },
+    {
+      "id": "m6",
+      "from": "proxy",
+      "to": "kimi",
+      "y": 498,
+      "label": "data: {\"delta\":{\"role\",\"content\",\"tool_calls\":[…]}}",
+      "variant": "emphasis",
+      "note": "writeNonStreamAsSSE 按白名单重建 delta：只挑 role / content / tool_calls，补 index 与 type: function；v0.2.128 时只搬 role+content，tool_calls 整段丢失"
+    },
+    {
+      "id": "m7",
+      "from": "proxy",
+      "to": "kimi",
+      "y": 548,
+      "label": "data: [DONE]",
+      "variant": "dashed"
+    },
+    {
+      "id": "m8",
+      "from": "kimi",
+      "to": "proxy",
+      "y": 668,
+      "label": "POST /v1/chat/completions（追加调用与结果）",
+      "variant": "emphasis",
+      "note": "Kimi 解析 tool_calls 后执行 Read 工具，再发第二条请求；body 涨到 135894 B，仍命中阈值走同一路径"
+    },
+    {
+      "id": "m9",
+      "from": "proxy",
+      "to": "upstream",
+      "y": 722,
+      "label": "POST /v1/chat/completions（去掉 stream）",
+      "variant": "default"
+    },
+    {
+      "id": "m10",
+      "from": "upstream",
+      "to": "proxy",
+      "y": 788,
+      "label": "finish_reason: \"stop\" · 文件摘要",
+      "variant": "return",
+      "note": "usage 35079/921，其中 reasoning 258"
+    },
+    {
+      "id": "m11",
+      "from": "proxy",
+      "to": "kimi",
+      "y": 852,
+      "label": "data: {\"delta\":{\"role\",\"content\":\"…\"}}",
+      "variant": "return"
+    },
+    {
+      "id": "m12",
+      "from": "proxy",
+      "to": "kimi",
+      "y": 902,
+      "label": "data: [DONE]",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "kimi",
+      "from": 168,
+      "to": 907,
+      "type": "external"
+    },
+    {
+      "participant": "proxy",
+      "from": 168,
+      "to": 907,
+      "type": "backend"
+    },
+    {
+      "participant": "upstream",
+      "from": 257,
+      "to": 430,
+      "type": "external"
+    },
+    {
+      "participant": "upstream",
+      "from": 717,
+      "to": 793,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "触发条件",
+      "items": [
+        "必须同时满足 stream: true 与请求体 > 100 KB 阈值",
+        "Kimi 系统提示词约 50407 字符，首轮 body 已 125997 B，必中阈值",
+        "续轮 body 涨到 135894 / 136275 B，阈值不会因续轮被绕过"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "v0.2.129 修复",
+      "items": [
+        "修复前 delta 只搬 role 与 content，message.tool_calls 整段丢弃",
+        "客户端收到 finish_reason: tool_calls 却配空工具列表，Kimi 直接结束步骤",
+        "现按白名单重建 delta，补 index 与 type: function，不整包塞 message"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "工具回灌与遗留",
+      "items": [
+        "回灌的 role:tool 消息必须带 tool_call_id 才能配对",
+        "上游 reasoning 等非标准字段若整包透传会被严格客户端拒收",
+        "遗留：这条 SSE 包装不透出 usage，Kimi 侧 usage.record 显示全 0"
+      ]
+    }
+  ]
+}
