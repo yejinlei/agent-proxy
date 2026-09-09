@@ -789,13 +789,13 @@ func TestWritePing_EmitsLegalDelta(t *testing.T) {
 				if i == 0 {
 					continue
 				}
-				lines := strings.Split(string(payload), "\n")
-				if lines[0] != "event: response.output_text.delta" {
-					t.Errorf("心跳 event 行 = %q", lines[0])
+				// Codex parses the whole WS frame as raw JSON; no event:/data: envelope.
+				if bytes.Contains(payload, []byte("event:")) || bytes.Contains(payload, []byte("data:")) {
+					t.Fatalf("heartbeat frame still carries SSE envelope: %q", payload)
 				}
 				var ev map[string]interface{}
-				if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[1], "data: ")), &ev); err != nil {
-					t.Fatalf("心跳 data 行不是 JSON: %v: %q", err, lines[1])
+				if err := json.Unmarshal(payload, &ev); err != nil {
+					t.Fatalf("heartbeat frame is not raw JSON: %v: %q", err, payload)
 				}
 				if ev["type"] != "response.output_text.delta" {
 					t.Errorf("心跳事件类型 = %v，期望 response.output_text.delta", ev["type"])
@@ -971,4 +971,58 @@ func sseHeartbeatFrame(eventType, data string) []byte {
 	b = append(b, data...)
 	b = append(b, '\n', '\n')
 	return b
+}
+
+// TestBuildCCContentFromBlocks_URLImage covers URL images: the block carries
+// an external URL with Data empty. Without the b.URL fallback buildCCContentFromBlocks
+// emitted an empty image_url and the upstream 400ed with required image, so the
+// image was silently lost. chatcompletion/translator.go already had this fallback.
+// TestBuildCCContentFromBlocks_URLImage covers URL images: the block carries
+// an external URL with Data empty. Without the b.URL fallback
+// buildCCContentFromBlocks emitted an empty image_url and the upstream 400ed
+// with required image, so the image was silently lost. The canonical CC
+// translator in protocol/chatcompletion/translator.go already had this.
+func TestBuildCCContentFromBlocks_URLImage(t *testing.T) {
+	blocks := []schema.InternalContentBlock{
+		{Type: "text", Text: "describe this"},
+		{Type: "image", URL: "https://example.com/photo.jpg"},
+	}
+	content := buildCCContentFromBlocks(blocks)
+	imgURL := ccImageURL(t, content)
+	if imgURL != "https://example.com/photo.jpg" {
+		t.Errorf("image_url = %q, must pass the URL through", imgURL)
+	}
+
+	// Data wins over URL: an already-encoded base64 payload is the primary
+	// form and must not be replaced by the URL field.
+	withData := []schema.InternalContentBlock{
+		{Type: "image", Data: "AAA", MediaType: "image/png", URL: "https://example.com/ignored.jpg"},
+	}
+	second := buildCCContentFromBlocks(withData)
+	secondURL := ccImageURL(t, second)
+	if secondURL != "data:image/png;base64,AAA" {
+		t.Errorf("image_url = %q, want the base64 form", secondURL)
+	}
+}
+
+// ccImageURL pulls the image_url out of a CC Content block, which is an opaque
+// json.RawMessage wrapper rather than a typed struct.
+func ccImageURL(t *testing.T, c chatcompletion.Content) string {
+	t.Helper()
+	var arr []struct {
+		Type     string `json:"type"`
+		ImageURL struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if err := json.Unmarshal(c.Raw(), &arr); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	for _, b := range arr {
+		if b.Type == "image_url" {
+			return b.ImageURL.URL
+		}
+	}
+	t.Fatalf("no image_url block in %s", string(c.Raw()))
+	return ""
 }

@@ -12,6 +12,7 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"log"
 	"net"
 	"strings"
@@ -91,6 +92,26 @@ func wsCollect(t *testing.T, written chan []byte) []byte {
 		out = append(out, b...)
 	case <-time.After(time.Second):
 		t.Fatal("no frame written")
+	}
+	for {
+		select {
+		case b := <-written:
+			out = append(out, b...)
+		default:
+			return out
+		}
+	}
+}
+
+// wsDrain 收集 written channel 里的帧：先用短超时等一次（覆盖 net.Pipe 写出已解
+// 阻塞、但捕获 goroutine 还没把字节塞进 channel 的竞态窗口），再非阻塞排空。
+// 用于断言"没有多余控制帧"，不会像 wsCollect 那样在无帧时 Fatal。
+func wsDrain(written chan []byte) []byte {
+	var out []byte
+	select {
+	case b := <-written:
+		out = append(out, b...)
+	case <-time.After(100 * time.Millisecond):
 	}
 	for {
 		select {
@@ -276,14 +297,166 @@ func TestQWSResponseWriter_WriteFrames(t *testing.T) {
 	if op != qwsOpText {
 		t.Fatalf("expected text frame, got opcode 0x%X", op)
 	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("frame payload mismatch: %q", got)
+	// Codex WS 路径按裸 JSON 解析整帧（serde_json::from_str，不剥 SSE 前缀），
+	// 帧内容不得带 event:/data: 信封，否则每个事件都解析失败被静默丢弃。
+	if !bytes.Equal(got, []byte("{}")) {
+		t.Fatalf("frame payload: got %q, want raw JSON %q (SSE envelope must be stripped)", got, "{}")
 	}
 }
 
-// TestWSWriteFailureLogged 覆盖 WS 数据帧写出失败日志：
-// WS 数据帧写出失败必须落 [CODEX-DEBUG] 日志且返回错误。
-// v0.2.121 实测 WS 静默降级 HTTPS 而日志零线索，根因就是这条路径只 return err。
+// TestUnwrapWSSEFrame 覆盖 SSE 信封剥离的全部边界。这些边界是 WS 通道的直接故障源：
+// WS 与 HTTPS 是两条线协议，同一条事件流在 WS 上是裸 JSON、在 HTTPS 上是 SSE。
+func TestUnwrapWSSEFrame(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		want     string
+		passthru bool
+	}{
+		{
+			name: "standard single event",
+			in:   "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+			want: `{"type":"response.created"}`,
+		},
+		{
+			// OpenAI 标准写法是 data: 后两个空格（SSE 规范要求 1 个，允许更多），
+			// 只按 "data: " 单空格剥前缀会丢一个字符
+			name: "double space prefix",
+			in:   "event: a\ndata:  {\"a\":1}\n\n",
+			want: `{"a":1}`,
+		},
+		{
+			// [DONE] is not valid JSON: forwarding it would make Codex serde_json::from_str
+			// return Err, which aborts the whole stream. Rewriting it as a fabricated
+			// response.completed would fail the same way - ResponseCompleted.id is a
+			// required String, so {"type":"response.completed"} cannot parse either.
+			// Dropping is therefore correct, and safe: the real response.completed has
+			// already been sent and already breaks the event loop.
+			name:     "done marker",
+			in:       "event: done\ndata: [DONE]\n\n",
+			want:     "event: done\ndata: [DONE]\n\n",
+			passthru: true,
+		},
+		{
+			// When [DONE] is dropped but a real event remains, we must NOT fall back to
+			// the raw envelope - that would put the event back on WS still wrapped, i.e.
+			// the exact pre-fix failure mode.
+			name: "done marker followed by real event",
+			in:   "data: [DONE]\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+			want: `{"type":"response.completed"}`,
+		},
+		{
+			// 多事件批：event: 名行不是事件体必须过滤，空 data: 行只是分隔符
+			name: "multi event batch",
+			in:   "event: a\ndata: {\"t\":1}\ndata: \nevent: b\ndata: {\"t\":2}\n\n",
+			want: `{"t":1}` + "\n" + `{"t":2}`,
+		},
+		{
+			name:     "non-sse passthrough",
+			in:       "plain text without sse",
+			want:     "plain text without sse",
+			passthru: true,
+		},
+		{
+			name:     "empty input",
+			in:       "",
+			want:     "",
+			passthru: true,
+		},
+		{
+			name: "crlf line endings",
+			in:   "event: a\r\ndata: {\"c\":1}\r\n\r\n",
+			want: `{"c":1}`,
+		},
+		{
+			name:     "event line only no data",
+			in:       "event: response.created\n\n",
+			want:     "event: response.created\n\n",
+			passthru: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unwrapWSSEFrame([]byte(tc.in))
+			if string(got) != tc.want {
+				t.Fatalf("want %q, got %q", tc.want, got)
+			}
+			if !tc.passthru {
+				if bytes.Contains(got, []byte("event:")) || bytes.Contains(got, []byte("data:")) {
+					t.Errorf("SSE envelope residue in %q", got)
+				}
+				// Output is "one event per frame", so verify each line is standalone JSON
+				// (Codex does one serde_json::from_str per frame; a non-JSON line drops the frame)
+				for _, line := range bytes.Split(got, []byte("\n")) {
+					if len(line) == 0 {
+						continue
+					}
+					var probe map[string]interface{}
+					if json.Unmarshal(line, &probe) != nil {
+						t.Errorf("frame %q is not parseable JSON", line)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBothWSWriters_StripEnvelope 双模式同步：quick 与 gateway 的 WS writer 都必须剥信封，
+// 否则「修 A 坏 B」——这正是 quick.go/gateway.go 双模式同步规则的用途。
+func TestBothWSWriters_StripEnvelope(t *testing.T) {
+	in := []byte("event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n")
+	want := `{"delta":"hi"}`
+
+	for _, tc := range []struct {
+		name string
+		do   func() error
+	}{
+		{
+			name: "quick",
+			do: func() error {
+				client, srv := net.Pipe()
+				defer client.Close()
+				defer srv.Close()
+				w := &qwsResponseWriter{conn: srv}
+				go func() { _, _ = w.Write(in) }()
+				buf := make([]byte, 4096)
+				n, err := client.Read(buf)
+				if err != nil {
+					return err
+				}
+				if _, got := wsFirstFrame(t, buf[:n]); string(got) != want {
+					t.Errorf("quick: got %q, want %q", got, want)
+				}
+				return nil
+			},
+		},
+		{
+			name: "gateway",
+			do: func() error {
+				client, srv := net.Pipe()
+				defer client.Close()
+				defer srv.Close()
+				w := &wsResponseWriter{conn: srv}
+				go func() { _, _ = w.Write(in) }()
+				buf := make([]byte, 4096)
+				n, err := client.Read(buf)
+				if err != nil {
+					return err
+				}
+				if _, got := wsFirstFrame(t, buf[:n]); string(got) != want {
+					t.Errorf("gateway: got %q, want %q", got, want)
+				}
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = tc.do()
+		})
+	}
+}
+
 func TestWSWriteFailureLogged(t *testing.T) {
 	var buf bytes.Buffer
 	orig := log.Writer()
@@ -352,5 +525,126 @@ func TestWSPreview(t *testing.T) {
 				t.Errorf("wsPreview(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// wsFrameAt builds one masked client frame carrying wcBody[off:off+n].
+// It reuses wsClientFrame so the length encoding stays correct at every
+// payload size - the previous hand-rolled 126-length form could only express
+// 0..255 bytes and silently zeroed the high length byte. wsClientFrame always
+// sets FIN, so clear it explicitly when the frame must stay open.
+func wsFrameAt(fin bool, opcode byte, off, n int) []byte {
+	if n <= 0 {
+		n = len(wcBody) - off
+	}
+	if n > len(wcBody)-off {
+		n = len(wcBody) - off
+	}
+	frame := wsClientFrame(opcode, wcBody[off:off+n])
+	if fin {
+		frame[0] |= 0x80
+	} else {
+		frame[0] &= 0x7F
+	}
+	return frame
+}
+
+// wcBody is the message the fragmented cases reassemble. It is deliberately a
+// valid request so a correct reassembly would be usable end to end.
+var wcBody = []byte(`{"model":"vmodel","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}],"max_output_tokens":30}`)
+
+// TestQuickReadWSFrame_FragmentedMessage covers RFC 6455 section 5.4: a text
+// message may arrive as an initial frame plus continuation frames. Before the
+// fix those frames were skipped by the opcode switch, so the reader returned a
+// truncated message that failed JSON parse on the codex side and forced an
+// HTTPS fallback. The reader must return the whole reassembled message.
+func TestQuickReadWSFrame_FragmentedMessage(t *testing.T) {
+	t.Run("two fragments", func(t *testing.T) {
+		mid := len(wcBody) / 2
+		f1 := wsFrameAt(false, qwsOpText, 0, mid)
+		f2 := wsFrameAt(true, 0x0, mid, len(wcBody)-mid)
+		got, err, written := runWSCase(t, quickReadWSFrame, f1, f2)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(got) != string(wcBody) {
+			t.Fatalf("message truncated: got %d bytes, want %d", len(got), len(wcBody))
+		}
+		if len(wsDrain(written)) != 0 {
+			t.Errorf("no control frame expected, got one")
+		}
+	})
+
+	t.Run("three fragments", func(t *testing.T) {
+		t1 := len(wcBody) / 3
+		t2 := t1 * 2
+		frames := [][]byte{
+			wsFrameAt(false, qwsOpText, 0, t1),
+			wsFrameAt(false, 0x0, t1, t2-t1),
+			wsFrameAt(true, 0x0, t2, len(wcBody)-t2),
+		}
+		got, err, _ := runWSCase(t, quickReadWSFrame, frames...)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(got) != string(wcBody) {
+			t.Fatalf("message truncated: got %d bytes, want %d", len(got), len(wcBody))
+		}
+	})
+
+	t.Run("ping interleaved mid fragment", func(t *testing.T) {
+		// RFC 6455 section 5.5 lets a control frame split a fragmented message.
+		// The reader must answer the ping and stay in sync, not fail the request.
+		mid := len(wcBody) / 2
+		frames := [][]byte{
+			wsFrameAt(false, qwsOpText, 0, mid),
+			wsClientFrame(qwsOpPing, []byte("keepalive")),
+			wsFrameAt(true, 0x0, mid, len(wcBody)-mid),
+		}
+		got, err, written := runWSCase(t, quickReadWSFrame, frames...)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(got) != string(wcBody) {
+			t.Fatalf("message truncated: got %d bytes, want %d", len(got), len(wcBody))
+		}
+		// 必须回一个 pong 并回显 payload，且不能多写帧
+		extra := wsDrain(written)
+		if len(extra) == 0 {
+			t.Fatal("expected a pong frame, got none")
+		}
+		op, payload := wsFirstFrame(t, extra)
+		if op != qwsOpPong {
+			t.Fatalf("opcode = 0x%X, want 0xA (pong)", op)
+		}
+		if string(payload) != "keepalive" {
+			t.Fatalf("pong payload = %q, must echo the ping payload", payload)
+		}
+	})
+}
+
+// TestReadWSFrame_FragmentedMessage_Gateway pins the complex-mode reader to the
+// same reassembly behaviour - quick.go and gateway.go must not drift here.
+func TestReadWSFrame_FragmentedMessage_Gateway(t *testing.T) {
+	mid := len(wcBody) / 2
+	frames := [][]byte{
+		wsFrameAt(false, wsOpText, 0, mid),
+		wsClientFrame(wsOpPing, []byte("keepalive")),
+		wsFrameAt(true, 0x0, mid, len(wcBody)-mid),
+	}
+	got, err, written := runWSCase(t, readWSFrame, frames...)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(got) != string(wcBody) {
+		t.Fatalf("message truncated: got %d bytes, want %d", len(got), len(wcBody))
+	}
+	raw := wsCollect(t, written)
+	op, payload := wsFirstFrame(t, raw)
+	if op != wsOpPong {
+		t.Fatalf("expected pong, got opcode 0x%X", op)
+	}
+	if string(payload) != "keepalive" {
+		t.Fatalf("pong payload = %q, must echo the ping payload", payload)
 	}
 }

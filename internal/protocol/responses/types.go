@@ -71,10 +71,10 @@ type InputItem struct {
 	//   否则入站侧只能靠 Content 里的 tool_calls/tool_result 兜底，客户端用标准 item 时上下文全丢。
 	// @REASON: v0.2.119 — 原先整个非 "message" item 被 inputToMessages 丢弃（26→18 条），
 	//   Codex 工具调用结果回灌历史时模型看不到真实输出，只能顺着幻觉编内容。
-	CallID    string          `json:"call_id,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
-	Output    interface{}     `json:"output,omitempty"`
-	RawFields map[string]any  `json:"-"` // 解析后的原始 item 字段，供日志统计未知 item 类型
+	CallID    string         `json:"call_id,omitempty"`
+	Arguments string         `json:"arguments,omitempty"`
+	Output    interface{}    `json:"output,omitempty"`
+	RawFields map[string]any `json:"-"` // 解析后的原始 item 字段，供日志统计未知 item 类型
 }
 
 // UnmarshalJSON 先按 map 解析原始字段（供日志统计），再按强类型字段解析。
@@ -170,13 +170,18 @@ type OutputItem struct {
 }
 
 type ContentBlock struct {
-	Type      string                 `json:"type"` // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text" | "input_image"
-	Text      string                 `json:"text"`
-	ID        string                 `json:"id,omitempty"`
-	Name      string                 `json:"name,omitempty"`
-	Input     map[string]interface{} `json:"input,omitempty"`
-	Source    map[string]interface{} `json:"source,omitempty"`
-	ToolUseID string                 `json:"tool_call_id,omitempty"` // tool_result 引用
+	Type   string                 `json:"type"` // "output_text" | "refusal" | "tool_call" | "tool_result" | "input_text" | "input_image"
+	Text   string                 `json:"text"`
+	ID     string                 `json:"id,omitempty"`
+	Name   string                 `json:"name,omitempty"`
+	Input  map[string]interface{} `json:"input,omitempty"`
+	Source map[string]interface{} `json:"source,omitempty"`
+	// ImageURL 是 Responses 协议 input_image 块的顶层字段（OpenAI 官方格式，也是
+	// Codex CLI 线上格式）。与 Anthropic 不同：Anthropic 图片数据放在
+	// source:{type:"base64",data,media_type} 里，Responses 放在顶层 image_url 里。
+	// v0.2.126 及之前本字段不存在，出站只写 source:{}，OpenAI 系上游读不到图片。
+	ImageURL  string `json:"image_url,omitempty"`
+	ToolUseID string `json:"tool_call_id,omitempty"` // tool_result 引用
 }
 
 type Usage struct {
