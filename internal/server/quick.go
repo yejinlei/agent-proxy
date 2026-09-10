@@ -2651,7 +2651,7 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	}
 
 	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 非流式出站也必须能还原 custom_tool_call
-	// @CONSTRAINT: TranslateResponse 签名无 ctx（CombinedTranslator 接口契约），custom 工具名表
+	// @CONSTRAINT: TranslateResponse 签名无 ctx（CombinedTranslator 接口契约），custom 工具映射
 	//   只能挂到 InternalResponse.CustomToolNames 上传递。流式路径走 ctx（WithCustomTools）。
 	// @RELATED: protocol/responses/custom_tool.go CollectCustomToolNames、
 	//   internal/protocol/schema/internal.go INTERNAL_RESPONSE_CUSTOM_NAMES、
@@ -2789,7 +2789,7 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 
 	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 非流式→SSE 出站同样还原 custom_tool_call
 	// @CONSTRAINT: 与 handleNonStreamResponse 同名块保持一致（TranslateResponse 签名无 ctx，
-	//   名表走 InternalResponse.CustomToolNames）。
+	//   合成名→原名映射走 InternalResponse.CustomToolNames）。
 	// @RELATED: handleNonStreamResponse、protocol/responses/custom_tool.go CollectCustomToolNames、
 	//   gateway.go handleNonStreamResponse
 	if internalReq != nil {
@@ -3110,7 +3110,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// @CONSTRAINT: Codex 的 freeform 工具（type:"custom"，如 apply_patch）到 CC 上游时被合成成
 	//   JSON 函数，CC 只能回 function_call。流式出口必须把 function_call 还原成
 	//   custom_tool_call（item.input 是裸字符串），否则 Codex 把它当成未知 function 工具，
-	//   本地没有 executor → 补丁永远不会落地。名表通过 ctx 传入 TranslateStream，
+	//   本地没有 executor → 补丁永远不会落地。合成名→原名映射通过 ctx 传入 TranslateStream，
 	//   避免改动四翻译器共用的 CombinedTranslator 接口签名。
 	// @RELATED: protocol/responses/custom_tool.go WithCustomTools、gateway.go 同名块（GATEWAY_STREAM_REQUEST）
 	// @REASON: v0.2.131 — Codex 唯一能改文件的工具 apply_patch 是 custom 工具，此前被

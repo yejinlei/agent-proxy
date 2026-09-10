@@ -10,8 +10,54 @@ import (
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
 
-// TestTranslateStream_CustomToolCall 验证 v0.2.132：custom（freeform）工具的流式出站
-// 必须是 type:"custom_tool_call" + input:<裸字符串>，不能是 function_call + arguments。
+// synthName 是发往 CC 上游的合成工具名（exec_<原名>），origName 是 Codex 原 custom 工具名。
+// v0.2.133 起映射方向是「合成名 → 原名」：出站必须把 function_call 还原成
+// custom_tool_call，且 name 写回 Codex 原名。
+var (
+	synthName = execPatchToolNameFor([]byte(`{"type":"custom","name":"apply_patch"}`))
+	origName  = "apply_patch"
+)
+
+func TestExecPatchToolNameFor(t *testing.T) {
+	if synthName != "exec_apply_patch" {
+		t.Fatalf("execPatchToolNameFor(apply_patch) = %q, want exec_apply_patch", synthName)
+	}
+	// 特殊字符折叠成 _，保证是合法 CC function 名
+	if got := execPatchToolNameFor([]byte(`{"name":"a b/c"}`)); got != "exec_a_b_c" {
+		t.Fatalf("execPatchToolNameFor(a b/c) = %q, want exec_a_b_c", got)
+	}
+	// 空名退化成固定兜底名，工具仍可调用
+	if got := execPatchToolNameFor([]byte(`{"type":"custom"}`)); got != "exec_freeform" {
+		t.Fatalf("execPatchToolNameFor(no name) = %q, want exec_freeform", got)
+	}
+}
+
+func TestCollectCustomToolNames(t *testing.T) {
+	tools := []schema.InternalTool{
+		{Type: "function", Function: &schema.InternalFunction{Name: "read_file"}},
+		{Type: "custom", Raw: json.RawMessage(`{"type":"custom","name":"apply_patch"}`), IsCustom: true},
+	}
+	got := CollectCustomToolNames(tools)
+	if got == nil {
+		t.Fatalf("CollectCustomToolNames 不应返回 nil")
+	}
+	if got["exec_apply_patch"] != "apply_patch" {
+		t.Fatalf("映射应为 exec_apply_patch→apply_patch，实际 %+v", got)
+	}
+	if _, ok := got["read_file"]; ok {
+		t.Fatalf("普通 function 工具不得进入 custom 映射：%+v", got)
+	}
+	// 关键回归：IsCustom 工具的 Function 为空时仍然能收集到映射
+	if len(CollectCustomToolNames(nil)) != 0 {
+		t.Fatalf("空工具表应返回 nil")
+	}
+	if CollectCustomToolNames([]schema.InternalTool{{Type: "function", Function: &schema.InternalFunction{Name: "x"}}}) != nil {
+		t.Fatalf("没有 custom 工具时应返回 nil")
+	}
+}
+
+// TestTranslateStream_CustomToolCall 验证 custom（freeform）工具的流式出站
+// 必须是 type:"custom_tool_call" + input:<裸字符串>，且 name 是 Codex 原名。
 //
 // Codex 侧证据：protocol/models.rs:1121 ResponseItem::CustomToolCall{call_id,name,input:String}，
 // codex-api/src/sse/responses.rs:509-512 对 output_item.done 的 item 直接
@@ -19,7 +65,7 @@ import (
 // 当成没有本地 executor 的未知 function 工具，整轮静默失败。
 func TestTranslateStream_CustomToolCall(t *testing.T) {
 	tr := NewResponsesTranslator()
-	ctx := WithCustomTools(context.Background(), map[string]bool{"apply_patch": true})
+	ctx := WithCustomTools(context.Background(), map[string]string{synthName: origName})
 
 	var events []schema.InternalStreamEvent
 	events = append(events, schema.InternalStreamEvent{Type: "start", Data: &schema.InternalStreamChunk{Model: "m"}})
@@ -33,7 +79,7 @@ func TestTranslateStream_CustomToolCall(t *testing.T) {
 						Name         string          `json:"name"`
 						Arguments    string          `json:"arguments"`
 						RawArguments json.RawMessage `json:"-"`
-					}{Name: "apply_patch", Arguments: `{"input":"*** Begin Patch\n*** Add File: a.txt"}`},
+					}{Name: synthName, Arguments: `{"input":"*** Begin Patch\n*** Add File: a.txt"}`},
 				}},
 			},
 		}}},
@@ -43,8 +89,7 @@ func TestTranslateStream_CustomToolCall(t *testing.T) {
 		Data: &schema.InternalStreamChunk{Choices: []schema.InternalChoice{{FinishReason: "tool_calls"}}},
 	})
 
-	out := drainStream(t, tr, ctx, events)
-	s := string(out)
+	s := string(drainStream(t, tr, ctx, events))
 	t.Logf("stream output:\n%s", s)
 
 	if !strings.Contains(s, `"type":"custom_tool_call"`) {
@@ -55,6 +100,13 @@ func TestTranslateStream_CustomToolCall(t *testing.T) {
 	}
 	if strings.Contains(s, "function_call_arguments") {
 		t.Fatalf("custom 工具禁止发 function_call_arguments.* 事件:\n%s", s)
+	}
+	// 出站 name 必须是 Codex 原名，不能泄漏合成名
+	if !strings.Contains(s, `"name":"apply_patch"`) {
+		t.Fatalf("出站 name 必须是 Codex 原工具名 apply_patch:\n%s", s)
+	}
+	if strings.Contains(s, synthName) {
+		t.Fatalf("出站禁止出现 CC 合成名 %s:\n%s", synthName, s)
 	}
 	// input 字段必须是解包后的裸串（Codex 要的就是 freeform 文本本身，不是 JSON）
 	if !strings.Contains(s, `"input":"*** Begin Patch\n*** Add File: a.txt"`) {
@@ -68,11 +120,10 @@ func TestTranslateStream_CustomToolCall(t *testing.T) {
 	}
 }
 
-// TestTranslateStream_FunctionCallUnchanged 确认 custom 名表不影响普通 function 工具
-// （回归：v0.2.132 只应改变 custom 的出站形状）。
+// TestTranslateStream_FunctionCallUnchanged 确认 custom 映射不影响普通 function 工具。
 func TestTranslateStream_FunctionCallUnchanged(t *testing.T) {
 	tr := NewResponsesTranslator()
-	ctx := WithCustomTools(context.Background(), map[string]bool{"apply_patch": true})
+	ctx := WithCustomTools(context.Background(), map[string]string{synthName: origName})
 
 	var events []schema.InternalStreamEvent
 	events = append(events, schema.InternalStreamEvent{
@@ -109,7 +160,7 @@ func TestTranslateStream_FunctionCallUnchanged(t *testing.T) {
 // （customFCItem 的约定：custom 没有 JSON 参数对象可兜底，空串如实交付）。
 func TestTranslateStream_EmptyCustomArgs(t *testing.T) {
 	tr := NewResponsesTranslator()
-	ctx := WithCustomTools(context.Background(), map[string]bool{"apply_patch": true})
+	ctx := WithCustomTools(context.Background(), map[string]string{synthName: origName})
 
 	events := []schema.InternalStreamEvent{
 		{Type: "delta", Data: &schema.InternalStreamChunk{Choices: []schema.InternalChoice{{
@@ -120,7 +171,7 @@ func TestTranslateStream_EmptyCustomArgs(t *testing.T) {
 						Name         string          `json:"name"`
 						Arguments    string          `json:"arguments"`
 						RawArguments json.RawMessage `json:"-"`
-					}{Name: "apply_patch", Arguments: ""},
+					}{Name: synthName, Arguments: ""},
 				}},
 			},
 		}}}},
@@ -150,12 +201,12 @@ func TestTranslateResponse_CustomToolCall(t *testing.T) {
 						Name         string          `json:"name"`
 						Arguments    string          `json:"arguments"`
 						RawArguments json.RawMessage `json:"-"`
-					}{Name: "apply_patch", Arguments: `{"input":"*** Begin Patch\n*** End Patch"}`},
+					}{Name: synthName, Arguments: `{"input":"*** Begin Patch\n*** End Patch"}`},
 				}},
 			},
 		}},
 		Usage:           &schema.InternalUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
-		CustomToolNames: map[string]bool{"apply_patch": true},
+		CustomToolNames: map[string]string{synthName: origName},
 	}
 
 	out, err := tr.TranslateResponse(resp)
@@ -170,6 +221,12 @@ func TestTranslateResponse_CustomToolCall(t *testing.T) {
 	}
 	if strings.Contains(s, `"type":"function_call"`) {
 		t.Fatalf("custom 工具禁止输出 function_call:\n%s", s)
+	}
+	if !strings.Contains(s, `"name":"apply_patch"`) {
+		t.Fatalf("出站 name 必须是 Codex 原工具名:\n%s", s)
+	}
+	if strings.Contains(s, synthName) {
+		t.Fatalf("出站禁止出现 CC 合成名:\n%s", s)
 	}
 	if !strings.Contains(s, `"input":"*** Begin Patch\n*** End Patch"`) {
 		t.Fatalf("input 必须是解包后的裸串:\n%s", s)

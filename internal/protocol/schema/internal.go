@@ -251,7 +251,7 @@ type InternalResponseFormat struct {
 //   - Choices[].Message.Content: 翻译器需按入站协议格式还原
 //   - Usage: 各协议 token 字段名不同，翻译器负责映射
 //   - CustomToolNames: json:"-" 上下文标记，仅非流式出站用——TranslateResponse 签名是
-//     CombinedTranslator 接口契约（无 ctx），custom 工具名表只能搭这个结构体传入。
+//     CombinedTranslator 接口契约（无 ctx），custom 工具名映射只能搭这个结构体传入。
 //     其他翻译器读不到它就按纯 function_call 处理，因此新增此字段对 CC/Anthropic/Gemini 无影响。
 // @RELATED: all protocol/translator.go TranslateResponse; responses/translator.go
 //   TranslateResponse（custom_tool_call item）、responses/custom_tool.go CollectCustomToolNames
@@ -269,7 +269,7 @@ type InternalResponse struct {
 	// CustomToolNames 标记本轮哪些 tool_call 名对应 custom（freeform）工具，
 	// 供非流式出站翻译把 function_call 还原成 custom_tool_call。
 	// @AI_GUARD: INTERNAL_RESPONSE_CUSTOM_NAMES - 见上方 INTERNAL_RESPONSE 约束
-	CustomToolNames map[string]bool `json:"-"`
+	CustomToolNames map[string]string `json:"-"`
 }
 
 type InternalChoice struct {

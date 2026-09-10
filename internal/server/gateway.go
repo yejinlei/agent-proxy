@@ -1177,7 +1177,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	// @CONSTRAINT: Codex 的 freeform 工具（type:"custom"，如 apply_patch）到 CC 上游时被合成成
 	//   JSON 函数，CC 只能回 function_call。流式出口必须把 function_call 还原成
 	//   custom_tool_call（item.input 是裸字符串），否则 Codex 把它当成未知 function 工具，
-	//   本地没有 executor → 补丁永远不会落地。名表通过 ctx 传入 TranslateStream，
+	//   本地没有 executor → 补丁永远不会落地。合成名→原名映射通过 ctx 传入 TranslateStream，
 	//   避免改动四翻译器共用的 CombinedTranslator 接口签名。
 	// @RELATED: protocol/responses/custom_tool.go WithCustomTools、quick.go 同名块（GATEWAY_STREAM_REQUEST）
 	// @REASON: v0.2.131 — Codex 唯一能改文件的工具 apply_patch 是 custom 工具，此前被
@@ -1274,8 +1274,10 @@ func mapRoleToCC(role string) string {
 
 // logCCRequestShape 打印发往上游 CC 的请求体形状与工具往返配对检查结果。
 // 只打形状（长度/名称/id），不打印正文与参数原文，避免日志膨胀和敏感内容外泄。
+// 工具名逐个列出（toolNames），不只要计数：v0.2.132 的 custom 工具回归只打了
+// tools=N，日志里看不出合成描述串到了哪些普通函数上、补丁工具有没有被送出。
 // 双模式共用 buildCCRequest，因此快速/复杂模式都覆盖。
-func logCCRequestShape(model string, messages []chatcompletion.Message, nTools int) {
+func logCCRequestShape(model string, messages []chatcompletion.Message, nTools int, toolNames []string) {
 	if len(messages) == 0 {
 		return
 	}
@@ -1311,9 +1313,12 @@ func logCCRequestShape(model string, messages []chatcompletion.Message, nTools i
 	if len(fcs) == 0 {
 		fcs = []string{"none"}
 	}
-	log.Printf("[CODEX-DEBUG] buildCCRequest: model=%q messages=%d roles=[%s] tools=%d tool_calls=%d fcs=[%s] orphaned_tool_results=%d",
+	if len(toolNames) == 0 {
+		toolNames = []string{"none"}
+	}
+	log.Printf("[CODEX-DEBUG] buildCCRequest: model=%q messages=%d roles=[%s] tools=%d tool_names=[%s] tool_calls=%d fcs=[%s] orphaned_tool_results=%d",
 		model, len(messages), strings.Join(roles, ","), nTools,
-		len(toolCallIDs), strings.Join(fcs, " "), orphans)
+		strings.Join(toolNames, ","), len(toolCallIDs), strings.Join(fcs, " "), orphans)
 }
 
 func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion.ChatCompletionRequest {
@@ -1372,30 +1377,41 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 		messages = append(messages, im)
 	}
 
-	// 上游 CC 请求体形状摘要 + 悬空工具结果检查。
-	// 这是数据离开代理的最后一个可观测点：请求体日志被 formatJSON 截到 20KB+8KB，
-	// messages 中段（正是工具往返所在的位置）进不了日志。此处只打形状。
-	// 悬空检查针对的正是静默故障：role:tool 带 tool_call_id 但历史里没有 assistant
-	// tool_calls 携带该 id，或 assistant tool_calls 没有对应的工具结果——上游一律 HTTP 200，
-	// 配对断了模型就把已读文件当成没读过并停止调工具。
-	logCCRequestShape(req.Model, messages, len(req.Tools))
-
 	// @AI_GUARD: CC_CUSTOM_TOOL_SYNTHESIS - custom 工具在 CC 上游必须合成 JSON 函数
 	// @CONSTRAINT: CC 的 tools[] 只认 type:"function"，type:"custom" 原样转发会 400。
-	//   映射方向固定为「入站 custom → 这里合成 {type:"function", function:{parameters:{input:string}}}
-	//   → 返回给 Codex 时还原成 custom_tool_call」。合成由入站翻译器完成（responses/translator.go
-	//   已把 IsCustom 工具的 Function 填成 name + 强化描述 + {input:string} schema），
-	//   此处只按 Function 存在与否转发，禁止按 tool.Type 白名单筛选。
+	//   映射方向固定为「入站 custom → 这里合成 exec_<原名> 的 JSON 函数（{input:string} schema）
+	//   → 返回给 Codex 时还原成 custom_tool_call（name 回原名、input 是裸串）」。
+	//   合成只允许发生在这里这一处：IsCustom 工具的 Function 字段必须为空
+	//   （translator.go @AI_GUARD: RESPONSES_CUSTOM_TOOL_NO_SHIM），因为 Function 是给
+	//   CC 上游的强类型出口，给 custom 工具填它会把合成名/合成描述当普通函数转发出去。
+	//   此处禁止按 tool.Type 白名单筛选——IsCustom 之外的工具一律按 Function 存在与否转发。
 	//   非 function/custom 类型（web_search / tool_search / namespace / image_generation）没有 CC
 	//   等价表达，会在这里被丢弃——这是上游能力上限而非白名单，必须打日志可见，不得静默。
-	// @RELATED: protocol/responses/custom_tool.go customToolParameters、
-	//   protocol/responses/translator.go TranslateRequest 与 TranslateStream、
-	//   protocol/schema/internal.go InternalTool（INTERNAL_TOOL_RAW）
+	// @RELATED: protocol/responses/custom_tool.go ExecPatchTool / customToolParameters /
+	//   CollectCustomToolNames、protocol/responses/translator.go TranslateRequest 与
+	//   TranslateStream（customFCItem）、protocol/schema/internal.go InternalTool（INTERNAL_TOOL_RAW）
 	// @REASON: v0.2.131 之前 translator.go 丢弃所有 type!="function" 的工具（tools=14→10），
-	//   其中 type:"custom" 的 apply_patch 是 Codex 唯一能改文件的工具。
+	//   其中 type:"custom" 的 apply_patch 是 Codex 唯一能改文件的工具。v0.2.132 把合成下放到
+	//   入站翻译器，结果是合成描述串到了 7 个普通 function 工具上、custom 工具本身 0 次调用
+	//   （agent-proxy-9093.log）。
 	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
+	toolNames := make([]string, 0, len(req.Tools))
 	nUnsupported := 0
 	for _, tool := range req.Tools {
+		if tool.IsCustom {
+			// custom（freeform）工具不能原样转发给 CC 上游：CC 没有本地 executor，
+			// 模型调用只会回显参数、补丁不落盘。这里合成 exec_<原名>，参数形状 {input:<裸串>}，
+			// 出站由 customFCItem 按 CollectCustomToolNames 的同名映射还原成
+			// custom_tool_call（name 写回 Codex 原工具名）。
+			if len(tool.Raw) > 0 {
+				tt := responses.ExecPatchTool(tool.Raw)
+				if tt.Function != nil {
+					toolNames = append(toolNames, tt.Function.Name)
+				}
+				tools = append(tools, tt)
+			}
+			continue
+		}
 		if tool.Function != nil {
 			tools = append(tools, chatcompletion.Tool{
 				Type: "function",
@@ -1405,6 +1421,7 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 					Parameters:  tool.Function.Parameters,
 				},
 			})
+			toolNames = append(toolNames, tool.Function.Name)
 			continue
 		}
 		nUnsupported++
@@ -1413,6 +1430,16 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 		log.Printf("[CODEX-DEBUG] buildCCRequest: %d tool(s) have no CC equivalent (type!=function/custom, e.g. web_search/tool_search) and are not sent upstream",
 			nUnsupported)
 	}
+
+	// 上游 CC 请求体形状摘要 + 悬空工具结果检查。
+	// 这是数据离开代理的最后一个可观测点：请求体日志被 formatJSON 截到 20KB+8KB，
+	// messages 中段（正是工具往返所在的位置）进不了日志。此处只打形状。
+	// 工具名必须逐个列出——v0.2.132 的回归（合成描述串到 7 个普通 function 工具、
+	// custom 工具 0 次调用）只打了 tools=N 的计数，从日志里根本看不出来。
+	// 悬空检查针对的正是静默故障：role:tool 带 tool_call_id 但历史里没有 assistant
+	// tool_calls 携带该 id，或 assistant tool_calls 没有对应的工具结果——上游一律 HTTP 200，
+	// 配对断了模型就把已读文件当成没读过并停止调工具。
+	logCCRequestShape(req.Model, messages, len(tools), toolNames)
 
 	// Stop 序列化
 	var stop json.RawMessage
