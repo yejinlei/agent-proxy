@@ -2389,8 +2389,8 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 				"model":   effectiveModel,
 				"choices": []interface{}{
 					map[string]interface{}{
-						"index": 0,
-						"delta": delta,
+						"index":         0,
+						"delta":         delta,
 						"finish_reason": choiceMap["finish_reason"],
 					},
 				},
@@ -2650,6 +2650,18 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 		internalResp.Model = internalReq.AliasModel
 	}
 
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 非流式出站也必须能还原 custom_tool_call
+	// @CONSTRAINT: TranslateResponse 签名无 ctx（CombinedTranslator 接口契约），custom 工具名表
+	//   只能挂到 InternalResponse.CustomToolNames 上传递。流式路径走 ctx（WithCustomTools）。
+	// @RELATED: protocol/responses/custom_tool.go CollectCustomToolNames、
+	//   internal/protocol/schema/internal.go INTERNAL_RESPONSE_CUSTOM_NAMES、
+	//   gateway.go handleNonStreamResponse 同名块
+	// @REASON: v0.2.131 — Codex 非流式（stream:false）同样用 apply_patch（custom 工具），
+	//   出站若不还原成 custom_tool_call item，Codex 反序列化不出该 item，补丁静默丢弃。
+	if internalReq != nil {
+		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
+	}
+
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
@@ -2773,6 +2785,15 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	// 回显客户端模型名
 	if internalReq != nil && internalReq.AliasModel != "" {
 		internalResp.Model = internalReq.AliasModel
+	}
+
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 非流式→SSE 出站同样还原 custom_tool_call
+	// @CONSTRAINT: 与 handleNonStreamResponse 同名块保持一致（TranslateResponse 签名无 ctx，
+	//   名表走 InternalResponse.CustomToolNames）。
+	// @RELATED: handleNonStreamResponse、protocol/responses/custom_tool.go CollectCustomToolNames、
+	//   gateway.go handleNonStreamResponse
+	if internalReq != nil {
+		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
 	}
 
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
@@ -2903,7 +2924,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	events := make(chan schema.InternalStreamEvent, 16)
 	var accumulatedUsage *schema.InternalUsage
 	var eventsDone sync.WaitGroup // 汇合上方事件生产 goroutine，避免 accumulatedUsage 数据竞态
-	var clientGone bool // 客户端已断开（broken pipe），停止向死 socket 写事件
+	var clientGone bool           // 客户端已断开（broken pipe），停止向死 socket 写事件
 	eventsDone.Add(1)
 	go func() {
 		defer close(events)
@@ -3085,6 +3106,18 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// @REASON: v0.2.111 日志 conn 53875 三次 13 工具载荷请求：10 条 TranslateStream emit
 	//   但 0 条 WS frame → client — 写错误被本 callback 静默吞掉，handler 205782ms 正常退出
 	//   而 Codex 侧 0 字节卡 Working。见 docs/release-v0.2.112.md
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom 工具名必须传给流式出口
+	// @CONSTRAINT: Codex 的 freeform 工具（type:"custom"，如 apply_patch）到 CC 上游时被合成成
+	//   JSON 函数，CC 只能回 function_call。流式出口必须把 function_call 还原成
+	//   custom_tool_call（item.input 是裸字符串），否则 Codex 把它当成未知 function 工具，
+	//   本地没有 executor → 补丁永远不会落地。名表通过 ctx 传入 TranslateStream，
+	//   避免改动四翻译器共用的 CombinedTranslator 接口签名。
+	// @RELATED: protocol/responses/custom_tool.go WithCustomTools、gateway.go 同名块（GATEWAY_STREAM_REQUEST）
+	// @REASON: v0.2.131 — Codex 唯一能改文件的工具 apply_patch 是 custom 工具，此前被
+	//   translator.go 的 type 白名单整条丢弃。
+	if internalReq != nil {
+		ctx = responses.WithCustomTools(ctx, responses.CollectCustomToolNames(internalReq.Tools))
+	}
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
 		if clientGone {
 			// 客户端已断开（broken pipe）：不再向死 socket 反复写事件。

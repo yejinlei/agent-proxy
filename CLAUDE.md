@@ -119,6 +119,14 @@ flowchart TD
 - **禁止协议 A 直接翻译到协议 B**，必须经过 Central Schema
 - 新增协议需实现 `CombinedTranslator` 接口，在 `gateway.go` 注册
 
+### 工具类型透传（禁止按 type 白名单丢弃）
+- Central Schema 只建模 `type:"function"`，但入站协议有更多工具类型（Responses: `custom` / `web_search` / `tool_search` / `image_generation` / `namespace`，客户端会随版本新增）。非 function 工具必须原样留在 `InternalTool.Raw` 里，**禁止在 `TranslateRequest` 阶段按 type 白名单丢弃**；只能拦「`type=="function"` 且 name 为空」这一种非法形态（会让上游报 400 `Invalid request format`）。
+- `type:"custom"`（Codex 的 freeform 工具，如 `apply_patch`）桥接方向固定：
+  入站 custom → 给 CC 上游合成 `{type:"function", function:{parameters:{input:string}}}` → 出站还原成 `type:"custom_tool_call"` + `input:<裸字符串>`。
+  禁止把 `type:"custom"` 原样发给 CC 上游（400），也禁止出站写 `function_call` + `arguments`（Codex 本地无 executor，补丁静默丢弃）。
+- 工具调用在 Responses 非流式出站时必须是 `output[]` 顶层独立 item，不能塞进 `message.content` 的 `tool_call` 块（Codex 的 `ResponseItem` 反序列化不认，补丁静默丢弃）。
+- 名表传递两条路径都要挂：流式走 `responses.WithCustomTools(ctx, …)`（ctx 有参），非流式走 `InternalResponse.CustomToolNames`（`TranslateResponse` 签名是 `CombinedTranslator` 接口契约，不能加参数）。quick.go / gateway.go 的非流式 JSON、非流式→SSE、流式三条 handler 都必须挂。
+
 ### SSE 格式
 - 所有 SSE 数据行必须带 `data: ` 前缀
 - 心跳格式：`event: ping\ndata: {"type":"ping"}\n\n`（完整 Anthropic 标准 ping 事件，必须带 `event: ping` 前缀）
@@ -232,7 +240,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 58 项；`grep -rn "@AI_GUARD:" internal/` 实际有 133 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 64 项；`grep -rn "@AI_GUARD:" internal/` 实际有 150 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -268,6 +276,12 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TRANSLATE_STREAM_EVENT` | responses/translator.go | 上游 Responses SSE → InternalStreamEvent |
 | `RESPONSES_INPUT_ITEM_TYPES` | responses/types.go + translator.go | 入站 input 必须识别 `function_call`/`function_call_output`/`reasoning` item，禁止整条丢弃（Codex 工具回灌历史靠它） |
 | `RESPONSES_FC_ROLE_DEFAULT` | responses/translator.go | 入站 item 缺 `role` 必须补默认（`function_call`→assistant；`input_text` 块→user；其余→assistant），否则上游 400 `Messages[N].Role invalid` |
+| `RESPONSES_FILTER_BUILTIN_TOOLS` | responses/translator.go | 入站 tools 只拦「`type=="function"` 且 name 为空」；其余（`custom`/`web_search`/`tool_search` 等）全部进 `InternalTool`，禁止 type 白名单丢弃 |
+| `RESPONSES_TOOL_RAW_PASSTHROUGH` | responses/types.go + translator.go | `ResponseRequest.Tools` 必须是 `[]json.RawMessage`，出站原样回写，不能强类型 `[]Tool` 重建 |
+| `RESPONSES_CUSTOM_TOOL` | responses/custom_tool.go + translator.go | freeform 工具双向桥接：出站必须 `type:"custom_tool_call"` + `input:<裸串>`（非 `arguments`），流式与非流式出口都要实现；custom 不发 `function_call_arguments.*` 事件 |
+| `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | `IsCustom` 工具合成 CC JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默 |
+| `INTERNAL_TOOL_RAW` | schema/internal.go | `Raw`/`IsCustom` 承接非 function 工具（`json:"-"`），禁止在入站翻译时按 type 丢弃 |
+| `INTERNAL_RESPONSE_CUSTOM_NAMES` | schema/internal.go | 非流式出站 custom 工具名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
 | `CC_TOOL_CALL_ID_LINKAGE` | gateway.go (buildCCRequest) | 翻译到 CC 时 `role:tool` 消息必须带 `tool_call_id`；缺失时上游不报 400 但工具调用与结果失配，模型误判文件未读取并停止调工具（Codex 一直不回读的根因） |
 | `RESPONSES_TEXT_BLOCK_TYPES` | responses/translator.go | 内容块必须同时接受 `text`/`input_text`/`output_text`，否则上游 400 No user query found |
 | `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`）；`status=failed` 时 `incomplete_details.reason` 必须为 null，写 `max_output_tokens` 会让客户端误判成输出截断 |

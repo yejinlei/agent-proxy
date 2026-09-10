@@ -137,26 +137,63 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	}
 
 	// --- 3. Tools → InternalTools ---
-	// @AI_GUARD: RESPONSES_FILTER_BUILTIN_TOOLS - 跳过客户端内置工具
-	// @CONSTRAINT: 只把 type=="function" 且 name 非空的 tool 转发给上游；其余（tool_search/web_search
-	//   等客户端执行的内置工具）必须丢弃，否则会产出 function.name 为空的非法定义，
-	//   上游报 400 "Invalid request format"
-	// @RELATED: types.go Tool.UnmarshalJSON（空 name 回退分支）
+	// @AI_GUARD: RESPONSES_FILTER_BUILTIN_TOOLS - 不丢弃客户端的工具清单
+	// @CONSTRAINT: 只丢弃「type=="function" 且 name 为空」这一种非法形态——包成 CC function
+	//   会产出 function.name 为空的定义，上游报 400 "Invalid request format"。
+	//   其余一律进 InternalTool：Function 能表达的填 Function，其余（custom / web_search /
+	//   tool_search / image_generation / namespace，以及 Codex 未来新增的任何 type）
+	//   原样留在 Raw 里由出站边界按目标协议能力决定，禁止按 type 白名单丢弃。
+	// @RELATED: custom_tool.go（Raw 原样回写 + IsCustom 标记）、
+	//   server/gateway.go buildCCRequest（IsCustom → 合成 JSON 函数）、
+	//   types.go Tool.UnmarshalJSON（空 name 回退分支）
 	// @REASON: v0.2.109 — Codex 经 WS 发来的 tools 含 tool_search/web_search 内置工具，
 	//   UnmarshalJSON 因 t.Name=="" 走 else 分支只设 Type/Parameters，name 留空；
 	//   翻译器若原样包成 function 转发，Sensenova 报 Invalid request format。
+	//   v0.2.131 之前的实现把 Type!="function" 也一并丢弃，导致每次请求固定丢 4 个工具
+	//   （tools=14→tools=10），其中 type:"custom" 的 apply_patch 是 Codex 唯一能改文件的
+	//   工具——模型被要求"用 apply_patch 写文件"却拿不到它，只能退化成 exec_command 或
+	//   纯散文。v0.2.131 起只拦真正的非法 function，其余全量保留。
 	var tools []schema.InternalTool
-	for _, tool := range req.Tools {
-		if tool.Type != "function" || tool.Name == "" {
+	var nSkippedInvalid int
+	for i := range req.Tools {
+		toolJSON := req.Tools[i]
+		var tool Tool
+		if err := json.Unmarshal(toolJSON, &tool); err != nil {
+			toolJSON = nil
+			nSkippedInvalid++
 			continue
 		}
-		tools = append(tools, schema.InternalTool{
-			Type: "function",
-			Function: &schema.InternalFunction{
-				Name:       tool.Name,
-				Parameters: tool.Parameters,
-			},
-		})
+		if tool.Type == "function" && tool.Name == "" {
+			nSkippedInvalid++
+			continue
+		}
+		it := schema.InternalTool{
+			Type:     tool.Type,
+			Raw:      toolJSON,
+			IsCustom: tool.Type == "custom",
+		}
+		if tool.Type == "function" || tool.Type == "custom" {
+			// function：标准形态。
+			// custom：Function 只用作「工具名」的载体（buildCCRequest 靠它合成 JSON 函数，
+			//   custom 工具出站靠 Function.Name 匹配还原成 custom_tool_call），
+			//   freeform 语法定义仍完整保留在 Raw 里。
+			if tool.Name != "" {
+				params := tool.Parameters
+				if tool.Type == "custom" {
+					params = customToolParameters()
+				}
+				it.Function = &schema.InternalFunction{
+					Name:        tool.Name,
+					Description: ccCustomToolDescription(tool.Name, toolJSON),
+					Parameters:  params,
+				}
+			}
+		}
+		tools = append(tools, it)
+	}
+	if nSkippedInvalid > 0 {
+		log.Printf("[CODEX-DEBUG] TranslateRequest: dropped %d invalid/unparseable tools out of %d",
+			nSkippedInvalid, len(req.Tools))
 	}
 
 	// --- 4. Metadata ---
@@ -199,6 +236,14 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 			itemType = "message"
 		}
 
+		// @AI_GUARD: RESPONSES_CUSTOM_TOOL - Codex freeform 工具的历史条目必须落进 messages
+		// @CONSTRAINT: custom_tool_call 与 function_call 形状相同（name/call_id/…），但载荷字段
+		//   叫 input 而非 arguments（codex protocol/models.rs:1121 ResponseItem::CustomToolCall，
+		//   input 是裸字符串）；custom_tool_call_output 与 function_call_output 形状相同
+		//   （call_id/output，models.rs:1142）。归一化必须与 itemToMessage 内部的
+		//   item.Type == "function_call" 判定保持一致，否则 custom 调用的 role 会错。
+		//   新增 item 类型时按 @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES 处理。
+		// @RELATED: itemToMessage、functionCallOutputItemToMessage、custom_tool.go
 		switch itemType {
 		case "message":
 			// @AI_GUARD: RESPONSES_INPUT_ITEM_TYPES - 非 message item 不再整条丢弃
@@ -211,14 +256,22 @@ func inputToMessages(items []InputItem) []schema.InternalMessage {
 			if ok {
 				msgs = append(msgs, msg)
 			}
-		case "function_call":
+		case "function_call", "custom_tool_call":
+			// custom_tool_call 的载荷字段叫 input（裸字符串），归一到 Arguments 后与
+			// function_call 共用 itemToMessage。
+			if item.Type == "custom_tool_call" {
+				if raw, ok := item.RawFields["input"].(string); ok {
+					item.Arguments = raw
+				}
+				item.Type = "function_call"
+			}
 			msg, ok := itemToMessage(item)
 			if ok {
 				msgs = append(msgs, msg)
 			} else {
 				droppedTypes[itemType]++
 			}
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
 			msgs = append(msgs, functionCallOutputItemToMessage(item))
 		default:
 			droppedTypes[itemType]++
@@ -671,6 +724,9 @@ func extractOutputText(v interface{}) string {
 func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (json.RawMessage, error) {
 	var contentBlocks []ContentBlock
 
+	// 工具调用单独收集，不塞进 message.content——Codex 只认顶层 output[] 里的独立 item。
+	toolCalls := make([]schema.InternalToolCall, 0)
+
 	for _, choice := range resp.Choices {
 		if len(choice.Message.ContentBlocks) > 0 {
 			for _, cb := range choice.Message.ContentBlocks {
@@ -708,18 +764,7 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 			}
 		}
 
-		for _, tc := range choice.Message.ToolCalls {
-			contentBlocks = append(contentBlocks, ContentBlock{
-				Type: "tool_call",
-				ID:   tc.ID,
-				Name: tc.Function.Name,
-				Input: func(tc schema.InternalToolCall) map[string]interface{} {
-					var m map[string]interface{}
-					json.Unmarshal(tc.Function.RawArguments, &m)
-					return m
-				}(tc),
-			})
-		}
+		toolCalls = append(toolCalls, choice.Message.ToolCalls...)
 	}
 
 	var usage *Usage
@@ -733,22 +778,114 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 		}
 	}
 
-	respObj := Response{
-		ID:         resp.ID,
-		Object:     "response",
-		Status:     "completed",
-		Model:      resp.Model,
-		StopReason: mapStopReasonReverse(resp.Choices[0].FinishReason),
-		Output: []OutputItem{
-			{
-				Type:    "message",
-				Role:    "assistant",
-				Content: contentBlocks,
-			},
-		},
-		Usage: usage,
+	finishReason := "stop"
+	if len(resp.Choices) > 0 && resp.Choices[0].FinishReason != "" {
+		finishReason = resp.Choices[0].FinishReason
+	}
+	if len(toolCalls) > 0 {
+		finishReason = "function_call"
 	}
 
+	// 无工具调用时保持原强类型输出形状（tool_call 块嵌在 message.content 里），
+	// 该路径已有测试覆盖，不动。
+	if len(toolCalls) == 0 {
+		respObj := Response{
+			ID:         resp.ID,
+			Object:     "response",
+			Status:     "completed",
+			Model:      resp.Model,
+			StopReason: mapStopReasonReverse(finishReason),
+			Output: []OutputItem{
+				{
+					Type:    "message",
+					Role:    "assistant",
+					Content: contentBlocks,
+				},
+			},
+			Usage: usage,
+		}
+		return json.Marshal(respObj)
+	}
+
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 非流式出站的 custom 工具必须是 custom_tool_call item
+	// @CONSTRAINT: Codex 只从「顶层 output[] 数组里的独立 item」识别工具调用
+	//   （codex protocol/models.rs:1121 CustomToolCall{call_id,name,input:String}；
+	//   FunctionCall 用 arguments:JSON字符串）。塞进 message.content 的 tool_call 块是 CC 形态，
+	//   Codex 的 ResponseItem 反序列化不认 → 非流式工具调用静默丢弃，apply_patch 的补丁根本送不出去。
+	//   名表经可选接口 NonStreamCustomTools 由调用方注入（见 custom_tool.go），
+	//   因为 TranslateResponse 的签名是 CombinedTranslator 接口契约，不能加参数。
+	//   载荷解包与 TranslateStream 的 customFCItem 一致：unwrapCCCustomArguments。
+	// @RELATED: custom_tool.go NonStreamCustomTools/CollectCustomToolNames、TranslateStream customFCItem
+	// @REASON: v0.2.131 之前非流式路径只产出 message.content 内的 tool_call 块，
+	//   即使入站侧已修好 custom 工具，stream:false 的响应仍无法表达 custom_tool_call。
+	var customNames map[string]bool
+	if resp != nil {
+		customNames = resp.CustomToolNames
+	}
+
+	output := make([]map[string]interface{}, 0, 1+len(toolCalls))
+	msgID := resp.ID + "_msg_0"
+	if resp.ID == "" {
+		msgID = "resp_nostream_msg_0"
+	}
+	if len(contentBlocks) > 0 {
+		output = append(output, map[string]interface{}{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"status":  "completed",
+			"content": contentBlocks,
+		})
+	}
+	for i, tc := range toolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = "call_" + fmt.Sprintf("%d_%d", time.Now().UnixNano(), i)
+		}
+		if customNames != nil && customNames[tc.Function.Name] {
+			input, unwrapped := unwrapCCCustomArguments(tc.Function.Arguments)
+			log.Printf("[CODEX-DEBUG] TranslateResponse custom_tool_call: name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
+				tc.Function.Name, callID, len(tc.Function.Arguments), len(input), unwrapped)
+			output = append(output, map[string]interface{}{
+				"id":      callID,
+				"type":    "custom_tool_call",
+				"call_id": callID,
+				"name":    tc.Function.Name,
+				"status":  "completed",
+				"input":   input,
+			})
+			continue
+		}
+		args := tc.Function.Arguments
+		if args == "" {
+			args = "{}"
+		}
+		output = append(output, map[string]interface{}{
+			"id":        callID,
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      tc.Function.Name,
+			"status":    "completed",
+			"arguments": args,
+		})
+	}
+
+	respObj := map[string]interface{}{
+		"id":            resp.ID,
+		"object":        "response",
+		"status":        "completed",
+		"model":         resp.Model,
+		"output":        output,
+		"finish_reason": finishReason,
+		"incomplete_details": map[string]interface{}{
+			"reason": nil,
+		},
+	}
+	if usage == nil {
+		respObj["usage"] = &Usage{} // @CONSTRAINT: usage 必须为非空对象（Codex 校验）
+	} else {
+		respObj["usage"] = usage
+	}
 	return json.Marshal(respObj)
 }
 
@@ -850,8 +987,17 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		addedSent  bool
 		argsDone   bool // fc_arguments.done 已发送（防止 sendCompleted 重复发）
 		itemDone   bool // function_call output_item.done 已发送（保证 added/done 配对）
+		// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom（freeform）工具还原标记
+		// @CONSTRAINT: Custom 为 true 时出站 item 必须写 type:"custom_tool_call" 且载荷字段
+		//   叫 input（裸字符串），不能是 type:"function_call" + arguments。否则 Codex 把补丁
+		//   当成没有本地 executor 的未知 function 工具，整轮静默失败。Custom 工具不发
+		//   function_call_arguments.* 事件（Codex 只按 output_item.done 建 item）。
+		Custom bool
 	}
 	funcCalls := make(map[string]*funcCallState)
+	// customNames 是本轮哪些 function 名在入站时是 type:"custom"（由调用方通过
+	// WithCustomTools 挂到 ctx）。空表表示上游没有 freeform 工具，走纯 function_call 路径。
+	customNames := customToolNames(ctx)
 	funcCallOrder := make([]string, 0)
 	nextFuncOutputIdx := 1
 
@@ -883,12 +1029,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				Name:      name,
 				CallID:    callID,
 				OutputIdx: nextFuncOutputIdx,
+				Custom:    customNames != nil && name != "" && customNames[name],
 			}
 			nextFuncOutputIdx++
 			funcCalls[key] = fc
 			funcCallOrder = append(funcCallOrder, key)
 		} else if newName := tc.Function.Name; newName != "" && fc.Name == "" {
 			fc.Name = newName
+			// 名字可能出现在续传分片：首次分片只有 ID 时 Custom 判定为空名、此处补判。
+			fc.Custom = fc.Custom || (customNames != nil && customNames[newName])
 		}
 		return fc
 	}
@@ -956,26 +1105,66 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		})
 	}
 
+	// customFCItem 把 fc 转成 Responses item map。
+	//
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom（freeform）工具出站 item 形状与 function_call 不同
+	// @CONSTRAINT: custom 工具必须输出 type:"custom_tool_call" + input:<裸字符串>
+	//   （codex protocol/models.rs:1121 CustomToolCall{call_id, name, input: String}），
+	//   不能是 function_call + arguments。载荷由 CC 上游合成的 {"input":"***"} 解包得到裸串；
+	//   解包失败则原样输出 arguments 文本——freeform 工具拿到 JSON 文本仍可由模型自纠，
+	//   空串会被 Codex 直接判失败。自定义 item 不发 function_call_arguments.* 事件，
+	//   因为 Codex 只为 function_call 消费那类事件，为 custom_tool_call 发它们等于噪声。
+	// @REASON: v0.2.131 之前入站侧整条丢弃 custom 工具（apply_patch），模型被要求用它改文件
+	//   却从未收到工具；即使收到，出站也只能回 function_call，Codex 本地无 executor。
+	customFCItem := func(fc *funcCallState, status string, argsStr string) map[string]interface{} {
+		if fc.Custom {
+			// 流式期间（argsStr==""）不写 input 字段：output_item.added 只用于注册 item，
+			// Codex 建 item 靠的是 output_item.done。
+			if argsStr == "" {
+				return map[string]interface{}{
+					"id":      fc.CallID,
+					"type":    "custom_tool_call",
+					"call_id": fc.CallID,
+					"name":    fc.Name,
+					"status":  status,
+				}
+			}
+			input, unwrapped := unwrapCCCustomArguments(argsStr)
+			log.Printf("[CODEX-DEBUG] TranslateStream custom_tool_call: name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
+				fc.Name, fc.CallID, len(argsStr), len(input), unwrapped)
+			return map[string]interface{}{
+				"id":      fc.CallID,
+				"type":    "custom_tool_call",
+				"call_id": fc.CallID,
+				"name":    fc.Name,
+				"status":  status,
+				"input":   input,
+			}
+		}
+		return map[string]interface{}{
+			"id":        fc.CallID,
+			"type":      "function_call",
+			"call_id":   fc.CallID,
+			"name":      fc.Name,
+			"status":    status,
+			"arguments": argsStr, // @CONSTRAINT: 必须是字符串，不能是对象——Codex 严格校验 item 类型
+		}
+	}
+
 	sendOutputItemAddedFunc := func(fc *funcCallState) {
 		if fc.addedSent {
 			return
 		}
 		fc.addedSent = true
+		item := customFCItem(fc, "in_progress", "")
 		sendSSE("response.output_item.added", map[string]interface{}{
 			"type":         "response.output_item.added",
 			"output_index": fc.OutputIdx,
-			"item": map[string]interface{}{
-				"id":        fc.CallID,
-				"type":      "function_call",
-				"call_id":   fc.CallID,
-				"name":      fc.Name,
-				"status":    "in_progress",
-				"arguments": "", // @CONSTRAINT: 必须是字符串（流式期间尚未累积参数），不能是对象——Codex 严格校验 item 类型
-			},
+			"item":         item,
 		})
 	}
 
-	// closeFuncCall 关闭一个 function_call item：fc_arguments.done + output_item.done 各一次。
+	// closeFuncCall 关闭一个 function_call / custom_tool_call item：fc_arguments.done + output_item.done 各一次。
 	// @AI_GUARD: RESPONSES_FC_TEARDOWN - added/done 必须严格配对
 	// @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING - function_call.arguments 必须是 JSON 字符串，不能是对象
 	// @CONSTRAINT: 输出侧（output_item.done.function_call.arguments / response.completed.output[].arguments）
@@ -993,9 +1182,21 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		}
 		finalArgs := fc.argsBuffer.String()
 		if finalArgs == "" {
-			finalArgs = "{}"
+			if fc.Custom {
+				// custom 工具没有 JSON 参数对象可兜底：input 必须是模型给的裸串。
+				// 空串保留原样，让 Codex 按「工具输入为空」如实报错，
+				// 而不是喂一个语义为「无参数 JSON 对象」的 "{}" 给它执行。
+			} else {
+				finalArgs = "{}"
+			}
 		}
-		if !fc.argsDone {
+		if fc.Custom {
+			// @CONSTRAINT: custom_tool_call 不发 response.function_call_arguments.* 事件——
+			//   Codex 只为 function_call item 消费那类事件，为 custom_tool_call 发它们是噪声。
+			//   标 argsDone 防止后续 delta 事件被转发成 function_call_arguments.delta。
+			//   item 数据完全靠下面的 output_item.done 交付（customFCItem 内已解包 input）。
+			fc.argsDone = true
+		} else if !fc.argsDone {
 			fc.argsDone = true
 			sendSSE("response.function_call_arguments.done", map[string]interface{}{
 				"type":         "response.function_call_arguments.done",
@@ -1010,14 +1211,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			sendSSE("response.output_item.done", map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": fc.OutputIdx,
-				"item": map[string]interface{}{
-					"id":        fc.CallID,
-					"type":      "function_call",
-					"call_id":   fc.CallID,
-					"name":      fc.Name,
-					"status":    "completed",
-					"arguments": finalArgs,
-				},
+				"item":         customFCItem(fc, "completed", finalArgs),
 			})
 		}
 	}
@@ -1062,6 +1256,12 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		if delta == "" {
 			return
 		}
+		// @CONSTRAINT: custom_tool_call 不发 function_call_arguments.delta 事件（同 closeFuncCall 的约定）——
+		//   该事件是 function_call 专属的增量通道，为 custom item 发它会让 Codex 把参数绑定到不存在的 item。
+		//   裸串仍写入 fc.argsBuffer，最终由 output_item.done 一次交付。
+		if fc.Custom {
+			return
+		}
 		nFuncArgsDeltas++
 		sendSSE("response.function_call_arguments.delta", map[string]interface{}{
 			"type":         "response.function_call_arguments.delta",
@@ -1092,14 +1292,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			} else {
 				argsStr = "{}"
 			}
-			output = append(output, map[string]interface{}{
-				"id":        fc.CallID,
-				"type":      "function_call",
-				"call_id":   fc.CallID,
-				"name":      fc.Name,
-				"status":    status,
-				"arguments": argsStr,
-			})
+			output = append(output, customFCItem(fc, status, argsStr))
 		}
 		return output
 	}
@@ -1456,18 +1649,42 @@ func buildInputArray(msgs []schema.InternalMessage) []InputItem {
 	return items
 }
 
-func toolsToResponses(tools []schema.InternalTool) []Tool {
-	var result []Tool
+// toolsToResponses 把中枢工具表写回 Responses 请求。
+//
+// @AI_GUARD: RESPONSES_TOOL_RAW_PASSTHROUGH - 非 function 工具必须原样回写
+// @CONSTRAINT: 入站 type 不只 function（custom / web_search / tool_search / image_generation /
+//
+//	namespace，且客户端会随版本新增）。有 Raw 的一律原样回写，保留入站字节——目标端
+//	不支持的 type 由它自己决定丢弃，本层不猜。只有 Raw 缺失（中枢合成、未经翻译器入站）
+//	的 function 才重建。
+//
+// @RELATED: schema/internal.go InternalTool.Raw（@AI_GUARD: INTERNAL_TOOL_RAW）、
+//
+//	TranslateRequest 的 Raw 填充、server/gateway.go buildCCRequest（IsCustom → 合成 function）
+//
+// @REASON: v0.2.131 之前这里硬编码 Type:"function" 且丢弃 Function==nil 的条目，
+//
+//	是「非 function 工具全丢」的出站侧根因（入站侧根因见 TranslateRequest）。
+func toolsToResponses(tools []schema.InternalTool) []json.RawMessage {
+	var result []json.RawMessage
 	for _, tool := range tools {
+		if len(tool.Raw) > 0 {
+			result = append(result, tool.Raw)
+			continue
+		}
 		if tool.Function == nil {
 			continue
 		}
-		result = append(result, Tool{
+		// 无 Raw：中枢合成或 CC→Responses 方向，只能重建 function 形态
+		raw, err := json.Marshal(Tool{
 			Type: "function",
 			Name: tool.Function.Name,
 			// ⚠️ Responses 无 description 字段
 			Parameters: tool.Function.Parameters,
 		})
+		if err == nil {
+			result = append(result, raw)
+		}
 	}
 	return result
 }

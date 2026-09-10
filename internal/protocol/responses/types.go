@@ -6,18 +6,18 @@ import "encoding/json"
 
 // ResponseRequest Responses API 请求
 type ResponseRequest struct {
-	Model              string          `json:"model"`
-	Input              Input           `json:"input"`
-	Tools              []Tool          `json:"tools,omitempty"`
-	Stream             bool            `json:"stream,omitempty"`
-	Temperature        *float64        `json:"temperature,omitempty"`
-	TopP               *float64        `json:"top_p,omitempty"`
-	MaxOutputTokens    int             `json:"max_output_tokens,omitempty"`
-	StopSequences      []string        `json:"stop_sequences,omitempty"`
-	ResponseFormat     *ResponseFormat `json:"response_format,omitempty"`
-	Metadata           *Metadata       `json:"metadata,omitempty"`
-	Instructions       string          `json:"instructions,omitempty"` // 系统提示
-	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	Model              string            `json:"model"`
+	Input              Input             `json:"input"`
+	Tools              []json.RawMessage `json:"tools,omitempty"` // RawMessage：custom 等类型可原样回写
+	Stream             bool              `json:"stream,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
+	MaxOutputTokens    int               `json:"max_output_tokens,omitempty"`
+	StopSequences      []string          `json:"stop_sequences,omitempty"`
+	ResponseFormat     *ResponseFormat   `json:"response_format,omitempty"`
+	Metadata           *Metadata         `json:"metadata,omitempty"`
+	Instructions       string            `json:"instructions,omitempty"` // 系统提示
+	PreviousResponseID string            `json:"previous_response_id,omitempty"`
 }
 
 // Input 兼容 Responses API 两种 input 形式：纯字符串（单消息）或 []InputItem 数组
@@ -94,6 +94,15 @@ type Tool struct {
 	Name       string                 `json:"name"`
 	Parameters map[string]interface{} `json:"parameters,omitempty"`
 }
+
+// @AI_GUARD: RESPONSES_TOOL_RAW_PASSTHROUGH - 工具元素必须是可原样透传的 JSON
+// @CONSTRAINT: 入站 type 不只 function（还有 custom / web_search / tool_search /
+//   image_generation / namespace，且客户端会随版本新增）。ResponseRequest.Tools 的元素
+//   不能是强类型 []Tool，否则出站只能重建成 function、丢掉其余类型。用 []json.RawMessage
+//   保留入站原始字节，出站按目标协议能力决定原样回写还是丢弃。
+// @RELATED: translator.go toolsToResponses（Raw 原样回写）
+// @REASON: v0.2.131 之前 []Tool 强类型 + Type 硬编码 "function" 是「非 function 工具全丢」
+//   的出站侧根因；入站侧根因见 translator.go TranslateRequest 的 @AI_GUARD。
 
 // UnmarshalJSON 兼容两种 tools 格式：
 // 1. Responses 原生格式: {"type":"function","name":"foo","parameters":{...}}

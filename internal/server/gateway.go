@@ -890,6 +890,14 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	if internalReq != nil && internalReq.AliasModel != "" {
 		internalResp.Model = internalReq.AliasModel
 	}
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - 复杂模式非流式出站同样还原 custom_tool_call
+	// @CONSTRAINT: 与 quick.go 同名块保持同步（TranslateResponse 签名无 ctx，名表走
+	//   InternalResponse.CustomToolNames）。
+	// @RELATED: quick.go handleNonStreamResponse 同名块、protocol/schema/internal.go
+	//   INTERNAL_RESPONSE_CUSTOM_NAMES
+	if internalReq != nil {
+		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
+	}
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
 		if g.verboseLevel >= 2 {
@@ -1165,6 +1173,18 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	// 使用入站翻译器的 TranslateStream 写出站 SSE
 	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
 	//
+	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom 工具名必须传给流式出口
+	// @CONSTRAINT: Codex 的 freeform 工具（type:"custom"，如 apply_patch）到 CC 上游时被合成成
+	//   JSON 函数，CC 只能回 function_call。流式出口必须把 function_call 还原成
+	//   custom_tool_call（item.input 是裸字符串），否则 Codex 把它当成未知 function 工具，
+	//   本地没有 executor → 补丁永远不会落地。名表通过 ctx 传入 TranslateStream，
+	//   避免改动四翻译器共用的 CombinedTranslator 接口签名。
+	// @RELATED: protocol/responses/custom_tool.go WithCustomTools、quick.go 同名块（GATEWAY_STREAM_REQUEST）
+	// @REASON: v0.2.131 — Codex 唯一能改文件的工具 apply_patch 是 custom 工具，此前被
+	//   translator.go 的 type 白名单整条丢弃。
+	if internalReq != nil {
+		streamCtx = responses.WithCustomTools(streamCtx, responses.CollectCustomToolNames(internalReq.Tools))
+	}
 	ingressTranslator.TranslateStream(streamCtx, events, func(eventData []byte, isDone bool) {
 		if clientGone {
 			// 客户端已断开（broken pipe）：不再向死 socket 反复写事件。
@@ -1360,7 +1380,21 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 	// 配对断了模型就把已读文件当成没读过并停止调工具。
 	logCCRequestShape(req.Model, messages, len(req.Tools))
 
+	// @AI_GUARD: CC_CUSTOM_TOOL_SYNTHESIS - custom 工具在 CC 上游必须合成 JSON 函数
+	// @CONSTRAINT: CC 的 tools[] 只认 type:"function"，type:"custom" 原样转发会 400。
+	//   映射方向固定为「入站 custom → 这里合成 {type:"function", function:{parameters:{input:string}}}
+	//   → 返回给 Codex 时还原成 custom_tool_call」。合成由入站翻译器完成（responses/translator.go
+	//   已把 IsCustom 工具的 Function 填成 name + 强化描述 + {input:string} schema），
+	//   此处只按 Function 存在与否转发，禁止按 tool.Type 白名单筛选。
+	//   非 function/custom 类型（web_search / tool_search / namespace / image_generation）没有 CC
+	//   等价表达，会在这里被丢弃——这是上游能力上限而非白名单，必须打日志可见，不得静默。
+	// @RELATED: protocol/responses/custom_tool.go customToolParameters、
+	//   protocol/responses/translator.go TranslateRequest 与 TranslateStream、
+	//   protocol/schema/internal.go InternalTool（INTERNAL_TOOL_RAW）
+	// @REASON: v0.2.131 之前 translator.go 丢弃所有 type!="function" 的工具（tools=14→10），
+	//   其中 type:"custom" 的 apply_patch 是 Codex 唯一能改文件的工具。
 	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
+	nUnsupported := 0
 	for _, tool := range req.Tools {
 		if tool.Function != nil {
 			tools = append(tools, chatcompletion.Tool{
@@ -1371,7 +1405,13 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 					Parameters:  tool.Function.Parameters,
 				},
 			})
+			continue
 		}
+		nUnsupported++
+	}
+	if nUnsupported > 0 {
+		log.Printf("[CODEX-DEBUG] buildCCRequest: %d tool(s) have no CC equivalent (type!=function/custom, e.g. web_search/tool_search) and are not sent upstream",
+			nUnsupported)
 	}
 
 	// Stop 序列化
