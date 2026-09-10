@@ -6,17 +6,18 @@ import "encoding/json"
 
 // ResponseRequest Responses API 请求
 type ResponseRequest struct {
-	Model           string          `json:"model"`
-	Input           Input           `json:"input"`
-	Tools           []Tool          `json:"tools,omitempty"`
-	Stream          bool            `json:"stream,omitempty"`
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"top_p,omitempty"`
-	MaxOutputTokens int             `json:"max_output_tokens,omitempty"`
-	StopSequences   []string        `json:"stop_sequences,omitempty"`
-	ResponseFormat  *ResponseFormat `json:"response_format,omitempty"`
-	Metadata        *Metadata       `json:"metadata,omitempty"`
-	Instructions    string          `json:"instructions,omitempty"` // 系统提示
+	Model              string          `json:"model"`
+	Input              Input           `json:"input"`
+	Tools              []Tool          `json:"tools,omitempty"`
+	Stream             bool            `json:"stream,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"top_p,omitempty"`
+	MaxOutputTokens    int             `json:"max_output_tokens,omitempty"`
+	StopSequences      []string        `json:"stop_sequences,omitempty"`
+	ResponseFormat     *ResponseFormat `json:"response_format,omitempty"`
+	Metadata           *Metadata       `json:"metadata,omitempty"`
+	Instructions       string          `json:"instructions,omitempty"` // 系统提示
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 }
 
 // Input 兼容 Responses API 两种 input 形式：纯字符串（单消息）或 []InputItem 数组

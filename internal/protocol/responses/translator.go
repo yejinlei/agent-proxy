@@ -124,6 +124,18 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	items := InputToItems(req.Input)
 	log.Printf("[CODEX-DEBUG] input items digest: %s", responsesItemDigest(items))
 
+	// Codex WS 增量输入：客户端复用连接时只发本轮新增的 input item，前缀靠
+	// previous_response_id 由服务端拼接（client.rs:1226-1250 get_incremental_items，
+	// 仅在 stream_responses_websocket 里生效——post-sse 不发这个字段）。
+	// 代理此前忽略该字段，导致 delta 请求被当成完整历史翻译：上游只收到一条
+	// 悬空的 role:tool 消息，模型给泛泛回答后不再调工具，turn 干净结束零报错。
+	// 本行日志用于确认线上是否命中这条路径：previous_response_id 非空且
+	// input_items 很小时即为增量请求（对照 buildCCRequest 的 orphaned_tool_results）。
+	if req.PreviousResponseID != "" {
+		log.Printf("[CODEX-DEBUG] incremental request detected: previous_response_id=%s input_items=%d tools=%d stream=%v",
+			req.PreviousResponseID, len(items), len(req.Tools), req.Stream)
+	}
+
 	// --- 3. Tools → InternalTools ---
 	// @AI_GUARD: RESPONSES_FILTER_BUILTIN_TOOLS - 跳过客户端内置工具
 	// @CONSTRAINT: 只把 type=="function" 且 name 非空的 tool 转发给上游；其余（tool_search/web_search
