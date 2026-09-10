@@ -240,7 +240,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 64 项；`grep -rn "@AI_GUARD:" internal/` 实际有 150 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 65 项；`grep -rn "@AI_GUARD:" internal/` 实际有 154 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -279,7 +279,8 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_FILTER_BUILTIN_TOOLS` | responses/translator.go | 入站 tools 只拦「`type=="function"` 且 name 为空」；其余（`custom`/`web_search`/`tool_search` 等）全部进 `InternalTool`，禁止 type 白名单丢弃 |
 | `RESPONSES_TOOL_RAW_PASSTHROUGH` | responses/types.go + translator.go | `ResponseRequest.Tools` 必须是 `[]json.RawMessage`，出站原样回写，不能强类型 `[]Tool` 重建 |
 | `RESPONSES_CUSTOM_TOOL` | responses/custom_tool.go + translator.go | freeform 工具双向桥接：出站必须 `type:"custom_tool_call"` + `input:<裸串>`（非 `arguments`），流式与非流式出口都要实现；custom 不发 `function_call_arguments.*` 事件 |
-| `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | `IsCustom` 工具合成 CC JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默 |
+| `RESPONSES_CUSTOM_TOOL_NO_SHIM` | responses/translator.go | custom 工具的 `InternalTool.Function` 必须为空；合成只能在 `buildCCRequest` 发生（合成名派生 `exec_<原名>`，出站还原 Codex 原名）。v0.2.132 在入站翻译器填 `Function` → shim 描述串到 7 个普通 function 工具、custom 工具 0 次调用 |
+| `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | CC 侧唯一合成点：`IsCustom` 工具合成 `exec_<原名>` 的 JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默；禁止按 `tool.Type` 白名单丢弃 |
 | `INTERNAL_TOOL_RAW` | schema/internal.go | `Raw`/`IsCustom` 承接非 function 工具（`json:"-"`），禁止在入站翻译时按 type 丢弃 |
 | `INTERNAL_RESPONSE_CUSTOM_NAMES` | schema/internal.go | 非流式出站 custom 工具名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
 | `CC_TOOL_CALL_ID_LINKAGE` | gateway.go (buildCCRequest) | 翻译到 CC 时 `role:tool` 消息必须带 `tool_call_id`；缺失时上游不报 400 但工具调用与结果失配，模型误判文件未读取并停止调工具（Codex 一直不回读的根因） |

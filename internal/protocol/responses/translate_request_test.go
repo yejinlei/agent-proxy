@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
@@ -45,21 +46,42 @@ func TestTranslateRequest_KeepsNonFunctionTools(t *testing.T) {
 			t.Fatalf("不应存在 function.name 为空的 tool: %+v", tl)
 		}
 	}
-	// custom 工具必须以 Function shim 承载名字，供 buildCCRequest 合成 CC function
+	// @AI_GUARD 回归：custom 工具的 Function 必须为空。
+	// v0.2.132 在这里给 IsCustom 工具填了 Function={input:string} + 合成描述，
+	// 而 buildCCRequest 对任何 Function!=nil 的工具都会当普通 CC function 原样转发——
+	// 结果 (a) custom 工具以 exec_* 形状被 CC 上游当成一个真实函数，
+	// (b) 合成描述串到 7 个普通 function 工具上，把它们的 required 数组盖掉。
+	// 合成只能发生在 buildCCRequest 一处。
 	var customOK bool
 	for _, tl := range ir.Tools {
-		if tl.IsCustom && tl.Function != nil && tl.Function.Name == "apply_patch" {
+		if tl.IsCustom {
 			customOK = true
-			if tl.Function.Parameters == nil {
-				t.Fatalf("custom 工具必须有合成 parameters（{input:string}），实际 nil")
+			if tl.Function != nil {
+				t.Fatalf("custom 工具的 Function 必须为空（合成只能发生在 buildCCRequest），实际 %+v", tl)
 			}
 			if tl.Raw == nil {
-				t.Fatalf("custom 工具必须保留 Raw 原始字节（原生 Responses 上游需要原样回写）")
+				t.Fatalf("custom 工具必须保留 Raw 原始字节（合成名派生 + 原生 Responses 上游原样回写都靠它）")
+			}
+			if got := toolNameFromRaw(tl.Raw); got != "apply_patch" {
+				t.Fatalf("Raw 里必须能取回原工具名 apply_patch，实际 %q", got)
 			}
 		}
 	}
 	if !customOK {
 		t.Fatalf("type:\"custom\" 的 apply_patch 必须保留且标记 IsCustom，实际 %+v", ir.Tools)
+	}
+	// 普通 function 工具保持自己的描述与 schema，不得被 freeform 合成描述污染。
+	var readOK bool
+	for _, tl := range ir.Tools {
+		if tl.Function != nil && tl.Function.Name == "read_file" {
+			readOK = true
+			if strings.Contains(tl.Function.Description, "input") && strings.Contains(tl.Function.Description, "raw text") {
+				t.Fatalf("普通 function 工具的描述不得带 freeform 裸文本说明：%q", tl.Function.Description)
+			}
+		}
+	}
+	if !readOK {
+		t.Fatalf("普通 function 工具 read_file 必须带 Function，实际 %+v", ir.Tools)
 	}
 	t.Logf("✅ 全部 %d 个工具已保留（含 custom + 客户端内置工具）", len(ir.Tools))
 }

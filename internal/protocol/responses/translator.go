@@ -172,20 +172,36 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 			Raw:      toolJSON,
 			IsCustom: tool.Type == "custom",
 		}
-		if tool.Type == "function" || tool.Type == "custom" {
-			// function：标准形态。
-			// custom：Function 只用作「工具名」的载体（buildCCRequest 靠它合成 JSON 函数，
-			//   custom 工具出站靠 Function.Name 匹配还原成 custom_tool_call），
-			//   freeform 语法定义仍完整保留在 Raw 里。
+		// @AI_GUARD: RESPONSES_CUSTOM_TOOL_NO_SHIM - custom 工具禁止填 InternalTool.Function
+		// @CONSTRAINT: Function 只能给 type=="function" 填。InternalTool.Function 就是给 CC
+		//   上游翻译用的（CC 的 tools[] 只认 type:"function"），custom 工具一旦填了 Function
+		//   就会原样被转发成一个普通函数，name 变成合成名、description 变成 freeform 的
+		//   「只收裸文本」说明——那是另一个能力错误。custom 的完整定义（含原工具名）只留在
+		//   Raw 里，由 buildCCRequest 统一合成 exec_<原名>，出站按该派生名还原成
+		//   custom_tool_call + Codex 原工具名（见 custom_tool.go ExecPatchTool / customFCItem）。
+		// @RELATED: server/gateway.go buildCCRequest（IsCustom → ExecPatchTool）、
+		//   protocol/responses/custom_tool.go CollectCustomToolNames / ExecPatchTool、
+		//   protocol/schema/internal.go InternalTool（INTERNAL_TOOL_RAW）
+		// @REASON: v0.2.132 的 custom 分支在这里填 Function={input:string} + 合成描述。
+		//   实测（agent-proxy-9093.log，9091 端口 v0.2.132，10 次流式请求）：
+		//     (a) 入站 tools 数组只有 8 项 7 个 name（日志 formatJSON 截断，真实 14 项 13 名），
+		//         但 CC 侧只有 exec_command 一个带「原始 schema」，其余 7 个工具（view_image /
+		//         request_user_input / create_goal / get_goal / update_goal / wait_agent /
+		//         list_mcp_resource_templates）的 description 全部被串上 freeform 的
+		//         "single raw text payload …" 后缀（shim 计数 7），模型眼里这 7 个工具
+		//         变成「无参数、只收裸文本」，全部退化。
+		//     (b) custom 工具 0 次出现在出站 CC tools[]（custom_tool_call 全日志计数 0），
+		//         所有 finish_reason=function_call 的调用 100% 是 exec_command（24 次提及）。
+		//     (c) Codex 侧从未回读文件：10 次请求里写文件全部停在散文承诺
+		//         （"I'll add chat.md …"、"Added the Capability Hub route at /capability-hub"），
+		//         代理无改动可做——补丁工具根本没送到模型面前。
+		//   v0.2.133 起：合成只发生在 buildCCRequest，此处不再为 custom 工具填 Function。
+		if tool.Type == "function" {
 			if tool.Name != "" {
-				params := tool.Parameters
-				if tool.Type == "custom" {
-					params = customToolParameters()
-				}
 				it.Function = &schema.InternalFunction{
 					Name:        tool.Name,
-					Description: ccCustomToolDescription(tool.Name, toolJSON),
-					Parameters:  params,
+					Description: toolDescriptionFromRaw(toolJSON),
+					Parameters:  tool.Parameters,
 				}
 			}
 		}
@@ -818,7 +834,7 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 	// @RELATED: custom_tool.go NonStreamCustomTools/CollectCustomToolNames、TranslateStream customFCItem
 	// @REASON: v0.2.131 之前非流式路径只产出 message.content 内的 tool_call 块，
 	//   即使入站侧已修好 custom 工具，stream:false 的响应仍无法表达 custom_tool_call。
-	var customNames map[string]bool
+	var customNames map[string]string
 	if resp != nil {
 		customNames = resp.CustomToolNames
 	}
@@ -842,15 +858,16 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 		if callID == "" {
 			callID = "call_" + fmt.Sprintf("%d_%d", time.Now().UnixNano(), i)
 		}
-		if customNames != nil && customNames[tc.Function.Name] {
+		origName, isCustom := customNames[tc.Function.Name]
+		if isCustom {
 			input, unwrapped := unwrapCCCustomArguments(tc.Function.Arguments)
-			log.Printf("[CODEX-DEBUG] TranslateResponse custom_tool_call: name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
-				tc.Function.Name, callID, len(tc.Function.Arguments), len(input), unwrapped)
+			log.Printf("[CODEX-DEBUG] TranslateResponse custom_tool_call: cc_name=%q codex_name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
+				tc.Function.Name, origName, callID, len(tc.Function.Arguments), len(input), unwrapped)
 			output = append(output, map[string]interface{}{
 				"id":      callID,
 				"type":    "custom_tool_call",
 				"call_id": callID,
-				"name":    tc.Function.Name,
+				"name":    origName,
 				"status":  "completed",
 				"input":   input,
 			})
@@ -990,13 +1007,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom（freeform）工具还原标记
 		// @CONSTRAINT: Custom 为 true 时出站 item 必须写 type:"custom_tool_call" 且载荷字段
 		//   叫 input（裸字符串），不能是 type:"function_call" + arguments。否则 Codex 把补丁
-		//   当成没有本地 executor 的未知 function 工具，整轮静默失败。Custom 工具不发
-		//   function_call_arguments.* 事件（Codex 只按 output_item.done 建 item）。
-		Custom bool
+		//   当成没有本地 executor 的未知 function 工具，整轮静默失败。CodexName 是 Codex 的
+		//   原工具名（fc.Name 是发往 CC 的合成名 exec_<原名>，不能直接回写给 Codex）。Custom
+		//   工具不发 function_call_arguments.* 事件（Codex 只按 output_item.done 建 item）。
+		Custom    bool
+		CodexName string
 	}
 	funcCalls := make(map[string]*funcCallState)
-	// customNames 是本轮哪些 function 名在入站时是 type:"custom"（由调用方通过
-	// WithCustomTools 挂到 ctx）。空表表示上游没有 freeform 工具，走纯 function_call 路径。
+	// customNames 是「发往 CC 上游的合成工具名 → Codex 原 custom 工具名」映射（由调用方
+	// 通过 WithCustomTools 挂到 ctx）。空表表示上游没有 freeform 工具，走纯 function_call 路径。
 	customNames := customToolNames(ctx)
 	funcCallOrder := make([]string, 0)
 	nextFuncOutputIdx := 1
@@ -1024,12 +1043,14 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			if callID == "" {
 				callID = fmt.Sprintf("call_%d_%s", nextFuncOutputIdx, responseID[5:])
 			}
+			codexName, isCustom := customNames[name]
 			fc = &funcCallState{
 				ID:        key,
 				Name:      name,
 				CallID:    callID,
 				OutputIdx: nextFuncOutputIdx,
-				Custom:    customNames != nil && name != "" && customNames[name],
+				Custom:    isCustom,
+				CodexName: codexName,
 			}
 			nextFuncOutputIdx++
 			funcCalls[key] = fc
@@ -1037,7 +1058,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		} else if newName := tc.Function.Name; newName != "" && fc.Name == "" {
 			fc.Name = newName
 			// 名字可能出现在续传分片：首次分片只有 ID 时 Custom 判定为空名、此处补判。
-			fc.Custom = fc.Custom || (customNames != nil && customNames[newName])
+			if codexName, isCustom := customNames[newName]; isCustom && !fc.Custom {
+				fc.Custom = true
+				fc.CodexName = codexName
+			}
 		}
 		return fc
 	}
@@ -1118,6 +1142,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	//   却从未收到工具；即使收到，出站也只能回 function_call，Codex 本地无 executor。
 	customFCItem := func(fc *funcCallState, status string, argsStr string) map[string]interface{} {
 		if fc.Custom {
+			// 出站 name 必须回写 Codex 的原工具名，不是发往 CC 的合成名 exec_<原名>。
+			name := fc.CodexName
+			if name == "" {
+				name = fc.Name
+			}
 			// 流式期间（argsStr==""）不写 input 字段：output_item.added 只用于注册 item，
 			// Codex 建 item 靠的是 output_item.done。
 			if argsStr == "" {
@@ -1125,18 +1154,18 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"id":      fc.CallID,
 					"type":    "custom_tool_call",
 					"call_id": fc.CallID,
-					"name":    fc.Name,
+					"name":    name,
 					"status":  status,
 				}
 			}
 			input, unwrapped := unwrapCCCustomArguments(argsStr)
-			log.Printf("[CODEX-DEBUG] TranslateStream custom_tool_call: name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
-				fc.Name, fc.CallID, len(argsStr), len(input), unwrapped)
+			log.Printf("[CODEX-DEBUG] TranslateStream custom_tool_call: cc_name=%q codex_name=%q call_id=%q args_bytes=%d input_bytes=%d unwrapped=%v",
+				fc.Name, name, fc.CallID, len(argsStr), len(input), unwrapped)
 			return map[string]interface{}{
 				"id":      fc.CallID,
 				"type":    "custom_tool_call",
 				"call_id": fc.CallID,
-				"name":    fc.Name,
+				"name":    name,
 				"status":  status,
 				"input":   input,
 			}

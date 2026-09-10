@@ -616,23 +616,24 @@ response.created → response.output_item.added → response.output_text.delta*
 - `response.completed` 的 `response.output[]` 必须包含累积的完整内容（非空数组）
 - channel 关闭或 `ctx.Done()` 时必须补发完整结束序列再发 `[DONE]`
 
-### Codex custom（freeform）工具桥接（v0.2.132）
+### Codex custom（freeform）工具桥接（v0.2.132 引入，v0.2.133 修正合成位置）
 
 Codex 的 `apply_patch` 是 `type:"custom"` 的 freeform 工具——它没有 JSON 参数 schema，
 `input` 就是一段裸文本（补丁 diff）。OpenAI Responses 协议与 CC 协议都没有等价表达，
-所以必须走「入站保留 → 合成 CC shim → 出站还原」的桥接：
+所以必须走「入站保留 → CC 边界合成 → 出站还原」的桥接：
 
 ```
 Codex custom 工具
-  └─ TranslateRequest：Raw 原样保留 + 标记 IsCustom
-       └─ 合成 CC function：parameters = {type:object, properties:{input:{type:string}},
-                             required:["input"], additionalProperties:false}
-            └─ buildCCRequest：转发（上游无等价表达的工具在此丢弃并打日志）
-               └─ 出站还原：type:"custom_tool_call" + input:<裸串>
-                    └─ codex models.rs ResponseItem::CustomToolCall{input: String}
+  └─ TranslateRequest：Raw 原样保留 + 标记 IsCustom，Function 必须为空
+       └─ buildCCRequest（唯一合成点）：exec_<原名>，parameters =
+              {type:object, properties:{input:{type:string}},
+               required:["input"], additionalProperties:false}
+              （上游无等价表达的工具在此丢弃并打日志）
+       └─ 出站还原：type:"custom_tool_call" + input:<裸串> + name:Codex 原名
+            └─ codex models.rs ResponseItem::CustomToolCall{input: String}
 ```
 
-**四条硬约束：**
+**五条硬约束：**
 
 1. **禁止按 type 白名单丢弃工具**。`TranslateRequest` 只挡「function 工具但 name 为空」
    这一种（会让上游报 400 Invalid request format），`custom` / `tool_search` /
@@ -640,19 +641,32 @@ Codex custom 工具
    非 function 工具出站可原样回写（原生 Responses 上游需要完整原始字节）。
 2. **入站保留原始字节**：`InternalTool.Raw`（`json:"-"`）存 tool 定义原文，
    `toolsToResponses` 有 Raw 就原样回写，没有才重建 function 形式。
-3. **出站形状由 custom 名表决定**，两条传输路径：
+3. **custom 工具的 `InternalTool.Function` 必须为空**。该字段是 CC 上游出口专用——
+   `buildCCRequest` 对任何 `Function != nil` 的工具都当普通 CC function 原样转发。
+   合成只允许发生在 `buildCCRequest` 一处，禁止下放到入站翻译器。
+   合成工具名由原工具名派生（`exec_<原名>`，非法字符折叠成 `_`），不能是固定常量：
+   一个固定名只能承载一个 custom 工具，且出站必须按原名还原。
+4. **出站形状由 custom 名映射决定**（合成名 → Codex 原名），两条传输路径：
    - 流式：`responses.WithCustomTools(ctx, ...)` 挂 context；
    - 非流式：`TranslateResponse` 的签名是 `CombinedTranslator` 接口契约、拿不到 ctx，
      只能挂 `InternalResponse.CustomToolNames`。
-   全部 5 条出站路径（quick.go 三条 + gateway.go 两条）都必须注入名表。
-4. **custom 的出站差异**：不发 `response.function_call_arguments.delta/.done`；
+   全部 5 条出站路径（quick.go 三条 + gateway.go 两条）都必须注入映射。
+5. **custom 的出站差异**：不发 `response.function_call_arguments.delta/.done`；
    空参数不兜底 `{}`（custom 没有 JSON 参数对象可兜底，如实交付空串）；
    `{"input":"..."}` 外壳由 `unwrapCCCustomArguments` 剥掉，交付裸串。
 
+**v0.2.132 的血泪教训**（实测 `agent-proxy-9093.log`，9091 端口，10 次流式请求）：
+合成下放到入站翻译器后，`Function` 被 `buildCCRequest` 当普通函数原样转发，导致
+(a) freeform 的「只收裸文本」描述后缀串到 7 个普通 function 工具上（`view_image` /
+`request_user_input` / `create_goal` / `get_goal` / `update_goal` / `wait_agent` /
+`list_mcp_resource_templates`），模型眼里这 7 个工具变成无参数；(b) `custom_tool_call`
+全日志计数 0，24 次工具调用 100% 是 `exec_command`；(c) Codex 写文件全部停在散文承诺。
+`buildCCRequest` 现在逐个打出工具名（`tool_names=[...]`）而非只打计数，避免同类回归再次不可见。
+
 实现位置：[custom_tool.go](file:///f:/src/agent-proxy/internal/protocol/responses/custom_tool.go)
-（上下文注入、合成 schema、解包裸串）、
+（上下文注入、合成名派生、合成 schema、解包裸串）、
 [translator.go](file:///f:/src/agent-proxy/internal/protocol/responses/translator.go)
-（入站保留、出站还原）、`buildCCRequest`（CC 侧合成转发）。
+（入站保留、出站还原）、`buildCCRequest`（CC 侧唯一合成点）。
 
 ***
 
