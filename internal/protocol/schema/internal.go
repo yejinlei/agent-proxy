@@ -147,10 +147,23 @@ type InternalContentBlock struct {
 //  3. Anthropic 把 tool_call 混在 content blocks 里，不是独立字段 → 解析时必须扫描所有 content
 //  4. Gemini 没有 tool_call_id 概念 → 需要网关层生成唯一 ID 映射
 type InternalTool struct {
-	Type     string            `json:"type"` // "function"
+	Type     string            `json:"type"` // "function" | "custom" | ...
 	Function *InternalFunction `json:"function"`
 	// Anthropic 用 input_schema 而非 parameters
 	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
+
+	// @AI_GUARD: INTERNAL_TOOL_RAW - 中枢工具的原始 JSON 兜底，保住入站协议的全部工具类型
+	// @CONSTRAINT: 入站协议有多种 tool type（Responses: function/custom/web_search/tool_search/
+	//   image_generation，Codex 还会随版本继续新增）。中央模式只建模 function，其余类型必须原样
+	//   留在 Raw 里，由出站边界按目标协议能力决定：能表达的原样透传，不能表达才丢弃。
+	//   禁止在 TranslateRequest 阶段按 type 白名单丢弃。
+	// @RELATED: responses/translator.go TranslateRequest 与 toolsToResponses（Raw 原样回写）、
+	//   server/gateway.go buildCCRequest（IsCustom → 合成 function）、protocol/responses/custom_tool.go
+	// @REASON: v0.2.131 之前 translator.go 只转发 type=="function"，Codex 每次请求固定丢 4 个工具
+	//   （tools=14 → tools=10），其中 type:"custom" 的 apply_patch 是它唯一能改文件的工具——
+	//   模型被要求"用 apply_patch 写文件"却拿不到这个工具，只能退化成 exec_command 或纯散文。
+	Raw      json.RawMessage `json:"-"` // 入站工具对象的原始 JSON，供原样透传
+	IsCustom bool            `json:"-"` // type=="custom"：客户端本地执行的 freeform 工具
 }
 
 type InternalFunction struct {
@@ -237,7 +250,11 @@ type InternalResponseFormat struct {
 // @CONSTRAINT: 字段增删必须同步所有协议翻译器的 TranslateResponse
 //   - Choices[].Message.Content: 翻译器需按入站协议格式还原
 //   - Usage: 各协议 token 字段名不同，翻译器负责映射
-// @RELATED: all protocol/translator.go TranslateResponse
+//   - CustomToolNames: json:"-" 上下文标记，仅非流式出站用——TranslateResponse 签名是
+//     CombinedTranslator 接口契约（无 ctx），custom 工具名表只能搭这个结构体传入。
+//     其他翻译器读不到它就按纯 function_call 处理，因此新增此字段对 CC/Anthropic/Gemini 无影响。
+// @RELATED: all protocol/translator.go TranslateResponse; responses/translator.go
+//   TranslateResponse（custom_tool_call item）、responses/custom_tool.go CollectCustomToolNames
 //
 // ─── 通用响应 ─────────────────────────────────────────────────────────
 
@@ -248,6 +265,11 @@ type InternalResponse struct {
 	Usage   *InternalUsage   `json:"usage,omitempty"`
 	Created int64            `json:"created,omitempty"`
 	Object  string           `json:"object,omitempty"` // CC 用 "chat.completion"
+
+	// CustomToolNames 标记本轮哪些 tool_call 名对应 custom（freeform）工具，
+	// 供非流式出站翻译把 function_call 还原成 custom_tool_call。
+	// @AI_GUARD: INTERNAL_RESPONSE_CUSTOM_NAMES - 见上方 INTERNAL_RESPONSE 约束
+	CustomToolNames map[string]bool `json:"-"`
 }
 
 type InternalChoice struct {
