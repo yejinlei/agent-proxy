@@ -1024,6 +1024,7 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
+	var clientGone bool // 客户端已断开（broken pipe），停止向死 socket 写事件
 	go func() {
 		defer close(events)
 		ccStartSent := false // OpenAI 兼容路径是否已发送 start 事件
@@ -1165,8 +1166,14 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	// 阶段 2 心跳保护整个流处理过程（等待上游数据到达 + TranslateStream 写入）
 	//
 	ingressTranslator.TranslateStream(streamCtx, events, func(eventData []byte, isDone bool) {
+		if clientGone {
+			// 客户端已断开（broken pipe）：不再向死 socket 反复写事件。
+			// 此处只负责退出 emit 循环，streamCtx 已在首次写错误时取消。
+			return
+		}
 		_, err := mw.Write(eventData)
 		if err != nil {
+			clientGone = true // 与上方 return 同为 TranslateStream 回调单线程执行，无并发写
 			log.Printf("[WS-ERR] gateway translate stream write failed, aborting: %v", err)
 			cancelStream()
 			return

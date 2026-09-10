@@ -2902,8 +2902,12 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// 构建内部流式事件 channel
 	events := make(chan schema.InternalStreamEvent, 16)
 	var accumulatedUsage *schema.InternalUsage
+	var eventsDone sync.WaitGroup // 汇合上方事件生产 goroutine，避免 accumulatedUsage 数据竞态
+	var clientGone bool // 客户端已断开（broken pipe），停止向死 socket 写事件
+	eventsDone.Add(1)
 	go func() {
 		defer close(events)
+		defer eventsDone.Done()
 		ccStartSent := false // OpenAI 兼容路径是否已发送 start 事件
 		for line := range lines {
 			// 跳过元数据
@@ -3082,8 +3086,14 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	//   但 0 条 WS frame → client — 写错误被本 callback 静默吞掉，handler 205782ms 正常退出
 	//   而 Codex 侧 0 字节卡 Working。见 docs/release-v0.2.112.md
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
+		if clientGone {
+			// 客户端已断开（broken pipe）：不再向死 socket 反复写事件。
+			// 此处只负责退出 emit 循环，ctx 已在首次写错误时取消（见上方 STREAM_WRITE_ERROR）。
+			return
+		}
 		_, err := mw.Write(eventData)
 		if err != nil {
+			clientGone = true // 与上方 return 同为 TranslateStream 回调单线程执行，无并发写
 			log.Printf("[WS-ERR] translate stream write failed (%s), aborting: %v", q.proxyName, err)
 			cancel()
 			return
@@ -3094,6 +3104,7 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	// 流处理完成，停止阶段 2 心跳
 	close(callDone2)
 	<-callFinished2
+	eventsDone.Wait() // 汇合事件生产 goroutine，之后读 accumulatedUsage 无竞态
 
 	vctx := ctx.Value(verboseCtxKey{}).(verboseCtx)
 	q.logRequest(vctx, startTime, http.StatusOK, accumulatedUsage, nil)
