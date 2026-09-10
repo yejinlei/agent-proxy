@@ -616,6 +616,44 @@ response.created → response.output_item.added → response.output_text.delta*
 - `response.completed` 的 `response.output[]` 必须包含累积的完整内容（非空数组）
 - channel 关闭或 `ctx.Done()` 时必须补发完整结束序列再发 `[DONE]`
 
+### Codex custom（freeform）工具桥接（v0.2.132）
+
+Codex 的 `apply_patch` 是 `type:"custom"` 的 freeform 工具——它没有 JSON 参数 schema，
+`input` 就是一段裸文本（补丁 diff）。OpenAI Responses 协议与 CC 协议都没有等价表达，
+所以必须走「入站保留 → 合成 CC shim → 出站还原」的桥接：
+
+```
+Codex custom 工具
+  └─ TranslateRequest：Raw 原样保留 + 标记 IsCustom
+       └─ 合成 CC function：parameters = {type:object, properties:{input:{type:string}},
+                             required:["input"], additionalProperties:false}
+            └─ buildCCRequest：转发（上游无等价表达的工具在此丢弃并打日志）
+               └─ 出站还原：type:"custom_tool_call" + input:<裸串>
+                    └─ codex models.rs ResponseItem::CustomToolCall{input: String}
+```
+
+**四条硬约束：**
+
+1. **禁止按 type 白名单丢弃工具**。`TranslateRequest` 只挡「function 工具但 name 为空」
+   这一种（会让上游报 400 Invalid request format），`custom` / `tool_search` /
+   `web_search` 等全部保留。`ResponseRequest.Tools` 用 `[]json.RawMessage` 承载，
+   非 function 工具出站可原样回写（原生 Responses 上游需要完整原始字节）。
+2. **入站保留原始字节**：`InternalTool.Raw`（`json:"-"`）存 tool 定义原文，
+   `toolsToResponses` 有 Raw 就原样回写，没有才重建 function 形式。
+3. **出站形状由 custom 名表决定**，两条传输路径：
+   - 流式：`responses.WithCustomTools(ctx, ...)` 挂 context；
+   - 非流式：`TranslateResponse` 的签名是 `CombinedTranslator` 接口契约、拿不到 ctx，
+     只能挂 `InternalResponse.CustomToolNames`。
+   全部 5 条出站路径（quick.go 三条 + gateway.go 两条）都必须注入名表。
+4. **custom 的出站差异**：不发 `response.function_call_arguments.delta/.done`；
+   空参数不兜底 `{}`（custom 没有 JSON 参数对象可兜底，如实交付空串）；
+   `{"input":"..."}` 外壳由 `unwrapCCCustomArguments` 剥掉，交付裸串。
+
+实现位置：[custom_tool.go](file:///f:/src/agent-proxy/internal/protocol/responses/custom_tool.go)
+（上下文注入、合成 schema、解包裸串）、
+[translator.go](file:///f:/src/agent-proxy/internal/protocol/responses/translator.go)
+（入站保留、出站还原）、`buildCCRequest`（CC 侧合成转发）。
+
 ***
 
 ## 扩展开发
