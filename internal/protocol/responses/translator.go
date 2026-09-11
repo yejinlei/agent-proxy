@@ -684,9 +684,16 @@ func detectToolCallInText(text string) string {
 	}
 	tokens := []token{
 		{"</tool_use>", "anthropic tool_use 闭合标签"},
-		{"<parameter>", "anthropic parameter 参数语法"},
-		{"antml:", "anthropic 工具语法前缀"},
+		// Codex 原生工具调用语法：16:15:06 那轮整段以纯文本吐出、func_calls=0。
+		// 开标签必现；闭标签被模型写成 "< /tool_call>"（中间带空格），
+		// 所以只检测开标签，不检测闭标签。
+		{"<tool_call>", "Codex tool_call 工具调用块"},
 		{"<function>", "XML 风格 function 声明"},
+		// Anthropic 参数标签两种写法都要查：裸 "<parameter>" 和
+		// 等号式 "<parameter=command>"——只查前者会漏掉 Codex 形态。
+		{"<parameter>", "anthropic parameter 裸标签"},
+		{"<parameter=", "anthropic parameter 等号式标签"},
+		{"antml:", "anthropic 工具语法前缀"},
 	}
 	var hits []string
 	for _, t := range tokens {
@@ -1684,7 +1691,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		endedText := accumulatedText.String()
 		// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - finish_reason=stop 且 func_calls=0 时，
 		//   这个字段是"模型为什么不再调工具"的唯一线索。命中即说明上游把工具调用写成了
-		//   纯文本（Anthropic 语法），CC 翻译器只能原样透传。
+		//   纯文本（Anthropic </tool_use>/<parameter> 语法，或 Codex 原生 <tool_call>/<parameter=command>）；两种语法都只检测开标签，CC 翻译器只能原样透传。
 		injected := detectToolCallInText(endedText)
 		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,

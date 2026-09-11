@@ -21,6 +21,12 @@ func closeTok(name string) string {
 // 断言重点在"只检测不改行为"：命中只返回描述串，绝不解析成工具调用、也不修改输入。
 // 尾部窗口（1500 字符）是刻意设计——这类语法泄漏总在输出末尾，全量扫会漏信号。
 func TestDetectToolCallInText(t *testing.T) {
+	lt := byte(60)
+	gt := byte(62)
+	codexOpen := string([]byte{lt}) + "tool_call" + string([]byte{gt})
+	codexParamEq := string([]byte{lt}) + "parameter=command" + string([]byte{gt})
+	codexCloseSpaced := string([]byte{lt}) + " /tool_call" + string([]byte{gt})
+
 	longClean := strings.Repeat("已完成分析，内容正常。", 120)
 	nl := "\n"
 	reOpen := "<parameter>"
@@ -36,7 +42,7 @@ func TestDetectToolCallInText(t *testing.T) {
 		{name: "空文本", text: "", wantMiss: true},
 		{name: "正常正文", text: "文件 a.txt 内容为空。", wantMiss: true},
 		{name: "parameter 开标签", text: reOpen + " name=\"cmd\">rg --files",
-			wants: []string{"parameter 参数语法"}},
+			wants: []string{"anthropic parameter 裸标签"}},
 		// 检测器只查开标签 <parameter>，闭标签不在检测范围（真实泄漏总伴随开标签）。
 		// 若将来要覆盖闭标签，需同步修改 detectToolCallInText 的 tokens 表。
 		{name: "闭标签不在检测范围", text: "执行完毕 " + reClose, wantMiss: true},
@@ -47,10 +53,22 @@ func TestDetectToolCallInText(t *testing.T) {
 		{name: "function 标签", text: "<function>ls -la",
 			wants: []string{"function 声明"}},
 		{name: "尾部命中", text: longClean + nl + reOpen,
-			wants: []string{"parameter 参数语法"}},
-		{name: "头部超窗口不命中", text: reOpen + longClean, wantMiss: true},
-		{name: "多模式同时命中", text: reOpen + nl + reClose + "<function>ls",
-			wants: []string{"parameter 参数语法", "function 声明"}},
+			wants: []string{"anthropic parameter 裸标签"}},
+		// v0.2.135 生产日志 16:15:06 那轮：整段工具调用以纯文本吐出、func_calls=0。
+	{name: "codex tool_call 开标签", text: codexOpen + "\n" + codexParamEq + "pwd",
+		wants: []string{"Codex tool_call", "等号式标签"}},
+	// 闭标签被模型写成带空格 "< /tool_call>"，刻意不在检测范围（开标签已足够定位）。
+	// 生产日志 16:15:06 那轮的 END tail 原样片段（v0.2.135 当时 toolcall_in_text=""）。
+	// 该片段只含闭标签形态、开标签在窗口外——必须命中，否则这类轮次仍是盲区。
+	{name: "生产 tail 闭标签形态", text: "\n" + codexParamEq + "\n" +
+		closeTok("parameter") + "\n" + closeTok("function"),
+		wants: []string{"等号式标签"}},
+	{name: "codex 闭标签带空格不命中", text: codexCloseSpaced, wantMiss: true},
+	{name: "codex 开标签尾部命中", text: longClean + nl + codexOpen,
+		wants: []string{"Codex tool_call"}},
+	{name: "头部超窗口不命中", text: reOpen + longClean, wantMiss: true},
+		{name: "多模式同时命中", text: reOpen + nl + reClose + "<function>ls" + codexOpen,
+			wants: []string{"anthropic parameter 裸标签", "function 声明", "Codex tool_call"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

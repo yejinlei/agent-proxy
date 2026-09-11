@@ -287,7 +287,7 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TEXT_BLOCK_TYPES` | responses/translator.go | 内容块必须同时接受 `text`/`input_text`/`output_text`，否则上游 400 No user query found |
 | `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`）；`status=failed` 时 `incomplete_details.reason` 必须为 null，写 `max_output_tokens` 会让客户端误判成输出截断 |
 | `RESPONSES_FINISH_REASON_LOG` | responses/translator.go | 流终态必须带 finish_reason/incomplete_details，并落一条 `[CODEX-DEBUG] TranslateStream END` 汇总日志 |
-| `RESPONSES_TOOLCALL_IN_TEXT` | responses/translator.go | 流终态检测"模型把工具调用当纯文本吐出"（Anthropic `<tool_use>`/`<parameter>`/`antml:` 语法）。**只观测打日志，绝不解析成真实工具调用** |
+| `RESPONSES_TOOLCALL_IN_TEXT` | responses/translator.go | 流终态检测"模型把工具调用当纯文本吐出"（Anthropic `<tool_use>`/`<parameter>`/`antml:`，Codex `<tool_call>`/`<parameter=command>`）。**只观测打日志，绝不解析成真实工具调用**；开标签必查，带空格闭标签不查   |
 | `RESPONSES_EMPTY_DELTA_SHAPE` | responses/translator.go + quick.go + gateway.go | END 日志必须带 `empty_deltas` / `reasoning_chars` / `delta_shapes`。`empty_deltas` 判据是"无可见输出"（不变量 `n_delta_events - text_deltas == empty_deltas`）；`delta_shapes` 只读 key 名绝不读值（指纹须跨轮次可 diff，`Content:""` 必须算 empty）；`reasoning_chars` 经 `Metadata` 传递，**禁止写入 Content / output_text**（Codex 会把思考当正文） |
 | `RESPONSES_INBOUND_META` | responses/types.go + translator.go | 入站顶层控制字段（`tool_choice` / `text.format` / 字段名清单）只观测落日志，**禁止据此改变出站行为**（CC 路径不透传 tool_choice） |
 | `RESPONSES_CODEX_SANDBOX_META` | responses/translator.go | `client_metadata.x-codex-turn-metadata` 是**三层嵌套 JSON**（外层 → 字符串 → 内层）。只观测 sandbox_mode/approval_policy，禁止据此改出站工具集或审批行为 |
