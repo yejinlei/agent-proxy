@@ -3038,6 +3038,18 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				//   Anthropic 入站的 TranslateStream 会单独合成 thinking 块。
 				if text == "" && !isResponsesIngress {
 					text = choice.Delta.Reasoning
+					if len(text) > 0 {
+						msg.Metadata = map[string]interface{}{"reasoning_chars": float64(len(text))}
+					}
+				} else if isResponsesIngress && len(choice.Delta.Reasoning) > 0 {
+					// @AI_GUARD: RESPONSES_EMPTY_DELTA_SHAPE - Responses 入站丢弃 reasoning，
+					//   改为只读观测计数（写 Metadata，绝不进 Content）
+					// @CONSTRAINT: Metadata["reasoning_chars"] 仅供上游翻译器的 [CODEX-DEBUG]
+					//   汇总日志计数。禁止把 reasoning 写成 Content / output_text——会违反上方
+					//   ⚠️ 注释的硬约束（Codex 把思考当正文）。
+					// @REASON: v0.2.134 排障——674 个 delta 只有 7 个带文本，日志里无法区分
+					//   "上游发空 content keep-alive"与"思考 token 被静默丢弃"。
+					msg.Metadata = map[string]interface{}{"reasoning_chars": float64(len(choice.Delta.Reasoning))}
 				}
 				if text != "" {
 					msg.Content, _ = json.Marshal(text)

@@ -514,6 +514,150 @@ func responsesLogTail(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// responsesDeltaShape 按 key 集合描述一个 delta 的 shape，供 [CODEX-DEBUG] 汇总日志
+// 输出 distinct 清单。只读 key 名，绝不读取值——值可能含用户正文或工具参数。
+//
+// content 的判据是"解出来是否有非空文本"，不是字段是否存在：上游会发
+// Content:"" 的 keep-alive，这类必须算 empty，否则 delta_shapes 会把空 delta
+// 误报成 content 并把真正的形状信号淹没。
+//
+// @AI_GUARD: RESPONSES_EMPTY_DELTA_SHAPE - 见 TranslateStream 里的同名标记
+// @CONSTRAINT: 只观测打日志。shape 字符串是日志字段，不参与任何出站行为判定。
+func responsesDeltaShape(d *schema.InternalMessage) string {
+	if d == nil {
+		return "no_choice"
+	}
+	seen := make(map[string]bool)
+	if hasNonEmptyText(d.Content) {
+		seen["content"] = true
+	}
+	if d.ToolCallID != "" {
+		seen["tool_call_id"] = true
+	}
+	if d.Name != "" {
+		seen["name"] = true
+	}
+	for _, tc := range d.ToolCalls {
+		if tc.Type != "" {
+			seen["tool_calls."+tc.Type] = true
+		} else {
+			seen["tool_calls"] = true
+		}
+	}
+	if md := d.Metadata; md != nil {
+		for k := range md {
+			seen[k] = true
+		}
+	}
+	if len(seen) == 0 {
+		return "empty"
+	}
+	return strings.Join(keysOfMap(seen), "+")
+}
+
+// extractTextDelta 提取本 delta 的正文。调用方必须已确认 len(event.Data.Choices)>0。
+// 只读 choice.Message.Content，不修改任何出站状态。
+func extractTextDelta(event schema.InternalStreamEvent, acc *strings.Builder) string {
+	choice := event.Data.Choices[0]
+	if choice.Message.Content == nil {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(choice.Message.Content, &text) != nil {
+		return ""
+	}
+	if text == "" {
+		return ""
+	}
+	acc.WriteString(text)
+	return text
+}
+
+// extractReasoningChars 取 quick.go/gateway.go 写入的 reasoning 字符数观测值。
+// 只读 Metadata，不改任何出站状态；reasoning 按硬约束绝不出现在 Content / output_text。
+func extractReasoningChars(event schema.InternalStreamEvent) int {
+	if len(event.Data.Choices) == 0 {
+		return 0
+	}
+	n, _ := event.Data.Choices[0].Message.Metadata["reasoning_chars"].(float64)
+	return int(n)
+}
+
+// deltaHasVisibleOutput 判定本 delta 是否携带任何**可见输出**（正文或工具调用）。
+// reasoning 观测值不算可见输出：它按硬约束绝不出站，因此不产生任何 SSE 事件。
+// 用它而非"载荷是否为空"来判 empty，是为了保持不变量
+// n_delta_events - text_deltas == empty_deltas，并让 reasoning-only delta 的 shape
+// （reasoning_chars）出现在 delta_shapes 里——那才是"模型在思考但没输出"的有效诊断信号。
+//
+// @AI_GUARD: RESPONSES_EMPTY_DELTA_SHAPE - 只观测打日志，绝不据此改变出站行为
+func deltaHasVisibleOutput(event schema.InternalStreamEvent) bool {
+	if len(event.Data.Choices) == 0 {
+		return false
+	}
+	choice := event.Data.Choices[0]
+	if hasNonEmptyText(choice.Message.Content) {
+		return true
+	}
+	return len(choice.Message.ToolCalls) > 0
+}
+
+// hasNonEmptyText 判定 Content 字段解出后是否有非空文本。
+// 判据是"解出来的值"而非"字段是否存在"：上游会发 Content:"" 的 keep-alive，
+// 这类必须算 empty，否则 delta_shapes 会把空 delta 误报成 content。
+func hasNonEmptyText(content json.RawMessage) bool {
+	if content == nil {
+		return false
+	}
+	var text string
+	if json.Unmarshal(content, &text) != nil {
+		return false
+	}
+	return text != ""
+}
+
+// keysOfMap 排序 map 的 key，保证日志里 shape 字符串稳定可 diff。
+func keysOfMap(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// emptyDeltaShapeSummary 把空 delta 的 shape 分布压成 "empty=667,metadata+reasoning_chars=1"
+// 形式，key 按出现次数降序再字母序，保证同一现象在不同轮次日志里字符串一致、可直接 diff。
+// 空 map 返回空串，END 日志里 %q 会打印为 ""，与"有分布但恰好为空"可区分。
+func emptyDeltaShapeSummary(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	type kv struct {
+		k string
+		n int
+	}
+	pairs := make([]kv, 0, len(counts))
+	for k, n := range counts {
+		if n > 0 {
+			pairs = append(pairs, kv{k, n})
+		}
+	}
+	if len(pairs) == 0 {
+		return ""
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].n != pairs[j].n {
+			return pairs[i].n > pairs[j].n
+		}
+		return pairs[i].k < pairs[j].k
+	})
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		parts = append(parts, fmt.Sprintf("%s=%d", p.k, p.n))
+	}
+	return strings.Join(parts, ",")
+}
+
 // @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 检测模型把工具调用当纯文本吐出
 // @CONSTRAINT: 只观测并打日志，绝不据此改写输出、也绝不解析成真实工具调用。
 //   这是"只加观测、不改行为"的硬约束——擅自解析 Anthropic 语法会引入与上游协议
@@ -1136,6 +1280,20 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	var nDeltaEvents int
 	var nTextDeltas int
 	var nFuncArgsDeltas int
+	// @AI_GUARD: RESPONSES_EMPTY_DELTA_SHAPE - 空 delta 的内容形状必须可观测
+	// @CONSTRAINT: 只计数打日志，绝不据此改变出站行为。nDeltaEvents 与 nTextDeltas 的
+	//   差值此前只能肉眼对总数（v0.2.134 排障时 71.87s / 674 delta / 只有 7 个带文本，
+	//   剩下 667 个空 delta 里装的是什么，日志里完全没有痕迹）。reasoning_chars 是
+	//   "模型在思考但没想完就 stop"的唯一证据：CC 协议把思考放在 choices[].delta.reasoning，
+	//   与 content 平级，本代理此前从不读取该字段。
+	// @RELATED: quick.go / gateway.go handleStreamRequest 的 OpenAI 兼容分支（Delta.Reasoning）
+	// @REASON: Codex 反复在 finish_reason=stop / func_calls=0 处停下等人回复，需区分
+	//   "上游发空 content keep-alive"与"思考 token 被静默丢弃"。
+	var nEmptyDeltas int
+	var reasoningChars int
+	// 空 delta 的 shape 分布，key 形如 "empty" / "metadata+reasoning_chars"，
+	// 用于 END 日志的 delta_shapes 字段。只在 emptyThisDelta 分支写入。
+	emptyDeltaShapeCounts := make(map[string]int)
 	startedAt := time.Now()
 	createdSent := false
 	itemAdded := false
@@ -1528,8 +1686,9 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		//   这个字段是"模型为什么不再调工具"的唯一线索。命中即说明上游把工具调用写成了
 		//   纯文本（Anthropic 语法），CC 翻译器只能原样透传。
 		injected := detectToolCallInText(endedText)
-		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
-			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
+			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
+			emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 			nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
 			respPayload["usage"], strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
 
@@ -1621,8 +1780,9 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				})
 				// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 错误路径同样检测，保证正常/失败两条
 				//   汇总日志字段一致，grep 时不需要按路径分开处理。
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
-					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
+					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
+						emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 					nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
 					event.Error.Code, event.Error.Type, event.Error.Message,
 					detectToolCallInText(accumulatedText.String()), responsesLogTail(accumulatedText.String()))
@@ -1639,19 +1799,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			case "delta":
 				sendCreated()
 				nDeltaEvents++
+
 				if event.Data != nil && len(event.Data.Choices) > 0 {
 					choice := event.Data.Choices[0]
 					if choice.FinishReason != "" {
 						lastFinishReason = choice.FinishReason
 					}
 
-					if choice.Message.Content != nil {
-						var text string
-						json.Unmarshal(choice.Message.Content, &text)
-						if text != "" {
-							sendTextDelta(text)
-							accumulatedText.WriteString(text)
-						}
+					if text := extractTextDelta(event, &accumulatedText); text != "" {
+						sendTextDelta(text)
 					}
 
 					for i, tc := range choice.Message.ToolCalls {
@@ -1662,6 +1818,25 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 							fc.argsBuffer.WriteString(tc.Function.Arguments)
 						}
 					}
+				}
+
+				// reasoning_chars 来自 choice.Message.Metadata["reasoning_chars"]，
+				// 由 quick.go / gateway.go 的 OpenAI 兼容分支写入；只计数，绝不进正文。
+				if n := extractReasoningChars(event); n > 0 {
+					reasoningChars += n
+				}
+
+				// 不变量：n_delta_events - text_deltas == n_empty_deltas。
+				// 判据是"本 delta 是否产生任何出站事件"，不是"载荷是否为空"——
+				// 只带 reasoning 的 delta 不产生事件但也不是空 keep-alive，
+				// 它的 shape（reasoning_chars）必须出现在 delta_shapes 里才是有效的诊断信号。
+				if !deltaHasVisibleOutput(event) {
+					nEmptyDeltas++
+					shape := "no_choice"
+					if event.Data != nil && len(event.Data.Choices) > 0 {
+						shape = responsesDeltaShape(&event.Data.Choices[0].Message)
+					}
+					emptyDeltaShapeCounts[shape]++
 				}
 				continue
 

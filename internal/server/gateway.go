@@ -1126,6 +1126,17 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 				}
 				choice := ccChunk.Choices[0]
 				msg := schema.InternalMessage{Role: schema.RoleAssistant}
+				// @AI_GUARD: RESPONSES_EMPTY_DELTA_SHAPE - reasoning 只观测计数，绝不进正文
+				// @CONSTRAINT: Metadata["reasoning_chars"] 仅供上游翻译器的 [CODEX-DEBUG]
+				//   汇总日志计数；禁止把 choices[].delta.reasoning 写成 Content / output_text。
+				//   Responses 有独立的 thinking 事件体系，混发 → Codex 把思考当正文。
+				// @RELATED: quick.go handleStreamRequest（同一逻辑，必须保持同步）
+				// @REASON: v0.2.134 排障——674 个 delta 只有 7 个带文本，日志里无法区分
+				//   "上游发空 content keep-alive"与"思考 token 被静默丢弃"。
+				//   gateway.go 此前完全没读 Delta.Reasoning（quick.go 读过但仅非 Responses 回退）。
+				if len(choice.Delta.Reasoning) > 0 {
+					msg.Metadata = map[string]interface{}{"reasoning_chars": float64(len(choice.Delta.Reasoning))}
+				}
 				if choice.Delta.Content != "" {
 					msg.Content, _ = json.Marshal(choice.Delta.Content)
 				}
