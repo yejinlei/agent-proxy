@@ -18,6 +18,33 @@ type ResponseRequest struct {
 	Metadata           *Metadata         `json:"metadata,omitempty"`
 	Instructions       string            `json:"instructions,omitempty"` // 系统提示
 	PreviousResponseID string            `json:"previous_response_id,omitempty"`
+
+	// @AI_GUARD: RESPONSES_INBOUND_META - Codex 顶层控制字段必须可观测
+	// @CONSTRAINT: ToolChoice 与 Text.Format 都不进上游请求（CC 路径不透传，见
+	//   gateway.go buildCCRequest），属于"入站收到但影响模型行为"的字段。之前完全没有解析，
+	//   日志里看不出来，无法判断 Codex 是不是用 tool_choice / structured text 限制了工具使用。
+	//   只解析 + 落日志，不得据此改出站行为（行为变更需单独评审）。
+	// @REASON: v0.2.134 排障——Codex 系统提示 272 次要求用 apply_patch，但 tools[] 里 0 次；
+	//   同时每次请求都带 "tool_choice":"auto" 和 "text":{"format":{"name":"codex_output_schema"}}，
+	//   两者此前都进不了日志，无法归因。
+	ToolChoice *json.RawMessage `json:"tool_choice,omitempty"`
+	Text       *ResponseText    `json:"text,omitempty"`
+
+	// RawMeta 顶层字段名 → 原始 JSON，供日志区分"已解析"与"被忽略"的字段。
+	// @CONSTRAINT: 仅供可观测性，不参与任何出站构造。
+	RawMeta map[string]json.RawMessage `json:"-"`
+}
+
+// ResponseText Responses API 的 text 控制字段（structured outputs）
+type ResponseText struct {
+	Format *ResponseTextFormat `json:"format,omitempty"`
+}
+
+// ResponseTextFormat structured outputs 的格式声明
+type ResponseTextFormat struct {
+	Type string `json:"type,omitempty"` // "json_schema" | "text"
+	Name string `json:"name,omitempty"` // 如 codex_output_schema
+	// Schema 不建模：只需要知道 Codex 是否要求结构化输出（recap 请求的标志）。
 }
 
 // Input 兼容 Responses API 两种 input 形式：纯字符串（单消息）或 []InputItem 数组
@@ -52,6 +79,15 @@ func (r *ResponseRequest) UnmarshalJSON(data []byte) error {
 			if err2 := json.Unmarshal(aux.Input, &s); err2 == nil {
 				r.Input = s
 			}
+		}
+	}
+
+	// RawMeta：顶层字段名 → 原始 JSON。用于日志区分"已解析"与"被忽略"的入站字段。
+	// 失败不致命——纯可观测性，不能因为解析 meta 失败而让请求失败。
+	if r.RawMeta == nil {
+		var meta map[string]json.RawMessage
+		if err := json.Unmarshal(data, &meta); err == nil {
+			r.RawMeta = meta
 		}
 	}
 	return nil

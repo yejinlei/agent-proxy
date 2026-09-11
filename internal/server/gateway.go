@@ -1277,6 +1277,36 @@ func mapRoleToCC(role string) string {
 // 工具名逐个列出（toolNames），不只要计数：v0.2.132 的 custom 工具回归只打了
 // tools=N，日志里看不出合成描述串到了哪些普通函数上、补丁工具有没有被送出。
 // 双模式共用 buildCCRequest，因此快速/复杂模式都覆盖。
+// digestCallID 空 id 会被现场合成，与历史里任何 function_call_output 都对不上；
+// 长 id 截中间保持日志宽度可控。
+func digestCallID(id string) string {
+	if id == "" {
+		return "SYNTH"
+	}
+	if len(id) > 28 {
+		return id[:16] + ".." + id[len(id)-8:]
+	}
+	return id
+}
+
+// toolResultShape 描述 role:tool 消息的内容形状。
+// CC 的 content 正常是纯字符串（工具输出文本）；若是对象/数组说明
+// extractOutputText 走了 json.Marshal 兜底，模型读到的是 JSON 包裹而非纯文本。
+func toolResultShape(m chatcompletion.Message) string {
+	b := m.Content.Raw()
+	if len(b) == 0 {
+		return "EMPTY"
+	}
+	prefix := b
+	if len(prefix) > 8 {
+		prefix = prefix[:8]
+	}
+	if prefix[0] == '{' || prefix[0] == '[' {
+		return fmt.Sprintf("%d:JSONPREFIX", len(b))
+	}
+	return fmt.Sprintf("%d", len(b))
+}
+
 func logCCRequestShape(model string, messages []chatcompletion.Message, nTools int, toolNames []string) {
 	if len(messages) == 0 {
 		return
@@ -1284,6 +1314,7 @@ func logCCRequestShape(model string, messages []chatcompletion.Message, nTools i
 
 	var roles []string
 	var fcs []string
+	var toolMsgs []string // role:tool 消息：长度 + JSON 化前缀标记
 	toolCallIDs := make(map[string]bool)
 	toolResultIDs := make(map[string]bool)
 	for _, m := range messages {
@@ -1296,6 +1327,12 @@ func logCCRequestShape(model string, messages []chatcompletion.Message, nTools i
 		}
 		if m.Role == "tool" {
 			toolResultIDs[m.ToolCallID] = true
+			// @AI_GUARD: CC_TOOL_RESULT_SHAPE - role:tool 的内容形状必须可见
+			// @REASON: function_call_output.output 若被 extractOutputText 兜底成
+			//   json.Marshal(map)，CC 消息的 content 会是整段 JSON 而非纯文本。
+			//   上游仍返回 200、工具结果可读，但模型的"文件已写好"判断会被 JSON 噪声干扰。
+			//   只看 tool_result_ids 的配对情况看不出这个问题，必须看内容形状。
+			toolMsgs = append(toolMsgs, fmt.Sprintf("%s:%s", digestCallID(m.ToolCallID), toolResultShape(m)))
 		}
 	}
 
@@ -1319,6 +1356,13 @@ func logCCRequestShape(model string, messages []chatcompletion.Message, nTools i
 	log.Printf("[CODEX-DEBUG] buildCCRequest: model=%q messages=%d roles=[%s] tools=%d tool_names=[%s] tool_calls=%d fcs=[%s] orphaned_tool_results=%d",
 		model, len(messages), strings.Join(roles, ","), nTools,
 		strings.Join(toolNames, ","), len(toolCallIDs), strings.Join(fcs, " "), orphans)
+
+	// tool_msgs 单独一行：role:tool 消息的 call_id 与内容形状。
+	// 与主行分离是因为 tool_names/fcs 已经把主行撑到很难读；分开后每行都可 grep。
+	// JSONPREFIX 标记见 toolResultShape 的 @AI_GUARD: CC_TOOL_RESULT_SHAPE。
+	if len(toolMsgs) > 0 {
+		log.Printf("[CODEX-DEBUG] buildCCRequest: tool_msgs=%d [%s]", len(toolMsgs), strings.Join(toolMsgs, " "))
+	}
 }
 
 func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion.ChatCompletionRequest {
@@ -1397,6 +1441,7 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
 	toolNames := make([]string, 0, len(req.Tools))
 	nUnsupported := 0
+	var droppedTools []string
 	for _, tool := range req.Tools {
 		if tool.IsCustom {
 			// custom（freeform）工具不能原样转发给 CC 上游：CC 没有本地 executor，
@@ -1425,10 +1470,24 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 			continue
 		}
 		nUnsupported++
+		// @AI_GUARD: CC_CUSTOM_TOOL_SYNTHESIS - 丢弃清单必须可观测
+		// @REASON: v0.2.134 排障——系统提示里 apply_patch 出现 272 次，但 Codex 本次送的
+		//   tools[] 里 0 次；此前这里只打"4 tool(s) have no CC equivalent"的**数量**，
+		//   日志里根本看不出丢的是哪些工具，无法归因。
+		dropped := tool.Type
+		if len(tool.Raw) > 0 {
+			var probe struct {
+				Name string `json:"name"`
+			}
+			if jsonErr := json.Unmarshal(tool.Raw, &probe); jsonErr == nil && probe.Name != "" {
+				dropped = fmt.Sprintf("%s/%s", tool.Type, probe.Name)
+			}
+		}
+		droppedTools = append(droppedTools, dropped)
 	}
 	if nUnsupported > 0 {
-		log.Printf("[CODEX-DEBUG] buildCCRequest: %d tool(s) have no CC equivalent (type!=function/custom, e.g. web_search/tool_search) and are not sent upstream",
-			nUnsupported)
+		log.Printf("[CODEX-DEBUG] buildCCRequest: %d tool(s) have no CC equivalent (type!=function/custom, e.g. web_search/tool_search) and are not sent upstream → [%s]",
+			nUnsupported, strings.Join(droppedTools, ","))
 	}
 
 	// 上游 CC 请求体形状摘要 + 悬空工具结果检查。

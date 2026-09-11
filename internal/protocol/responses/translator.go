@@ -115,6 +115,40 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
 		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
 
+	// 顶层控制字段诊断：这些字段影响模型行为但不会进入上游请求，此前完全不可见。
+	// tool_choice 限制了模型可选的工具；text.format 是 structured outputs（Codex 的 recap
+	// 摘要请求用 codex_output_schema），出现它就意味着本轮是结构化摘要而非工具调用轮。
+	// @AI_GUARD: RESPONSES_INBOUND_META - 只观测，不得据此改变出站行为
+	{
+		topFields := make([]string, 0, len(req.RawMeta))
+		for k := range req.RawMeta {
+			topFields = append(topFields, k)
+		}
+		sort.Strings(topFields)
+
+		toolChoice := "none"
+		if req.ToolChoice != nil {
+			toolChoice = cleanScalarForLog(*req.ToolChoice)
+			if len(toolChoice) > 120 {
+				toolChoice = toolChoice[:120] + "…"
+			}
+		}
+		textFormat := "none"
+		if req.Text != nil && req.Text.Format != nil {
+			textFormat = fmt.Sprintf("type=%s name=%q", req.Text.Format.Type, req.Text.Format.Name)
+		}
+		log.Printf("[CODEX-DEBUG] TranslateRequest meta: top_fields=[%s] tool_choice=%s text_format=%s store=%s",
+			strings.Join(topFields, ","), toolChoice, textFormat, cleanScalarForLog(req.RawMeta["store"]))
+
+		// Codex 沙箱/审批模式：藏在 client_metadata.x-codex-turn-metadata 里，是那层里的
+		// JSON 编码字符串——三层嵌套。读它需要两次额外解析，失败静默跳过。
+		// @REASON: v0.2.134 排障时 grep 转义 JSON 失败 3 次才定位到 sandbox_mode，
+		//   而它是判断"写入被沙箱拦了"还是"模型没尝试写"的唯一依据。
+		if meta := codexSandboxMode(req.RawMeta["client_metadata"]); meta != "" {
+			log.Printf("[CODEX-DEBUG] TranslateRequest meta: codex_sandbox=%s", meta)
+		}
+	}
+
 	// input items 逐条形状摘要。
 	// 上游请求体日志被 formatJSON 截到 20KB+8KB（quick.go），大请求的 messages 中段
 	// 完整内容进不了日志；排查"模型最后一轮决定收口而不再调工具"这类问题时，
@@ -397,6 +431,78 @@ func responsesItemDigest(items []InputItem) string {
 	return strings.Join(parts, " ")
 }
 
+// cleanScalarForLog 把单个 JSON 标量的原始字节压成适合日志的字符串。
+// 直接 %s 打印 json.RawMessage 会带引号（store=false → `"false"`、tool_choice → `"auto"`），
+// 读日志时容易和"缺失"混淆。这里解一次字符串类型化：字符串去掉成对外层引号，
+// 其余（数字/布尔/null）原样保留，解析失败则回退到去空白原文。
+// @REASON: v0.2.134 排障——RawMeta 存的是原始 JSON，直接插值打印出来是
+//   tool_choice=""auto""、store="false"，逐字比对时很容易误读成字段缺失。
+// @CONSTRAINT: 仅用于日志。返回值的形态不能反推回解析逻辑。
+func cleanScalarForLog(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// @AI_GUARD: RESPONSES_CODEX_SANDBOX_META - Codex 沙箱/审批模式只观测，不得据此改变出站行为
+// @CONSTRAINT: 返回值仅供日志。CC 路径不透传 sandbox/approval_policy，因此**禁止**用它
+//   推导"沙箱拦了写入"而改变出站工具集或审批行为——那会让代理替 Codex 做安全决策。
+// @REASON: 该字段藏在 client_metadata.x-codex-turn-metadata 里，且**那层本身也是 JSON
+//   编码的字符串**（三层嵌套：外层 JSON → 字符串 → 内层 JSON）。v0.2.134 排障时对
+//   转义 JSON 做了 3 次 grep 才定位到 sandbox_mode。它是区分"写入被沙箱拦截"与
+//   "模型压根没尝试写"的唯一直接证据，而 v0.2.134 的结论是后者（工具数组里没有
+//   任何能写文件的工具）。
+// @RELATED: detectToolCallInText（同属 v0.2.134 的纯观测诊断点）
+func codexSandboxMode(clientMetadataRaw json.RawMessage) string {
+	if len(clientMetadataRaw) == 0 {
+		return ""
+	}
+	var outer map[string]json.RawMessage
+	if err := json.Unmarshal(clientMetadataRaw, &outer); err != nil {
+		return ""
+	}
+	turnRaw, ok := outer["x-codex-turn-metadata"]
+	if !ok {
+		return ""
+	}
+	// 该字段是 JSON 字符串，解一次引号；也可能有实现直接放对象，两者都兼容。
+	var inner map[string]json.RawMessage
+	var turnJSON string
+	if err := json.Unmarshal(turnRaw, &turnJSON); err == nil {
+		if turnJSON == "" {
+			return ""
+		}
+		if err := json.Unmarshal([]byte(turnJSON), &inner); err != nil {
+			return ""
+		}
+	} else {
+		// 对象形态：turnRaw 本身就是 JSON 对象，直接解。空串/非法 JSON 都走这里静默返回。
+		if err := json.Unmarshal(turnRaw, &inner); err != nil || inner == nil {
+			return ""
+		}
+	}
+	fields := make([]string, 0, 3)
+	if v, ok := inner["sandbox_mode"]; ok {
+		fields = append(fields, "sandbox_mode="+cleanScalarForLog(v))
+	}
+	if v, ok := inner["approval_policy"]; ok {
+		fields = append(fields, "approval_policy="+cleanScalarForLog(v))
+	}
+	if v, ok := inner["working_directory"]; ok {
+		s := strings.TrimSpace(cleanScalarForLog(v))
+		if len(s) > 80 {
+			s = s[:80] + "…"
+		}
+		fields = append(fields, "workdir="+s)
+	}
+	return strings.Join(fields, " ")
+}
+
 // responsesLogTail 取文本末尾 160 字符并压成单行，供 [CODEX-DEBUG] 汇总日志使用。
 // 模型"最后一轮只回了一句就收口"的措辞是判断它为何停止调工具的唯一线索，
 // 但整段输出进日志会膨胀，因此只保留尾部。所有空白（含换行）折叠成单空格，
@@ -406,6 +512,48 @@ func responsesLogTail(s string) string {
 		s = s[len(s)-160:]
 	}
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 检测模型把工具调用当纯文本吐出
+// @CONSTRAINT: 只观测并打日志，绝不据此改写输出、也绝不解析成真实工具调用。
+//   这是"只加观测、不改行为"的硬约束——擅自解析 Anthropic 语法会引入与上游协议
+//   不一致的行为分叉，且需要 CC 翻译器同步改。
+// @REASON: v0.2.134 排障——上游模型有 Anthropic 训练痕迹，会用 Anthropic 的
+//   <tool_use>/<parameter> 语法把工具调用写成纯文本。CC 的 TranslateStream 只能当
+//   choices[].delta.content 原样透传 → finish_reason="stop"、func_calls=0。Codex 收到
+//   纯文本不会解析成工具调用，整轮静默失败。agent-proxy-9091.log L1109 结尾是
+//   </tool_use>、L1857 结尾是 <parameter>…
+// @RELATED: internal/protocol/chatcompletion/translator.go TranslateStream（无法解析该语法）
+func detectToolCallInText(text string) string {
+	if len(text) == 0 {
+		return ""
+	}
+	// 只看尾部 1500 字符：这类语法泄漏总是出现在文本末尾（模型先在 content 里写
+	// 工具调用、把整轮"结束"）。全量扫会漏掉被长文本稀释的信号，也可能误判系统提示里的示例。
+	probe := text
+	if len(probe) > 1500 {
+		probe = probe[len(probe)-1500:]
+	}
+	type token struct {
+		pat string
+		why string
+	}
+	tokens := []token{
+		{"</tool_use>", "anthropic tool_use 闭合标签"},
+		{"<parameter>", "anthropic parameter 参数语法"},
+		{"antml:", "anthropic 工具语法前缀"},
+		{"<function>", "XML 风格 function 声明"},
+	}
+	var hits []string
+	for _, t := range tokens {
+		if i := strings.Index(probe, t.pat); i >= 0 {
+			// 带 80 字符窗口，能看到泄漏的具体上下文
+			start := max(0, i-40)
+			end := min(len(probe), i+80)
+			hits = append(hits, fmt.Sprintf("%s@%d:%q", t.why, i, responsesLogTail(probe[start:end])))
+		}
+	}
+	return strings.Join(hits, " | ")
 }
 
 // digestCallID 空 call_id 会被 itemToMessage 现场合成，与历史里任何
@@ -1367,16 +1515,23 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		var fcDesc []string
 		for _, k := range funcCallOrder {
 			fc := funcCalls[k]
-			fcDesc = append(fcDesc, fmt.Sprintf("%s/%s/%d", fc.CallID, fc.Name, fc.argsBuffer.Len()))
+			// fcs 带 args 摘要（前 120 字节）：长度只能说明"有参数"，看不到模型实际想让
+			// 工具干什么。Codex 场景要判断"模型是只读探查还是尝试写文件"，必须看到 cmd 内容。
+			fcDesc = append(fcDesc, fmt.Sprintf("%s/%s/%d:%s", fc.CallID, fc.Name, fc.argsBuffer.Len(),
+				responsesLogTail(fc.argsBuffer.String())))
 		}
 		if len(fcDesc) == 0 {
 			fcDesc = append(fcDesc, "none")
 		}
 		endedText := accumulatedText.String()
-		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] tail=%q",
+		// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - finish_reason=stop 且 func_calls=0 时，
+		//   这个字段是"模型为什么不再调工具"的唯一线索。命中即说明上游把工具调用写成了
+		//   纯文本（Anthropic 语法），CC 翻译器只能原样透传。
+		injected := detectToolCallInText(endedText)
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
 			nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
-			respPayload["usage"], strings.Join(fcDesc, " "), responsesLogTail(endedText))
+			respPayload["usage"], strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
 
 		sendDoneSSE()
 	}
@@ -1464,10 +1619,13 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 					"type":     "response.completed",
 					"response": respPayload,
 				})
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s tail=%q",
+				// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 错误路径同样检测，保证正常/失败两条
+				//   汇总日志字段一致，grep 时不需要按路径分开处理。
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
 					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, len(funcCallOrder),
 					nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
-					event.Error.Code, event.Error.Type, event.Error.Message, responsesLogTail(accumulatedText.String()))
+					event.Error.Code, event.Error.Type, event.Error.Message,
+					detectToolCallInText(accumulatedText.String()), responsesLogTail(accumulatedText.String()))
 				sendDoneSSE()
 				return
 
