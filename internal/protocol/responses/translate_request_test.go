@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -116,4 +117,146 @@ func TestTranslateRequest_EmptyInputInjectsUser(t *testing.T) {
 		t.Fatalf("注入的消息必须含 user 角色，实际 %+v", ir.Messages)
 	}
 	t.Logf("✅ 空 input 已注入 user 消息，messages=%d", len(ir.Messages))
+}
+
+// TestTranslateRequest_EmptyUserContentIsFilled 验证 v0.2.136：
+// 空 input 注入的是**非空**占位符，且 input 非空但 user 消息内容为空时同样要填。
+//
+// 上游 SenseNova 有两道连续校验：
+//   ① 只有 system 消息 → 400 "Failed to build prompt: No user query found in messages."
+//   ② user 消息 content 为空串/纯空白 → 400 "user content required"
+//
+// v0.2.109 注入 "" 兜住了 ①（agent-proxy-9092.log 09-10 同 body 200）；
+// 09-12 上游加严校验 ②，同一字节序列变成 400（agent-proxy-9091.log）。
+func TestTranslateRequest_EmptyUserContentIsFilled(t *testing.T) {
+	tr := NewResponsesTranslator()
+
+	// 1) 空 input：注入的占位符不能是空串或纯空白
+	raw := json.RawMessage(`{"model":"m","input":[],"instructions":"sys"}`)
+	ir, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ir.Messages) != 1 {
+		t.Fatalf("空 input 应只有 1 条注入消息，实际 %d", len(ir.Messages))
+	}
+	m := ir.Messages[0]
+	if m.Role != schema.RoleUser {
+		t.Fatalf("注入消息必须是 user，实际 %s", m.Role)
+	}
+	var got string
+	if err := json.Unmarshal(m.Content, &got); err != nil || strings.TrimSpace(got) == "" {
+		t.Fatalf("注入的 user 内容必须非空（空串会让上游 400 \"user content required\"），实际 %q", got)
+	}
+	if got != prewarmPlaceholder {
+		t.Fatalf("注入内容应为固定占位符 %q，实际 %q", prewarmPlaceholder, got)
+	}
+	t.Logf("✅ 空 input 注入非空占位符: %q", got)
+}
+
+// TestTranslateRequest_EmptyUserMessageInHistoryIsFilled 验证 input 非空但
+// user 消息内容为空的形态——这是主编码轮次的真实形态（Codex 用空 user item
+// 标记"用户没说什么新东西"），影响比 prewarm 大得多：会让整轮编码会话 400。
+func TestTranslateRequest_EmptyUserMessageInHistoryIsFilled(t *testing.T) {
+	cases := []struct {
+		name string
+		item string
+	}{
+		{"content 为空串", `{"type":"message","role":"user","content":""}`},
+		{"content 为纯空白", `{"type":"message","role":"user","content":"  "}`},
+		{"content 为 nil", `{"type":"message","role":"user"}`},
+		{"input_text 块为空串", `{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`},
+		{"只有空 text 块", `{"type":"message","role":"user","content":[{"type":"text","text":"   "}]}`},
+	}
+	tr := NewResponsesTranslator()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := json.RawMessage(fmt.Sprintf(
+				`{"model":"m","instructions":"sys","input":[%s,{"type":"message","role":"assistant","content":[{"type":"output_text","text":"thinking"}]}]}`,
+				tc.item))
+			ir, err := tr.TranslateRequest(context.Background(), raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, msg := range ir.Messages {
+				if msg.Role != schema.RoleUser {
+					continue
+				}
+				found = true
+				var got string
+				json.Unmarshal(msg.Content, &got)
+				if strings.TrimSpace(got) == "" {
+					t.Fatalf("%s → user 内容为空，必须替换成占位符（否则上游 400 \"user content required\"）", tc.name)
+				}
+				// buildCCRequest 优先用 ContentBlocks 而非 Content，两条出口必须一致：
+				// ContentBlocks 里必须恰好是一条占位 text 块，不能残留空块（空块数组会让
+				// buildCCRequest 产出空的 CC content，等于没修）。
+				if len(msg.ContentBlocks) != 1 || msg.ContentBlocks[0].Type != "text" ||
+					msg.ContentBlocks[0].Text != prewarmPlaceholder {
+					t.Fatalf("%s → ContentBlocks 必须是单条占位 text 块，实际 %+v", tc.name, msg.ContentBlocks)
+				}
+				t.Logf("✅ %s → %q", tc.name, got)
+			}
+			if !found {
+				t.Fatalf("%s → 必须存在一条 user 消息", tc.name)
+			}
+		})
+	}
+}
+
+// TestTranslateRequest_ImageOnlyUserMessageNotTreatedAsEmpty 是"修 A 坏 B"护栏：
+// image-only 消息的 Content 恒为空串，只有 ContentBlocks 里有图片。
+// 若空消息判定只看 Content 或把任何非 text 块忽略，就会把图片顶成占位符——
+// 图片静默丢失（roundtrip_test.go TestInbound_ImageURL 首次暴露此问题）。
+func TestTranslateRequest_ImageOnlyUserMessageNotTreatedAsEmpty(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := json.RawMessage(`{"model":"m","instructions":"sys","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_image","source":{"type":"url","url":"https://example.com/photo.jpg"}}
+		]}
+	]}`)
+	ir, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ir.Messages) != 1 {
+		t.Fatalf("应只有 1 条消息，实际 %d", len(ir.Messages))
+	}
+	m := ir.Messages[0]
+	var got string
+	json.Unmarshal(m.Content, &got)
+	if got == prewarmPlaceholder {
+		t.Fatalf("image-only 消息被误判为空并替换成占位符，图片丢失")
+	}
+	if len(m.ContentBlocks) != 1 || m.ContentBlocks[0].Type != "image" {
+		t.Fatalf("image 块被顶掉了，实际 %+v", m.ContentBlocks)
+	}
+	if m.ContentBlocks[0].URL != "https://example.com/photo.jpg" {
+		t.Fatalf("图片 URL 丢失: %+v", m.ContentBlocks[0])
+	}
+}
+
+// TestTranslateRequest_NonEmptyUserMessageUntouched 确认占位符替换只作用于空内容，
+// 正常会话的 user 消息必须逐字节不变——这是防止"修 A 坏 B"的回归护栏。
+func TestTranslateRequest_NonEmptyUserMessageUntouched(t *testing.T) {
+	tr := NewResponsesTranslator()
+	raw := json.RawMessage(`{"model":"m","instructions":"sys","input":[
+		{"type":"message","role":"user","content":"修复登录 bug"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录 bug"}]}
+	]}`)
+	ir, err := tr.TranslateRequest(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range ir.Messages {
+		var got string
+		json.Unmarshal(m.Content, &got)
+		if got == prewarmPlaceholder {
+			t.Fatalf("index %d 的正常 user 消息被替换成占位符", i)
+		}
+		if got != "修复登录 bug" {
+			t.Fatalf("index %d user 内容被篡改: %q", i, got)
+		}
+	}
 }

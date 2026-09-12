@@ -2660,6 +2660,13 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 	//   出站若不还原成 custom_tool_call item，Codex 反序列化不出该 item，补丁静默丢弃。
 	if internalReq != nil {
 		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 非流式出站必须还原 namespace function_call
+		// @CONSTRAINT: 与 gateway.go 同名块逐字同步（TranslateResponse 签名无 ctx，映射只能走
+		//   InternalResponse.NamespaceTools）。漏挂时历史里的 namespace 调用被出站成顶层
+		//   function_call（不带 namespace 字段），Codex 找不到该工具 → 整轮静默失败。
+		// @RELATED: protocol/responses/namespace_tool.go CollectNamespaceToolNames、
+		//   gateway.go handleNonStreamResponse
+		internalResp.NamespaceTools = responses.CollectNamespaceToolNames(internalReq.Tools)
 	}
 
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
@@ -2794,6 +2801,13 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	//   gateway.go handleNonStreamResponse
 	if internalReq != nil {
 		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 非流式出站必须还原 namespace function_call
+		// @CONSTRAINT: 与 gateway.go 同名块逐字同步（TranslateResponse 签名无 ctx，映射只能走
+		//   InternalResponse.NamespaceTools）。漏挂时历史里的 namespace 调用被出站成顶层
+		//   function_call（不带 namespace 字段），Codex 找不到该工具 → 整轮静默失败。
+		// @RELATED: protocol/responses/namespace_tool.go CollectNamespaceToolNames、
+		//   gateway.go handleNonStreamResponse
+		internalResp.NamespaceTools = responses.CollectNamespaceToolNames(internalReq.Tools)
 	}
 
 	// ── 出站翻译：InternalResponse → 入站协议格式 ──
@@ -3129,6 +3143,11 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	//   translator.go 的 type 白名单整条丢弃。
 	if internalReq != nil {
 		ctx = responses.WithCustomTools(ctx, responses.CollectCustomToolNames(internalReq.Tools))
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 流式出口必须拿到 namespace 展平映射
+		// @CONSTRAINT: 与 gateway.go 同名块同步（流式走 ctx）。漏挂时流式 function_call item
+		//   没有 namespace 字段，Codex 当顶层函数执行 → 静默失败。
+		// @RELATED: gateway.go handleStreamRequest（GATEWAY_STREAM_REQUEST）
+		ctx = responses.WithNamespaceTools(ctx, responses.CollectNamespaceToolNames(internalReq.Tools))
 	}
 	ingressTranslator.TranslateStream(ctx, events, func(eventData []byte, isDone bool) {
 		if clientGone {

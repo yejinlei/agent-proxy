@@ -108,6 +108,7 @@ flowchart TD
 | `internal/provider/openai.go` | HTTP 客户端：四种协议的 Call/CallStream |
 | `internal/protocol/schema/internal.go` | Central Schema 定义（InternalRequest/InternalResponse） |
 | `internal/protocol/<name>/translator.go` | 各协议翻译器（实现 CombinedTranslator 接口） |
+| `internal/protocol/responses/namespace_tool.go` | namespace（Codex MCP / multi_agent）工具展平：入站展平名派生、出站映射表收集、ctx 载体 |
 | `internal/translator/interfaces.go` | CombinedTranslator 接口定义 |
 | `internal/db/aliasfile.go` | 模型别名：三层加载、DefaultAliases()、双向替换 |
 
@@ -240,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 45 项；`grep -rn "@AI_GUARD:" internal/` 实际有 168 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 77 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 191 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -283,6 +284,13 @@ grep -rn "@REASON:" internal/
 | `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | CC 侧唯一合成点：`IsCustom` 工具合成 `exec_<原名>` 的 JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默；禁止按 `tool.Type` 白名单丢弃 |
 | `INTERNAL_TOOL_RAW` | schema/internal.go | `Raw`/`IsCustom` 承接非 function 工具（`json:"-"`），禁止在入站翻译时按 type 丢弃 |
 | `INTERNAL_RESPONSE_CUSTOM_NAMES` | schema/internal.go | 非流式出站 custom 工具名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
+| `RESPONSES_EMPTY_INPUT_USER_FALLBACK` | responses/translator.go | 空 `input:[]`（Codex prewarm）必须注入一条 **非空** user 消息，否则上游 400 `No user query found in messages` |
+| `RESPONSES_EMPTY_USER_CONTENT` | responses/translator.go | 无可见文本的 user 消息必须换成固定占位符 `prewarmPlaceholder`，`Content` 与 `ContentBlocks` **两处**同步替换；非 text 块（image/file）存在时整体跳过，禁止顶掉图片。空 user 消息在 `itemToMessage` 的 empty-drop 前必须填占位符，否则整轮 0 条 user → 上游 400 `user content required` |
+| `RESPONSES_NAMESPACE_TOOL` | responses/namespace_tool.go + translator.go | namespace（Codex MCP / multi_agent）工具双向桥接：出站仍是 `type:"function_call"`，必须写 `namespace:<命名空间名>` + `name:<原工具名>`。展平名→(命名空间, 原工具名) 的映射必须显式携带（流式 `WithNamespaceTools`/ctx，非流式 `InternalResponse.NamespaceTools`），**禁止按前缀字符串反推**——命名空间名含下划线（`mcp__codegraph`），反推会张冠李戴。所有出站 `name` 写点（item 级 3 处 + `function_call_arguments.done` 的事件级裸 `name`）必须走 `funcCallOutboundName` |
+| `CC_NAMESPACE_TOOL_FLATTEN` | gateway.go (buildCCRequest) | namespace 工具展平成 CC 顶层 function（`<namespace>_<toolname>`，schema/description 原样透传），禁止提升为顶层 function 而不补 namespace 字段（Codex 会当成顶层函数执行 → 整轮静默失败）；namespace 内的 custom 子工具无 CC 等价表达，必须打日志丢弃 |
+| `INTERNAL_TOOLCALL_NAMESPACE` | schema/internal.go | tool call 的命名空间名（`json:"-"`）；非空时出站必须写 namespace 字段 |
+| `INTERNAL_MESSAGE_TOOL_NAMESPACE` | schema/internal.go | `role:tool` 消息所属调用的命名空间名，供下一轮出站还原 |
+| `INTERNAL_RESPONSE_NAMESPACE_NAMES` | schema/internal.go | 非流式出站 namespace 展平名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
 | `CC_TOOL_CALL_ID_LINKAGE` | gateway.go (buildCCRequest) | 翻译到 CC 时 `role:tool` 消息必须带 `tool_call_id`；缺失时上游不报 400 但工具调用与结果失配，模型误判文件未读取并停止调工具（Codex 一直不回读的根因） |
 | `RESPONSES_TEXT_BLOCK_TYPES` | responses/translator.go | 内容块必须同时接受 `text`/`input_text`/`output_text`，否则上游 400 No user query found |
 | `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`）；`status=failed` 时 `incomplete_details.reason` 必须为 null，写 `max_output_tokens` 会让客户端误判成输出截断 |

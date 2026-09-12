@@ -70,6 +70,11 @@ type InternalMessage struct {
 	ContentBlocks []InternalContentBlock `json:"content_blocks,omitempty"`
 	ToolCalls     []InternalToolCall     `json:"tool_calls,omitempty"`
 	ToolCallID    string                 `json:"tool_call_id,omitempty"`
+	// ToolCallNamespace 是 role:"tool" 消息所属调用的命名空间名。
+	// 与 ToolCallID 并存：CC 的 tool 消息只认 tool_call_id，命名空间本身无法影响配对，
+	// 但下一轮出站时要用它把「上一轮 assistant 的展平调用」还原成带 namespace 的 function_call。
+	// @AI_GUARD: INTERNAL_MESSAGE_TOOL_NAMESPACE - 见 responses/namespace_tool.go
+	ToolCallNamespace string                 `json:"-"`
 	Name          string                 `json:"name,omitempty"`
 	Metadata      map[string]interface{} `json:"metadata,omitempty"`
 }
@@ -175,7 +180,12 @@ type InternalFunction struct {
 type InternalToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
-	Function struct {
+	// Namespace 是 Responses 的命名空间工具调用的命名空间名（Codex MCP 工具）。
+	// 非空时出站必须写 function_call + namespace 字段；为 CC 上游展平时工具名要换成
+	// <namespace>_<toolname>，还原由 server 侧按下一次工具定义表完成（见 namespace_tool.go）。
+	// @AI_GUARD: INTERNAL_TOOLCALL_NAMESPACE - 见 responses/namespace_tool.go 的 RESPONSES_NAMESPACE_TOOL
+	Namespace string `json:"-"`
+	Function  struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"` // CC 格式：JSON 字符串
 		// 其他协议解析时先填 RawArguments（对象），翻译为 CC 时 Marshal
@@ -253,8 +263,12 @@ type InternalResponseFormat struct {
 //   - CustomToolNames: json:"-" 上下文标记，仅非流式出站用——TranslateResponse 签名是
 //     CombinedTranslator 接口契约（无 ctx），custom 工具名映射只能搭这个结构体传入。
 //     其他翻译器读不到它就按纯 function_call 处理，因此新增此字段对 CC/Anthropic/Gemini 无影响。
+//   - NamespaceTools: 同一约定，供非流式出站把 namespace 展平工具名还原成
+//     function_call + namespace 字段。
 // @RELATED: all protocol/translator.go TranslateResponse; responses/translator.go
-//   TranslateResponse（custom_tool_call item）、responses/custom_tool.go CollectCustomToolNames
+//   TranslateResponse（custom_tool_call item / namespace function_call）、
+//   responses/custom_tool.go CollectCustomToolNames、
+//   responses/namespace_tool.go CollectNamespaceToolNames
 //
 // ─── 通用响应 ─────────────────────────────────────────────────────────
 
@@ -270,6 +284,20 @@ type InternalResponse struct {
 	// 供非流式出站翻译把 function_call 还原成 custom_tool_call。
 	// @AI_GUARD: INTERNAL_RESPONSE_CUSTOM_NAMES - 见上方 INTERNAL_RESPONSE 约束
 	CustomToolNames map[string]string `json:"-"`
+
+	// NamespaceTools 标记本轮哪些 tool_call 名来自入站 type:"namespace" 工具，
+	// 供非流式出站翻译把 function_call 还原成 name:<原工具名> + namespace:<命名空间名>。
+	// key 是转发给 CC 上游的展平工具名（<namespace>_<toolname>）。
+	// @AI_GUARD: INTERNAL_RESPONSE_NAMESPACE_NAMES - 见上方 INTERNAL_RESPONSE 约束
+	NamespaceTools map[string]InternalNamespaceToolRef `json:"-"`
+}
+
+// InternalNamespaceToolRef 是「展平工具名 → 命名空间 + 原工具名」的映射值。
+// 定义在 schema 而非 responses，是因为 InternalResponse 是中枢结构，
+// 不能反向依赖 responses（responses 已 import schema）。
+type InternalNamespaceToolRef struct {
+	Namespace string
+	ToolName  string
 }
 
 type InternalChoice struct {

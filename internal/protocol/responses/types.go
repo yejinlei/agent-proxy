@@ -109,6 +109,12 @@ type InputItem struct {
 	// @REASON: v0.2.119 — 原先整个非 "message" item 被 inputToMessages 丢弃（26→18 条），
 	//   Codex 工具调用结果回灌历史时模型看不到真实输出，只能顺着幻觉编内容。
 	CallID    string         `json:"call_id,omitempty"`
+	// Namespace 是命名空间工具调用的命名空间名（codex protocol/models.rs FunctionCall{
+	// namespace: Option<String>}，见 function_call_deserializes_optional_namespace）。
+	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 入站必须读出来，否则下一轮出站无法还原
+	// @CONSTRAINT: 命名空间名可以含下划线（实测 mcp__codegraph / mcp__zvec_grep），
+	//   出站还原必须靠本字段 + 工具定义表，禁止从展平工具名反推。
+	Namespace string         `json:"namespace,omitempty"`
 	Arguments string         `json:"arguments,omitempty"`
 	Output    interface{}    `json:"output,omitempty"`
 	RawFields map[string]any `json:"-"` // 解析后的原始 item 字段，供日志统计未知 item 类型

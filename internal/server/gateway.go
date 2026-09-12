@@ -897,6 +897,14 @@ func (g *Gateway) handleNonStreamResponse(ctx context.Context, w http.ResponseWr
 	//   INTERNAL_RESPONSE_CUSTOM_NAMES
 	if internalReq != nil {
 		internalResp.CustomToolNames = responses.CollectCustomToolNames(internalReq.Tools)
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 非流式出站同样还原 namespace function_call
+		// @CONSTRAINT: 与 quick.go 同名块保持同步。namespace 展平名→(命名空间, 原工具名)
+		//   只能走 InternalResponse.NamespaceTools（TranslateResponse 签名无 ctx）。
+		//   漏挂时历史里的 namespace 调用会被出站成顶层 function_call（不带 namespace 字段），
+		//   Codex 当成顶层函数执行而找不到工具 → 整轮静默失败。
+		// @RELATED: protocol/responses/namespace_tool.go CollectNamespaceToolNames、
+		//   quick.go handleNonStreamResponse / 同名块
+		internalResp.NamespaceTools = responses.CollectNamespaceToolNames(internalReq.Tools)
 	}
 	outgoingResp, err := ingressTranslator.TranslateResponse(internalResp)
 	if err != nil {
@@ -1195,6 +1203,11 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	//   translator.go 的 type 白名单整条丢弃。
 	if internalReq != nil {
 		streamCtx = responses.WithCustomTools(streamCtx, responses.CollectCustomToolNames(internalReq.Tools))
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 流式出口必须拿到 namespace 展平映射
+		// @CONSTRAINT: 与上方非流式块保持同步（流式走 ctx，非流式走 InternalResponse）。
+		//   漏挂时流式 function_call item 没有 namespace 字段，Codex 当顶层函数执行 → 静默失败。
+		// @RELATED: quick.go handleStreamRequest 同名块（GATEWAY_STREAM_REQUEST）
+		streamCtx = responses.WithNamespaceTools(streamCtx, responses.CollectNamespaceToolNames(internalReq.Tools))
 	}
 	ingressTranslator.TranslateStream(streamCtx, events, func(eventData []byte, isDone bool) {
 		if clientGone {
@@ -1480,6 +1493,31 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 			toolNames = append(toolNames, tool.Function.Name)
 			continue
 		}
+		// @AI_GUARD: CC_NAMESPACE_TOOL_FLATTEN - namespace 工具展平成 CC 顶层 function
+		// @CONSTRAINT: CC 的 tools[] 只认 type:"function"，type:"namespace" 原样转发会 400。
+		//   展平形状 = 每个子 function 变成顶层函数，工具名 = <namespace>_<toolname>，
+		//   schema 与 description 原样透传。出站 function_call item 必须还原成
+		//   name:<原工具名> + namespace:<命名空间名>（type 仍是 function_call），
+		//   还原依赖 CollectNamespaceToolNames 的同名映射——禁止按前缀字符串反推，
+		//   命名空间名本身可以含下划线（实测 mcp__codegraph / mcp__zvec_grep）。
+		//   禁止只把子工具提升成顶层 function 而不在出站加 namespace 字段：不带 namespace
+		//   的调用 Codex 会当成顶层函数执行，而顶层并不存在同名工具 → 整轮静默失败。
+		// @REASON: v0.2.136 之前 namespace 工具落入下方 nUnsupported 分支，每次请求固定
+		//   丢掉 3 个（tools=14→10）。Codex 系统提示明确要求用 mcp__codegraph / mcp__zvec_grep
+		//   做证据检索，模型拿不到只能退化到 exec_command 里跑命令行。
+		// @RELATED: protocol/responses/namespace_tool.go（NamespaceTool 展平 /
+		//   CollectNamespaceToolNames / WithNamespaceTools）、
+		//   protocol/responses/translator.go（funcCallState.Namespace、TranslateResponse）
+		if tool.Type == "namespace" && len(tool.Raw) > 0 {
+			for _, sub := range responses.NamespaceSubTools(tool.Raw) {
+				if sub.Tool.Function == nil {
+					continue
+				}
+				tools = append(tools, sub.Tool)
+				toolNames = append(toolNames, sub.Tool.Function.Name)
+			}
+			continue
+		}
 		nUnsupported++
 		// @AI_GUARD: CC_CUSTOM_TOOL_SYNTHESIS - 丢弃清单必须可观测
 		// @REASON: v0.2.134 排障——系统提示里 apply_patch 出现 272 次，但 Codex 本次送的
@@ -1509,6 +1547,10 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 	// 悬空检查针对的正是静默故障：role:tool 带 tool_call_id 但历史里没有 assistant
 	// tool_calls 携带该 id，或 assistant tool_calls 没有对应的工具结果——上游一律 HTTP 200，
 	// 配对断了模型就把已读文件当成没读过并停止调工具。
+	if nNamespace := len(responses.CollectNamespaceToolNames(req.Tools)); nNamespace > 0 {
+		log.Printf("[CODEX-DEBUG] buildCCRequest: namespace tools flattened into %d CC function(s) upstream; outbound restores the namespace field", nNamespace)
+	}
+
 	logCCRequestShape(req.Model, messages, len(tools), toolNames)
 
 	// Stop 序列化

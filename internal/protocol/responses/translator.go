@@ -111,6 +111,25 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 		}}
 	}
 
+	// @AI_GUARD: RESPONSES_EMPTY_USER_CONTENT - 空 user 消息换成非空占位符
+	// @CONSTRAINT: 上游校验 user content 非空（空串/纯空白 → 400 "user content required"）。
+	//   必须在 TranslateRequest 出口统一兜底：inputToMessages 逐 item 处理，
+	//   无法在这里知道"整轮有没有别的 user 消息"，但单条空 user 消息本身就是非法的，
+	//   就地替换即可。image-only 等非文本消息不受影响（见 fillEmptyUserMessage 守卫）。
+	// @RELATED: prewarmPlaceholder、buildCCRequest（ContentBlocks 优先）
+	// @REASON: 09-12 上游加严校验后，Codex 主编码轮次用空 user item 标记"无新内容"，
+	//   整轮请求 400；v0.2.109 的注入只覆盖了 input:[] 的 prewarm 场景。
+	var nFilledEmptyUser int
+	for i := range messages {
+		if fillEmptyUserMessage(&messages[i]) {
+			nFilledEmptyUser++
+		}
+	}
+	if nFilledEmptyUser > 0 {
+		log.Printf("[CODEX-DEBUG] TranslateRequest: filled %d empty user message(s) with placeholder %q",
+			nFilledEmptyUser, prewarmPlaceholder)
+	}
+
 	// @CODEX-DEBUG v0.2.98：Codex 入站请求形状诊断（生产可见，用 [CODEX-DEBUG] 前缀便于 grep）
 	log.Printf("[CODEX-DEBUG] TranslateRequest: model=%q instructions_len=%d input_items=%d messages=%d tools=%d stream=%v raw_len=%d",
 		req.Model, len(req.Instructions), len(InputToItems(req.Input)), len(messages), len(req.Tools), req.Stream, len(rawReq))
@@ -271,6 +290,77 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 	}, nil
 }
 
+// prewarmPlaceholder 是「user 消息没有任何可见内容」时注入的中性占位文本。
+//
+// @AI_GUARD: RESPONSES_EMPTY_USER_CONTENT - 空 user 消息必须换成非空占位符
+// @CONSTRAINT: 占位符必须是固定常量（本变量）且**非空白**，不得随请求变化。
+//   原因有二：
+//   ① 上游 SenseNova 校验 user content 非空，空串/纯空白一律 400
+//      "user content required"（09-12 加严，同字节序列此前 200）；
+//   ② 固定字面量让「本轮被替换」在日志里可 grep，也便于与正常 user 内容区分。
+//   ContentBlocks 必须同时被替换成单条 text 块——buildCCRequest 优先读 ContentBlocks
+//   而非 Content，只改 Content 等于没修。
+// @CONSTRAINT: 只作用于 role:user 且**没有任何文本块**的消息。image/file/audio 块属于
+//   可见内容，绝不能因"无文本"被顶成占位符（图片静默丢失）。assistant/system/tool
+//   消息不受影响：它们的内容语义由上游协议定义，空串是合法的。
+// @RELATED: inputToMessages、itemToMessage、server/gateway.go buildCCRequest
+// @REASON: v0.2.109 起空 input 注入 "" 兜住了「只有 system 消息」的 400；
+//   09-12 上游加严校验后，Codex 用空 user item 标记"无新内容"的主编码轮次也变成 400。
+const prewarmPlaceholder = "[agent-proxy] continue"
+
+// fillEmptyUserMessage 把「无任何可见内容的 user 消息」替换成中性占位符。
+//
+// 返回是否发生了替换，供调用方打日志——被替换意味着这一轮本来就没有用户输入，
+// 上游拿到占位符后是否产出内容取决于模型，这个事实必须可观测。
+func fillEmptyUserMessage(msg *schema.InternalMessage) bool {
+	if msg == nil || msg.Role != schema.RoleUser {
+		return false
+	}
+	hasText := false
+	for _, b := range msg.ContentBlocks {
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			hasText = true
+			break
+		}
+	}
+	if !hasText {
+		// Content 可能是 "string" 或 JSON 数组（content blocks 的原始形态）。
+		// 数组形态由上面的 ContentBlocks 判定覆盖：这里只处理纯字符串。
+		var s string
+		if strings.TrimSpace(string(msg.Content)) != "" && json.Unmarshal(msg.Content, &s) == nil {
+			hasText = strings.TrimSpace(s) != ""
+		}
+	}
+	if hasText {
+		return false
+	}
+	// @AI_GUARD: RESPONSES_EMPTY_USER_CONTENT - 非文本块存在时整体不得替换
+	// @CONSTRAINT: image/file/audio 块属于可见内容，只因为"没有文字"就被顶成占位符
+	//   会让图片静默丢失（roundtrip_test.go TestInbound_ImageURL 首次暴露）。
+	//   这个守卫必须包住 Content 与 ContentBlocks **两处**赋值：image-only 消息的
+	//   Content 恒为空串，只改 Content 等于把图片顶掉了。
+	if hasAnyNonTextBlock(msg.ContentBlocks) {
+		return false
+	}
+	placeholder, _ := json.Marshal(prewarmPlaceholder)
+	msg.Content = placeholder
+	// @CONSTRAINT: ContentBlocks 必须同步替换成单条 text 块。buildCCRequest 优先用
+	//   ContentBlocks 而非 Content，残留的空 text 块数组会产出空的 CC content，等于没修。
+	msg.ContentBlocks = []schema.InternalContentBlock{{Type: "text", Text: prewarmPlaceholder}}
+	return true
+}
+
+// hasAnyNonTextBlock 判定内容块里是否存在非文本块（image/file/audio）。
+// 有则说明该消息「有可见内容只是没有文字」，不得替换成占位符。
+func hasAnyNonTextBlock(blocks []schema.InternalContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type != "text" {
+			return true
+		}
+	}
+	return false
+}
+
 func inputToMessages(items []InputItem) []schema.InternalMessage {
 	var msgs []schema.InternalMessage
 
@@ -417,6 +507,11 @@ func responsesItemDigest(items []InputItem) string {
 			}
 			if name == "" {
 				name = "?"
+			}
+			if item.Namespace != "" {
+				// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - namespace 调用入站形状必须可见
+				// @CONSTRAINT: 只观测打日志，禁止据此改变出站行为。
+				p += fmt.Sprintf(" ns=%s", item.Namespace)
 			}
 			p += fmt.Sprintf(" name=%s call=%s args=%d", name, digestCallID(call), len(args))
 		case "function_call_output":
@@ -931,9 +1026,29 @@ func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 		if callID == "" {
 			callID = fmt.Sprintf("call_%s_%d", item.Name, time.Now().UnixNano())
 		}
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - namespace 工具调用入站还原成展平名
+		// @CONSTRAINT: item.Namespace 非空时必须同时改写 Name 为 <namespace>_<toolname>
+		//   并填 Namespace 字段。只改一处都会静默出错：
+		//     只改 Name 不改 Namespace → 下游不知道这是命名空间工具，出站丢 namespace 字段；
+		//     不改 Name → 展平映射表按展平名索引，查不到 → 出站又写成原工具名 + namespace，
+		//     Codex 找不到本轮 tools[] 里对应的工具。
+		//   本轮请求的命名空间由 tools[] 定义，展平名与定义表一致，故这里就地拼出展平名。
+		// @REASON: 不改入站，Codex 自己的历史（上一轮的 namespace 调用）会与展平后的
+		//   工具表脱钩，模型看到"调用过 codegraph_explore"却对应不上 <ns>_codegraph_explore。
+		if ns := item.Namespace; ns != "" {
+			name := item.Name
+			if name == "" {
+				name = "?"
+			}
+			item.Name = namespaceToolNameFor(ns, name)
+			item.Namespace = ns
+			log.Printf("[CODEX-DEBUG] inbound namespace function_call restored: ns=%q codex_name=%q → cc_name=%q call_id=%q",
+				ns, name, item.Name, item.CallID)
+		}
 		msg.ToolCalls = append(msg.ToolCalls, schema.InternalToolCall{
-			ID:   callID,
-			Type: "function",
+			ID:        callID,
+			Type:      "function",
+			Namespace: item.Namespace,
 			Function: struct {
 				Name         string          `json:"name"`
 				Arguments    string          `json:"arguments"`
@@ -947,6 +1062,18 @@ func itemToMessage(item InputItem) (schema.InternalMessage, bool) {
 	}
 
 	if text == "" && len(contentBlocks) == 0 && len(msg.ToolCalls) == 0 {
+		// @AI_GUARD: RESPONSES_EMPTY_USER_CONTENT - 空 user 消息必须填占位符而非整条丢弃
+		// @CONSTRAINT: Codex 用空 user item 标记"用户没有新输入"（主编码轮次的真实形态），
+		//   这类消息必须先填成占位符再保留。这里原本无条件 return false，空消息在到达
+		//   fillEmptyUserMessage 之前就被丢掉 → 整轮没有任何 user 消息，
+		//   上游 SenseNova 400 "user content required"。
+		//   只保留 role:user；assistant/system 的"无内容"仍然丢弃（那是合法的）。
+		// @REASON: 09-12 上游加严校验后，这个丢弃点比空 input 注入点影响大得多——
+		//   只有前者会打断真实编码轮次。
+		// @RELATED: fillEmptyUserMessage、inputToMessages
+		if fillEmptyUserMessage(&msg) {
+			return msg, true
+		}
 		return msg, false
 	}
 	return msg, true
@@ -965,9 +1092,10 @@ func functionCallOutputItemToMessage(item InputItem) schema.InternalMessage {
 	}
 	contentJSON, _ := json.Marshal(text)
 	return schema.InternalMessage{
-		Role:       schema.Role("tool"),
-		ToolCallID: item.CallID,
-		Content:    contentJSON,
+		Role:              schema.Role("tool"),
+		ToolCallID:        item.CallID,
+		ToolCallNamespace: item.Namespace,
+		Content:           contentJSON,
 	}
 }
 
@@ -1134,8 +1262,12 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 	// @REASON: v0.2.131 之前非流式路径只产出 message.content 内的 tool_call 块，
 	//   即使入站侧已修好 custom 工具，stream:false 的响应仍无法表达 custom_tool_call。
 	var customNames map[string]string
+	// nsNames 是「发往 CC 上游的 namespace 展平工具名 → (命名空间, 原工具名)」映射。
+	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 见 namespace_tool.go
+	var nsNames map[string]NamespaceEntry
 	if resp != nil {
 		customNames = resp.CustomToolNames
+		nsNames = resp.NamespaceTools
 	}
 
 	output := make([]map[string]interface{}, 0, 1+len(toolCalls))
@@ -1176,14 +1308,27 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 		if args == "" {
 			args = "{}"
 		}
-		output = append(output, map[string]interface{}{
+		item := map[string]interface{}{
 			"id":        callID,
 			"type":      "function_call",
 			"call_id":   callID,
 			"name":      tc.Function.Name,
 			"status":    "completed",
 			"arguments": args,
-		})
+		}
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 非流式出站 namespace 字段必须与流式一致
+		// @CONSTRAINT: namespace 工具 item 仍是 type:"function_call"，但必须带 namespace 字段，
+		//   name 回写 Codex 原工具名（tc.Function.Name 是发往 CC 上游的展平名）。
+		//   两条出站路径（流式 customFCItem / 非流式本处）形状必须一致，否则 stream:false
+		//   的 Codex 会话会拿到顶层函数名 → 静默失败。
+		// @RELATED: TranslateStream customFCItem / funcCallOutboundName
+		if nsEntry := nsNames[tc.Function.Name]; nsEntry.Namespace != "" {
+			item["namespace"] = nsEntry.Namespace
+			item["name"] = nsEntry.ToolName
+			log.Printf("[CODEX-DEBUG] TranslateResponse namespace function_call: cc_name=%q ns=%q codex_name=%q call_id=%q args_bytes=%d",
+				tc.Function.Name, nsEntry.Namespace, nsEntry.ToolName, callID, len(args))
+		}
+		output = append(output, item)
 	}
 
 	respObj := map[string]interface{}{
@@ -1325,11 +1470,22 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		//   工具不发 function_call_arguments.* 事件（Codex 只按 output_item.done 建 item）。
 		Custom    bool
 		CodexName string
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - namespace（Codex MCP / multi_agent）工具还原标记
+		// @CONSTRAINT: Namespace 非空时出站 item 仍是 type:"function_call"，但必须写
+		//   namespace:<命名空间名> 且 name 回写 Codex 的**原工具名**（Name 是发往 CC 上游
+		//   的展平名 <namespace>_<toolname>，不能直接回写）。漏掉 namespace 字段 Codex 会
+		//   把调用当成顶层函数执行，而顶层不存在该工具 → 整轮静默失败。
+		Namespace     string
+		NamespaceName string
 	}
 	funcCalls := make(map[string]*funcCallState)
 	// customNames 是「发往 CC 上游的合成工具名 → Codex 原 custom 工具名」映射（由调用方
 	// 通过 WithCustomTools 挂到 ctx）。空表表示上游没有 freeform 工具，走纯 function_call 路径。
 	customNames := customToolNames(ctx)
+	// nsNames 是「发往 CC 上游的 namespace 展平工具名 → (命名空间, 原工具名)」映射。
+	// 空表表示上游没有命名空间工具，走纯 function_call 路径（与改动前完全一致）。
+	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 见 namespace_tool.go
+	nsNames := namespaceTools(ctx)
 	funcCallOrder := make([]string, 0)
 	nextFuncOutputIdx := 1
 
@@ -1357,13 +1513,17 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				callID = fmt.Sprintf("call_%d_%s", nextFuncOutputIdx, responseID[5:])
 			}
 			codexName, isCustom := customNames[name]
+			// nsEntry 是零值时表示非 namespace 工具（nsNames 只在命名空间工具上有 key）。
+			nsEntry := nsNames[name]
 			fc = &funcCallState{
-				ID:        key,
-				Name:      name,
-				CallID:    callID,
-				OutputIdx: nextFuncOutputIdx,
-				Custom:    isCustom,
-				CodexName: codexName,
+				ID:            key,
+				Name:          name,
+				CallID:        callID,
+				OutputIdx:     nextFuncOutputIdx,
+				Custom:        isCustom,
+				CodexName:     codexName,
+				Namespace:     nsEntry.Namespace,
+				NamespaceName: nsEntry.ToolName,
 			}
 			nextFuncOutputIdx++
 			funcCalls[key] = fc
@@ -1374,6 +1534,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			if codexName, isCustom := customNames[newName]; isCustom && !fc.Custom {
 				fc.Custom = true
 				fc.CodexName = codexName
+			}
+			if nsEntry := nsNames[newName]; nsEntry.Namespace != "" && fc.Namespace == "" {
+				fc.Namespace = nsEntry.Namespace
+				fc.NamespaceName = nsEntry.ToolName
 			}
 		}
 		return fc
@@ -1442,6 +1606,26 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		})
 	}
 
+	// funcCallOutboundName 取出站 name：namespace 工具必须回写 Codex 原工具名
+	// （fc.Name 是发往 CC 上游的展平名 <namespace>_<toolname>）。
+	//
+	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 每个写 name 的出站事件都必须走这里
+	// @CONSTRAINT: item 级输出（output_item.added / output_item.done / response.completed.output[]）
+	//   与事件级 name 字段（function_call_arguments.done）都算"写 name"。
+	//   function_call_arguments.done 只带 name、不带 item 负载，Codex 拿不到 namespace 字段，
+	//   写展平名会让它把调用绑到不存在的顶层工具上；漏改这处 = 改完 item 仍失败。
+	// @REASON: namespace 展平起初只在 item 级生效，事件级 name 是漏网的那一处。
+	// @RELATED: customFCItem（item 级）、closeFuncCall（事件级）、TranslateResponse（非流式）
+	funcCallOutboundName := func(fc *funcCallState) string {
+		if fc.Namespace != "" && fc.NamespaceName != "" {
+			return fc.NamespaceName
+		}
+		if fc.Custom && fc.CodexName != "" {
+			return fc.CodexName
+		}
+		return fc.Name
+	}
+
 	// customFCItem 把 fc 转成 Responses item map。
 	//
 	// @AI_GUARD: RESPONSES_CUSTOM_TOOL - custom（freeform）工具出站 item 形状与 function_call 不同
@@ -1456,10 +1640,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	customFCItem := func(fc *funcCallState, status string, argsStr string) map[string]interface{} {
 		if fc.Custom {
 			// 出站 name 必须回写 Codex 的原工具名，不是发往 CC 的合成名 exec_<原名>。
-			name := fc.CodexName
-			if name == "" {
-				name = fc.Name
-			}
+			name := funcCallOutboundName(fc)
 			// 流式期间（argsStr==""）不写 input 字段：output_item.added 只用于注册 item，
 			// Codex 建 item 靠的是 output_item.done。
 			if argsStr == "" {
@@ -1483,14 +1664,27 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"input":   input,
 			}
 		}
-		return map[string]interface{}{
+		item := map[string]interface{}{
 			"id":        fc.CallID,
 			"type":      "function_call",
 			"call_id":   fc.CallID,
-			"name":      fc.Name,
+			"name":      funcCallOutboundName(fc),
 			"status":    status,
 			"arguments": argsStr, // @CONSTRAINT: 必须是字符串，不能是对象——Codex 严格校验 item 类型
 		}
+		// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 流式出站 namespace 字段必须与非流式一致
+		// @CONSTRAINT: namespace 工具的 item 仍是 type:"function_call"，但必须带 namespace 字段，
+		//   且 name 回写 Codex 原工具名。漏掉 namespace → Codex 按顶层函数查找 → 静默失败。
+		// @RELATED: TranslateResponse（非流式路径）、server/gateway.go buildCCRequest（入站展平）
+		if fc.Namespace != "" {
+			item["namespace"] = fc.Namespace
+			if fc.NamespaceName != "" {
+				item["name"] = fc.NamespaceName
+			}
+			log.Printf("[CODEX-DEBUG] TranslateStream namespace function_call: cc_name=%q ns=%q codex_name=%q call_id=%q args_bytes=%d",
+				fc.Name, fc.Namespace, item["name"], fc.CallID, len(argsStr))
+		}
+		return item
 	}
 
 	sendOutputItemAddedFunc := func(fc *funcCallState) {
@@ -1544,7 +1738,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"type":         "response.function_call_arguments.done",
 				"item_id":      fc.CallID,
 				"output_index": fc.OutputIdx,
-				"name":         fc.Name,
+				"name":         funcCallOutboundName(fc), // @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 见 funcCallOutboundName
 				"arguments":    finalArgs,
 			})
 		}
