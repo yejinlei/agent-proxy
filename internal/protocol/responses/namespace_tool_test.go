@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"strings"
 	"testing"
 
@@ -374,7 +375,8 @@ func TestTranslateStream_NamespaceFunctionCall(t *testing.T) {
 		t.Fatalf("流式出口 name 必须还原成原工具名:\n%s", s)
 	}
 	if strings.Contains(s, `"name":"`+nsFlatName+`"`) {
-		t.Fatalf("item 级 name 禁止泄漏 CC 展平名（function_call_arguments.done 例外：该事件不带 item 负载，沿用既有行为）:\n%s", s)
+		t.Fatalf("整个流式输出禁止出现 CC 展平名——item 级（output_item.added/done、response.completed.output[]）与"+
+			"事件级（function_call_arguments.done 的裸 name）都必须还原成原工具名:\n%s", s)
 	}
 	if strings.Contains(s, "custom_tool_call") {
 		t.Fatalf("namespace 工具不是 custom 工具，禁止输出 custom_tool_call:\n%s", s)
@@ -382,6 +384,33 @@ func TestTranslateStream_NamespaceFunctionCall(t *testing.T) {
 	if !strings.Contains(s, "response.completed") || !strings.Contains(s, `[DONE]`) {
 		t.Fatalf("必须发 response.completed + [DONE] 结束序列:\n%s", s)
 	}
+
+	// v0.2.138 起 END 汇总行必须同时带 ns_tools / ns_calls，否则"工具送达了但模型没用"
+	// 只能靠人工数 fcs=[...] 里的工具名——与 v0.2.132 之前"连丢了哪些工具都看不到"是同类盲区。
+	// ns_tools 来自 ctx 映射表（本轮送出去的展平工具数），ns_calls 来自模型实际发出的调用。
+	gotLog := nsLogCapture(t, tr, ctx, events)
+	if !strings.Contains(gotLog, "TranslateStream END") {
+		t.Fatalf("未捕获 END 汇总日志：%q", gotLog)
+	}
+	for _, want := range []string{"ns_tools=1", "ns_calls=1"} {
+		if !strings.Contains(gotLog, want) {
+			t.Fatalf("END 汇总日志必须带 %s（否则送达侧与使用侧不可 grep）：%q", want, gotLog)
+		}
+	}
+}
+
+// nsLogCapture 把 TranslateStream 运行期间的 log 输出捕获成字符串，仅用于断言汇总日志字段。
+// 命名前缀 ns 避免与本包内其他 translate stream 日志捕获 helper 撞名。
+func nsLogCapture(t *testing.T, tr *ResponsesTranslator, ctx context.Context, events []schema.InternalStreamEvent) string {
+	t.Helper()
+	captured := newSyncBuffer()
+	old := log.Writer()
+	log.SetOutput(captured)
+	defer log.SetOutput(old)
+
+	_ = drainStream(t, tr, ctx, events)
+	captured.Close()
+	return captured.String()
 }
 
 // TestTranslateStream_PlainFunctionCallWithoutNamespaceContext 映射表为空时
@@ -409,5 +438,14 @@ func TestTranslateStream_PlainFunctionCallWithoutNamespaceContext(t *testing.T) 
 	}
 	if !strings.Contains(s, `"type":"function_call"`) || !strings.Contains(s, `"name":"exec_command"`) {
 		t.Fatalf("普通 function 工具形状必须不变:\n%s", s)
+	}
+
+	// 零值也必须可观测：ns_tools=0 说明本轮上游没有 namespace 工具，
+	// 与 ns_tools>0 && ns_calls=0（"送达了但没用"）是两种不同状态，日志上必须能区分。
+	gotLog := nsLogCapture(t, tr, context.Background(), events)
+	for _, want := range []string{"ns_tools=0", "ns_calls=0"} {
+		if !strings.Contains(gotLog, want) {
+			t.Fatalf("无 namespace 映射时 END 日志必须为 %s：%q", want, gotLog)
+		}
 	}
 }

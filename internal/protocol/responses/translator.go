@@ -1486,6 +1486,16 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	// 空表表示上游没有命名空间工具，走纯 function_call 路径（与改动前完全一致）。
 	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 见 namespace_tool.go
 	nsNames := namespaceTools(ctx)
+	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - namespace 工具的「送达 vs 被使用」必须可观测
+	// @CONSTRAINT: 只计数打日志，绝不据此改变出站行为。nsToolsOffered 是本轮送出去的
+	//   namespace 展平工具数（来自 ctx 映射表），nsCallsIssued 是模型实际发出的 namespace
+	//   调用数（来自 fc.Namespace 非空）。两者同时出现于 END / END(err) 汇总行。
+	// @REASON: v0.2.137 修的是"namespace 工具被静默丢弃"，只有丢弃侧有日志。修完后暴露出
+	//   另一半盲区——工具确实送达了，模型却一次没用（生产 11 轮 0 次调用），此时只能靠
+	//   人工解析 END 行的 fcs=[...] 逐轮数工具名。这一类"给了但没用"必须一行 grep 可见。
+	// @RELATED: namespace_tool.go CollectNamespaceToolNames、gateway.go buildCCRequest 的
+	//   "namespace tools flattened into N CC function(s)" 日志（送达侧）、本行（使用侧）
+	nNamespaceCalls := 0
 	funcCallOrder := make([]string, 0)
 	nextFuncOutputIdx := 1
 
@@ -1524,6 +1534,9 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				CodexName:     codexName,
 				Namespace:     nsEntry.Namespace,
 				NamespaceName: nsEntry.ToolName,
+			}
+			if nsEntry.Namespace != "" {
+				nNamespaceCalls++
 			}
 			nextFuncOutputIdx++
 			funcCalls[key] = fc
@@ -1887,10 +1900,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		//   这个字段是"模型为什么不再调工具"的唯一线索。命中即说明上游把工具调用写成了
 		//   纯文本（Anthropic </tool_use>/<parameter> 语法，或 Codex 原生 <tool_call>/<parameter=command>）；两种语法都只检测开标签，CC 翻译器只能原样透传。
 		injected := detectToolCallInText(endedText)
-		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d ns_tools=%d ns_calls=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
 			emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
-			nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
+			nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
 			respPayload["usage"], strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
 
 		sendDoneSSE()
@@ -1981,10 +1994,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				})
 				// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 错误路径同样检测，保证正常/失败两条
 				//   汇总日志字段一致，grep 时不需要按路径分开处理。
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d ns_tools=%d ns_calls=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
 					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
 						emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
-					nDeltaEvents, nFuncArgsDeltas, time.Since(startedAt).Round(time.Millisecond),
+					nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
 					event.Error.Code, event.Error.Type, event.Error.Message,
 					detectToolCallInText(accumulatedText.String()), responsesLogTail(accumulatedText.String()))
 				sendDoneSSE()

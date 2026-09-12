@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 77 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 191 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 78 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 192 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -291,6 +291,7 @@ grep -rn "@REASON:" internal/
 | `INTERNAL_TOOLCALL_NAMESPACE` | schema/internal.go | tool call 的命名空间名（`json:"-"`）；非空时出站必须写 namespace 字段 |
 | `INTERNAL_MESSAGE_TOOL_NAMESPACE` | schema/internal.go | `role:tool` 消息所属调用的命名空间名，供下一轮出站还原 |
 | `INTERNAL_RESPONSE_NAMESPACE_NAMES` | schema/internal.go | 非流式出站 namespace 展平名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
+| `RESPONSES_NAMESPACE_USAGE_LOG` | responses/translator.go | END / END(err) 汇总行必须带 `ns_tools`（本轮送出去的 namespace 展平工具数）与 `ns_calls`（模型实际发出的 namespace 调用数）。纯观测，**禁止据此改变出站行为**；`ns_tools>0 && ns_calls==0` 是"工具送达了但模型没用"的唯一 grep 判据 |
 | `CC_TOOL_CALL_ID_LINKAGE` | gateway.go (buildCCRequest) | 翻译到 CC 时 `role:tool` 消息必须带 `tool_call_id`；缺失时上游不报 400 但工具调用与结果失配，模型误判文件未读取并停止调工具（Codex 一直不回读的根因） |
 | `RESPONSES_TEXT_BLOCK_TYPES` | responses/translator.go | 内容块必须同时接受 `text`/`input_text`/`output_text`，否则上游 400 No user query found |
 | `RESPONSES_ERROR_SHAPE` | responses/translator.go | 错误对象单层（`{"error":{...}}`）；`status=failed` 时 `incomplete_details.reason` 必须为 null，写 `max_output_tokens` 会让客户端误判成输出截断 |
