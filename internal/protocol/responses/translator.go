@@ -166,6 +166,11 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 		if meta := codexSandboxMode(req.RawMeta["client_metadata"]); meta != "" {
 			log.Printf("[CODEX-DEBUG] TranslateRequest meta: codex_sandbox=%s", meta)
 		}
+
+		// reasoning 参数（Codex 的 vmodel medium）：入站带，但上游 CC 请求构造不出来。
+		// 上游 CC 侧的对应字段名是 reasoning_effort（无 summary），落日志能看出
+		// "代理在丢弃"还是"代理在传递"，不用再翻 WS frame 原文。
+		log.Printf("[CODEX-DEBUG] TranslateRequest meta: reasoning=%s", codexReasoningArg(req.RawMeta["reasoning"]))
 	}
 
 	// input items 逐条形状摘要。
@@ -525,6 +530,19 @@ func responsesItemDigest(items []InputItem) string {
 	}
 	return strings.Join(parts, " ")
 }
+// codexReasoningArg 把 reasoning / temperature 的观测值统一成日志形态：
+// 缺失 → "absent"；有值 → "<值> (not forwarded to CC)"。固定后缀避免读日志时
+// 把"代理丢弃"和"代理传递"混为一谈。
+func codexReasoningArg(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "absent"
+	}
+	v := codexReasoningMeta(raw)
+	if len(v) == 0 {
+		return "absent"
+	}
+	return v + " (not forwarded to CC)"
+}
 
 // cleanScalarForLog 把单个 JSON 标量的原始字节压成适合日志的字符串。
 // 直接 %s 打印 json.RawMessage 会带引号（store=false → `"false"`、tool_choice → `"auto"`），
@@ -542,6 +560,42 @@ func cleanScalarForLog(raw json.RawMessage) string {
 		return s
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+// @AI_GUARD: RESPONSES_REASONING_META - Codex 的 reasoning 参数只观测，不得据此改变出站行为
+// @CONSTRAINT: 返回值仅供日志。buildCCRequest 构造上游 CC 请求时**禁止**据此注入
+//   reasoning_effort 或其他推理字段——那会让代理替 Codex 决定上游推理强度，
+//   与 RESPONSES_INBOUND_META / RESPONSES_CODEX_SANDBOX_META 的观测护栏同一条约定。
+// @REASON: v0.2.139 生产日志三轮 reasoning_chars 均非 0（440/393/511），但入站
+//   {"reasoning":{"effort":"medium","summary":"auto"}} 与上游 CC 请求构造之间没有观测点，
+//   只能靠翻 WS frame 原文确认丢弃。该字段是 OpenAI 专有能力（summary 控制思考可见性），
+//   直接映射进 CC 请求体有 400 风险，观测优先。
+// @RELATED: codexSandboxMode / detectToolCallInText（同属纯观测诊断点）
+// @REASON(格式): effort 是字符串枚举，summary 可能是数组或字符串两种形态；不建模结构，
+//   只拼 key=value 扁平串，避免对 Codex 版本演进过敏。
+func codexReasoningMeta(reasoningRaw json.RawMessage) string {
+	if len(reasoningRaw) == 0 {
+		return ""
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(reasoningRaw, &fields); err != nil {
+		// 非对象形态（字符串/null）原样返回，不猜测。
+		return cleanScalarForLog(reasoningRaw)
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := cleanScalarForLog(fields[k])
+		if len(v) > 60 {
+			v = v[:60] + "…"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%q", k, v))
+	}
+	return strings.Join(parts, " ")
 }
 
 // @AI_GUARD: RESPONSES_CODEX_SANDBOX_META - Codex 沙箱/审批模式只观测，不得据此改变出站行为

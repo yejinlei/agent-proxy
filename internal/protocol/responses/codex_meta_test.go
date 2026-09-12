@@ -389,3 +389,59 @@ func (s *syncBuffer) String() string {
 	return strings.Join(parts, "")
 }
 
+
+// TestCodexReasoningMeta 锁定 reasoning 参数的纯观测提取：只拼 key=value 扁平串，
+// 不建模结构（summary 在 Codex 侧可能是数组或字符串两种形态，不猜）。
+func TestCodexReasoningMeta(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+		want string
+	}{
+		{"real_codex_shape", json.RawMessage(`{"effort":"medium","summary":"auto"}`), "effort=\"medium\" summary=\"auto\""},
+		// summary 为数组时不能报错，压成 JSON 原文
+		{"summary_array", json.RawMessage(`{"effort":"high","summary":["auto","output"]}`), "effort=\"high\" summary=\"[\\\"auto\\\",\\\"output\\\"]\""},
+		// 非对象形态（字符串）原样返回，不猜测
+		{"scalar", json.RawMessage(`"medium"`), "medium"},
+		// 空输入返回空串（调用方打 reasoning=absent）
+		{"empty", nil, ""},
+		// 非法 JSON 原样返回
+		{"malformed", json.RawMessage(`{oops`), "{oops"},
+	}
+	for _, c := range cases {
+		if got := codexReasoningMeta(c.raw); got != c.want {
+			t.Fatalf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestTranslateRequestReasoningMetaLog 生产路径上 reasoning 必须落到日志——
+// 这是"代理在丢弃"还是"代理在传递"的唯一 grep 判据。
+func TestTranslateRequestReasoningMetaLog(t *testing.T) {
+	tr := NewResponsesTranslator()
+
+	capture := func(t *testing.T, raw string) string {
+		t.Helper()
+		buf := newSyncBuffer()
+		old := log.Writer()
+		log.SetOutput(buf)
+		defer log.SetOutput(old)
+		if _, err := tr.TranslateRequest(context.Background(), json.RawMessage(raw)); err != nil {
+			t.Fatal(err)
+		}
+		buf.Close()
+		return buf.String()
+	}
+
+	logged := capture(t, `{"model":"m","input":[{"type":"message","role":"user","content":"hi"}],` +
+		`"reasoning":{"effort":"medium","summary":"auto"},"temperature":0.7}`)
+	want := `reasoning=effort="medium" summary="auto" (not forwarded to CC)`
+	if !strings.Contains(logged, want) {
+		t.Fatalf("reasoning 未落日志，期望包含 %q：%s", want, logged)
+	}
+
+	absent := capture(t, `{"model":"m","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	if !strings.Contains(absent, "reasoning=absent") {
+		t.Fatalf("无 reasoning 时必须打 reasoning=absent（区分未带与带但丢弃）：%s", absent)
+	}
+}
