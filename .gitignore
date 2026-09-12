@@ -60,6 +60,10 @@ package-lock.json
 # Local build/dev helpers (not shipped)
 tools/
 
+# Local workspace indexes (per-machine tooling, never committed)
+.codegraph/
+.zvec-grep/
+
 # ── Temp & test files ──
 .tmp/
 test-request.json
