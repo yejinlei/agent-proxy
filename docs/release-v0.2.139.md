@@ -182,3 +182,40 @@ format: output_schema.as_ref().map(|schema| TextFormat {
 "真实 agent 轮 vs 结构化输出轮"，但当前日志已经能用
 `text_format` + `tools` 数 + `input_items` 数判断，不值得为纯观测再加解析。
 `thread_id` / `session_id` 属于客户端标识，不适合进生产日志。
+
+## ⚠️ tag 指向说明（源码可复现性）
+
+本 release 的 tag `v0.2.139` 指向提交 `8d0d71c`，**该提交不含本次改动**。
+
+`8d0d71c` 是 v0.2.138 时代的提交，它的 `main.go` 仍是 `v0.2.138`，
+`internal/protocol/responses/translator.go` 里没有 `codexReasoningMeta`（出现 0 次）。
+`git clone --branch v0.2.139` 会拿到 v0.2.138 的源码。
+
+本次改动的实际提交是 `cd219bd`（比 `8d0d71c` 领先 3 个提交，含 6 文件 299 行）：
+
+- `a5f278c` — 入站 reasoning 观测日志（translator.go + codex_meta_test.go + main.go + CLAUDE.md / AGENTS.md）
+- `d217433` — `docs/release-v0.2.139.md`（Pages 源）
+- `cd219bd` — build/ 那份 note 退出版本控制
+
+**要复现本 release 的源码，请用 `master` 分支的 `cd219bd`，不要用 tag。**
+
+### 为什么没有修 tag
+
+- `gh release edit --target master` 能修 `targetCommitish` 但 **tag 不随动**
+- `gh release edit --target <sha>` 报 `HTTP 422: Release.target_commitish is invalid`
+- 删 tag 重建（`git push origin :refs/tags/v0.2.139` + 重新打）有**丢失 release 与
+  tag 关联的风险**，且不可逆——7 个资产可能掉
+- 发新版本号（v0.2.140）会污染版本号序列，且 v0.2.139 的错误 tag 仍留着
+
+权衡后保留 tag 原状，在此说明。
+
+### 资产本身是正确的
+
+7 个二进制都是用 `-ldflags "-X main.version=v0.2.139"` 从含改动的源码编译的。
+验证方式：
+
+```bash
+strings agent-proxy_linux_amd64 | grep -x 'v0.2.139'
+```
+
+能匹配到即证明产物版本正确，与 tag 指向无关。
