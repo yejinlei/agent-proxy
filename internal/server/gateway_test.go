@@ -228,6 +228,52 @@ func TestReadBody_UnderLimit(t *testing.T) {
 	}
 }
 
+// TestReadBody_ProductionObservedSize 回归 v0.2.142 生产事故：
+// 09-14 15 时 Codex 请求体 1,196,624 字节（全量重发历史）稳定打穿 1MiB 上限，
+// 58 次 413，非瞬时错误 → 5 次重试全失败 → turn 停住。
+// 上限提到 16MiB 后这个真实尺寸必须放行。
+func TestReadBody_ProductionObservedSize(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), 1196624)
+	body, err := readBody(newBodyRequest(payload), time.Now())
+	if err != nil {
+		t.Fatalf("生产实测尺寸 1196624 字节必须放行，实际报: %v", err)
+	}
+	if len(body) != 1196624 {
+		t.Errorf("len(body) = %d, want 1196624", len(body))
+	}
+}
+
+// TestMaxBodyBytesDefault 锁定默认上限，防止有人误改回 1MiB。
+// @AI_GUARD: INBOUND_BODY_LIMIT - 默认值不得低于 16MiB
+// @REASON: Codex 每轮全量重发历史，1MiB 会在会话进行 10 分钟后必然打穿。
+func TestMaxBodyBytesDefault(t *testing.T) {
+	if defaultMaxBodyBytes != 16<<20 {
+		t.Errorf("defaultMaxBodyBytes = %d, want %d", defaultMaxBodyBytes, 16<<20)
+	}
+	if maxBodyBytes != 16<<20 {
+		t.Errorf("maxBodyBytes = %d, want %d", maxBodyBytes, 16<<20)
+	}
+}
+
+// TestSetMaxBodyBytes 校验启动期配置入口：正数生效、非正回落默认。
+func TestSetMaxBodyBytes(t *testing.T) {
+	defer func() { maxBodyBytes = defaultMaxBodyBytes }()
+
+	if got := SetMaxBodyBytes(1 << 20); got != 1<<20 {
+		t.Errorf("SetMaxBodyBytes(1<<20) = %d", got)
+	}
+	if maxBodyBytes != 1<<20 {
+		t.Errorf("maxBodyBytes = %d, want 1<<20", maxBodyBytes)
+	}
+	if got := SetMaxBodyBytes(0); got != defaultMaxBodyBytes {
+		t.Errorf("SetMaxBodyBytes(0) = %d, want default %d", got, defaultMaxBodyBytes)
+	}
+	if got := SetMaxBodyBytes(-5); got != defaultMaxBodyBytes {
+		t.Errorf("SetMaxBodyBytes(-5) = %d, want default %d", got, defaultMaxBodyBytes)
+	}
+}
+
+
 func TestReadBody_ExactlyAtLimit(t *testing.T) {
 	payload := bytes.Repeat([]byte("a"), maxBodyBytes)
 	body, err := readBody(newBodyRequest(payload), time.Now())

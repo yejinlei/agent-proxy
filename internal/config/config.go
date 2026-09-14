@@ -19,6 +19,9 @@ type Config struct {
 		ReadTimeout    int    `json:"read_timeout" yaml:"read_timeout"`
 		WriteTimeout   int    `json:"write_timeout" yaml:"write_timeout"`
 		MaxHeaderBytes int    `json:"max_header_bytes" yaml:"max_header_bytes"`
+		// MaxBodyBytes 是入站请求体的字节上限（HTTPS 路径），超限回 413。
+		// 0 表示用 server 包的默认值。WS 路径另有 64MiB 上限，两者独立。
+		MaxBodyBytes int `json:"max_body_bytes" yaml:"max_body_bytes"`
 	} `json:"server" yaml:"server"`
 
 	// Provider 配置
@@ -111,6 +114,10 @@ func DefaultConfig() *Config {
 	cfg.Server.ReadTimeout = 120
 	cfg.Server.WriteTimeout = 600
 	cfg.Server.MaxHeaderBytes = 1 << 20
+	// 必须与 main.go 的默认值 / server 包 DefaultMaxBodyBytes 三者一致。
+	// 历史上这里缺这一项：MaxBodyBytes 长期硬编码 1MiB，Codex 每轮全量重发历史，
+	// 请求体涨到 1.19MiB 就稳定 413（非瞬时错误，5 次重试全失败 → turn 停住）。
+	cfg.Server.MaxBodyBytes = 16 << 20
 
 	cfg.ModelRouter.DefaultProvider = "default"
 	cfg.ModelRouter.PrefixMatch = true

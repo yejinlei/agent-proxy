@@ -4538,9 +4538,36 @@ func (q *QuickGateway) handleResponsesWebSocket(w http.ResponseWriter, r *http.R
 //    gateway.go handleRequest
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// maxBodyBytes 是入站请求体的硬上限。超过的部分会被截断，上游收到的是残缺 JSON。
-// quick.go 与 gateway.go 共用同一个常量，避免两边数值漂移。
-const maxBodyBytes = 1 << 20
+// defaultMaxBodyBytes 是入站请求体的默认硬上限（HTTPS 路径）。
+// 超过的部分会被截断，上游收到的是残缺 JSON，所以超限直接回 413 而不截断。
+const defaultMaxBodyBytes = 16 << 20
+
+// maxBodyBytes 是当前生效的入站请求体上限。启动时由 main.go 从
+// --max-body-bytes / server.max_body_bytes 设定，运行期不再改动。
+//
+// @AI_GUARD: INBOUND_BODY_LIMIT - 入站 HTTPS 请求体上限
+// @CONSTRAINT: 必须与 WS 路径的 qwsMaxPayload / wsMaxPayload（64MiB）区分开，
+//   这是两条独立的上限：handleResponsesWebSocket 绕过 readBody，
+//   所以同一条请求走 WS 能过、走 HTTPS 会 413，排查「随机 413」先看请求走了哪条路。
+// @CONSTRAINT: 只允许在启动阶段调用 SetMaxBodyBytes，禁止在请求处理路径里改，
+//   否则并发的 readBody 会读到不同的值。
+// @REASON: 这里曾是 1<<20。Codex 每轮全量重发历史（不发 previous_response_id），
+//   请求体单调增长，v0.2.142 生产环境 09-14 15 时打出 58 次
+//   413 "got 1196624 bytes, limit 1048576"——非瞬时错误，5 次重试全失败，
+//   turn 彻底停住。这是「Codex 停住」的直接原因，与代理的转换逻辑无关。
+//   16MiB 给 13 倍余量；实测历史到 1.19MiB 时模型仍在工作，上限应覆盖
+//   正常会话长度而非贴住它。
+var maxBodyBytes = defaultMaxBodyBytes
+
+// SetMaxBodyBytes 设定入站请求体上限（字节）。n<=0 时回落到默认值。
+// 返回生效值，供启动日志打印。
+func SetMaxBodyBytes(n int) int {
+	if n <= 0 {
+		return defaultMaxBodyBytes
+	}
+	maxBodyBytes = n
+	return maxBodyBytes
+}
 
 // errBodyExceedsLimit 标记「请求体超过 maxBodyBytes」。
 // 调用方据此回 413（客户端确实发了太大数据），而不是 400（数据损坏）。
@@ -4559,12 +4586,12 @@ var errBodyExceedsLimit = errors.New("request body exceeds limit")
 // 那种做法在 keep-alive 连接上会越过本请求的 body 边界、吞掉下一个请求的字节。
 // net/http 对 body 分层的 chunk 解码不会越过 body 边界，所以上限内读取是安全的。
 func readBody(r *http.Request, start time.Time) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBodyBytes)+1))
 	if err != nil {
 		logReadBodyFailure(r, start, int64(len(body)), err)
 		return body, err
 	}
-	if int64(len(body)) > maxBodyBytes {
+	if int64(len(body)) > int64(maxBodyBytes) {
 		return body, errBodyTooLarge(r)
 	}
 	return body, nil

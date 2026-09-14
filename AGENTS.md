@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 90 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 217 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 91 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 217 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -334,6 +334,7 @@ grep -rn "@REASON:" internal/
 | `STREAM_RESPONSE_HEADERS` | quick.go | 两条流式路径的下游响应头透传必须过滤（上游 CL 按上游体算，本路径写 SSE 自身体） |
 | `MODELS_ALIASES_HEADERS` | quick.go (handleModels) | `/v1/models` 透传头必须过滤 `Content-Length`（下面 `json.NewEncoder(w).Encode(upstreamResp)` 写的是追加别名后的重编码体）。**本函数有且只有一个头转发循环**，且遍历的是 `resp.Header` 不是 `headers`，AST 扫描两种形态都得覆盖——只扫 `headers` 时这里曾漏网 |
 | `NO_DUPLICATE_HEADER_FWD` | header_forward_test.go | 每个函数最多一个响应头转发循环：`w.Header().Add` 是追加语义，同一函数写两次会让 Date / X-Request-Id / Access-Control-* 全部重复。`handleModels` 曾有两个（第二个还漏过滤，是坏 CL 的入口），v0.2.141 删掉重复的那个；AST 按函数分组计数锁住 |
+| `INBOUND_BODY_LIMIT` | quick.go (readBody) | 入站 HTTPS 请求体上限，默认 16MiB，可用 `--max-body-bytes` / `server.max_body_bytes` 覆盖。**与 WS 的 64MiB 是两条独立上限**（WS 绕过 readBody），同一请求走 WS 能过、走 HTTPS 会 413。v0.2.142 曾是 1MiB，Codex 全量重发历史到 1.19MiB 打穿 → 58 次 413、5 次重试全失败 → turn 停住，这是「Codex 停住」的直接原因 |
 | **gateway.go** | | |
 | `GATEWAY_HANDLE_REQUEST_ENTRY` | gateway.go | 复杂模式总入口，必须同步 quick.go |
 | `GATEWAY_TRANSLATE_TO_PROVIDER` | gateway.go | Central Schema 出口，必须同步 quick.go |
