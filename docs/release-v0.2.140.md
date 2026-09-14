@@ -95,3 +95,58 @@ go vet  ./internal/server/ ...      # 干净
 
 部署版 v0.2.139 上该问题仍在真实存在（2/9 可复现），本 release 的二进制需要重新部署才生效。
 SSH 不可用，无法由本仓库侧完成部署 —— 需要到服务器上重新构建并替换。
+
+## ⚠️ tag 指向说明（源码可复现性）
+
+本 release 的 tag `v0.2.140` 指向提交 `65b31c3`，**该提交不含本次改动**。
+
+`65b31c3` 是 v0.2.139 时代的提交（`docs: release-v0.2.139.md 末尾补 tag 指向说明`），
+它的 `main.go` 仍是 `v0.2.139`，6 个响应头转发点也都没有过滤。
+`git clone --branch v0.2.140` 会拿到 v0.2.139 的源码。
+
+**源码可复现性走 `master`**：本次改动的提交 `91edad8` 已推送到远端 `master`
+（`65b31c3..91edad8`），`git log master` 可见：
+
+```
+91edad8  fix: 响应头透传全量过滤 Content-Length，修复非流式 IncompleteRead
+        8 files changed, 359 insertions(+), 8 deletions(-)
+```
+
+包含 `main.go`（v0.2.140）、`internal/server/quick.go`（5 处过滤）、
+`internal/server/gateway.go`（1 处过滤）、`internal/server/header_forward_test.go`
+（新增，AST 锁 10 个转发点）、`build.ps1`、`docs/release-v0.2.140.md`、
+`CLAUDE.md` / `AGENTS.md`。8 个文件全是源码/文档/脚本，**无二进制入库**
+（`git ls-files | grep -cE 'agent-proxy_(linux|windows|darwin)'` = 0）；
+二进制资产经 `gh release upload` 发布，不占 git 历史。
+
+**要复现本 release 的源码，请 `git checkout master`，不要用 tag。**
+
+### 为什么 tag 指错
+
+`gh release create --target master` 会把 tag 落在远端 `master` 指向的 commit 上。
+发 release 时 `github.com:443` 持续不可达（`Failed to connect`，重试 10 次全失败），
+而 `api.github.com:443` 是通的（`gh` 全程可用）—— 两个域名走不同网络路径，
+所以 `gh api` / `gh release` 能用，但 `git push origin master` 一直推不上去。
+远端 `master` 因此停在 `65b31c3`，tag 跟着落在了那里。
+
+网络恢复后 `master` 已补推成功（`git push origin master:master` → `65b31c3..91edad8`）。
+**tag 仍指旧 commit**：修正需要 `git push --force --tags origin v0.2.140`，
+而该操作会把 tag 从当前锚点移走、旧 tag 对象不再可达，属不可逆动作，
+未获显式授权故保留原状，在此说明。
+
+与 v0.2.139 是同一个坑（v0.2.139 的 tag 也落在了错误 commit 上）。
+
+### 资产本身是正确的
+
+7 个二进制都是用 `-ldflags "-X main.version=v0.2.140"` 从含改动的源码编译的。
+验证方式：
+
+```bash
+strings agent-proxy_linux_amd64 | grep -x 'v0.2.140'
+```
+
+本 release 实测：远端下载的 `agent-proxy_linux_amd64` 为 13,750,456 字节，
+含 `v0.2.140` 字符串 2 次、`v0.2.139` 0 次，函数符号
+`QuickGateway).handleModels` / `handleNonStreamResponse` 均在。
+（哈希比对因 objects 域名间歇不可达未完成 —— 该域名在本环境下载不稳定，
+首次下载曾截断为 13,115,267 字节。）
