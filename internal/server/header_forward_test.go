@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +85,76 @@ func TestNoUnfilteredHeaderForwarding(t *testing.T) {
 			t.Parallel()
 			guard(t, src)
 		})
+	}
+}
+
+// TestNoDuplicateHeaderForwarding 用 AST 锁住「每个函数最多一个响应头转发循环」。
+//
+// 2026-09-14 发现 handleModels 里有**两个**转发循环（3466 / 3588），都往 w.Header().Add()
+// 追加。Add 是追加语义不是覆盖，于是 Date / X-Request-Id / Access-Control-Allow-Origin
+// 全部出现两次。v0.2.139 起就这样，与 Content-Length 修复无关——坏 CL 的来源是第二个
+// 循环漏了过滤；v0.2.140 补上过滤，v0.2.141 直接删掉这个重复循环。
+//
+// 为什么需要这个测试：删掉后没有任何代码「需要」两个循环，但也没有任何机制阻止后人
+// 把它加回来。本项目的失败模式历来是「修 A 坏 B」，而「多写一遍转发」是最容易被误当成
+// 「顺手补齐」的错误。TestNoUnfilteredHeaderForwarding 只检查「过滤在不在」，看不出重复。
+func TestNoDuplicateHeaderForwarding(t *testing.T) {
+	t.Parallel()
+
+	for _, src := range []string{"quick.go", "gateway.go"} {
+		src := src
+		t.Run(src, func(t *testing.T) {
+			t.Parallel()
+			guardNoDup(t, src)
+		})
+	}
+}
+
+func guardNoDup(t *testing.T, rel string) {
+	t.Helper()
+
+	dir := pkgDir(t)
+	path := filepath.Join(dir, rel)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("解析 %s 失败: %v", rel, err)
+	}
+
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		name := fn.Name.Name
+		if fn.Recv != nil && len(fn.Recv.List) > 0 {
+			if star, ok := fn.Recv.List[0].Type.(*ast.StarExpr); ok {
+				if id, ok := star.X.(*ast.Ident); ok {
+					name = id.Name + "." + name
+				}
+			}
+		}
+
+		var lines []int
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			rs, ok := n.(*ast.RangeStmt)
+			if !ok || !isHeaderRangeX(rs.X) {
+				return true
+			}
+			lines = append(lines, fset.Position(rs.Pos()).Line)
+			return true
+		})
+		if len(lines) > 1 {
+			parts := make([]string, len(lines))
+			for i, l := range lines {
+				parts[i] = fmt.Sprintf(":%d", l)
+			}
+			t.Errorf("%s: %s 有 %d 处响应头转发循环（%s）—— "+
+				"w.Header().Add 是追加语义，同一批上游头会被写两次，Date / X-Request-Id / "+
+				"Access-Control-* 全部重复\n每个函数只保留一个转发循环"+
+				"（过滤要求见 TestNoUnfilteredHeaderForwarding）",
+				rel, name, len(lines), strings.Join(parts, " "))
+		}
 	}
 }
 

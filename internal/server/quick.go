@@ -3608,22 +3608,16 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 透传上游响应头（过滤连接管理 header）
-	// @AI_GUARD: MODELS_ALIASES_HEADERS - 必须过滤，下面 json.NewEncoder(w).Encode(upstreamResp)
-	//   写的是「上游 data[] 追加别名模型 + metadata.aliases」后的重编码体（Encoder 还会追加换行），
-	//   长度与上游不同。若透传上游 Content-Length，?simple=0 的模型列表会被非流式客户端按上游 CL
-	//   多读 → IncompleteRead。
-	// @REASON: 本函数另一处转发点（上方 ?simple=1 之前）早已过滤；此处漏了，且是 iterate
-	//   resp.Header 而非 headers，header_forward_test.go 的 AST 扫描此前看不到——已一并扩到 resp.Header。
+	// @AI_GUARD: MODELS_ALIASES_HEADERS - 本函数只有「上方 ?simple=1 之前」那一个头转发循环。
+	//   下方 json.NewEncoder(w).Encode(upstreamResp) 写的是「上游 data[] 追加别名模型 +
+	//   metadata.aliases」后的重编码体（Encoder 还会追加换行），长度与上游不同，所以那个循环
+	//   必须过滤 Content-Length —— 否则非流式客户端按上游 CL 多读 → IncompleteRead。
+	//   禁止在本函数再加第二个转发循环：w.Header().Add 是追加语义，两个循环加同一批头会让
+	//   Date / X-Request-Id / Access-Control-Allow-Origin 全部出现两次（2026-09-14 实测）。
+	//   header_forward_test.go 的 TestNoDuplicateHeaderForwarding 用 AST 锁住「每个函数最多一个」。
+	// @REASON: v0.2.140 及更早本函数有两个转发循环（3466 / 3588），第二个漏了过滤 —— 那正是
+	//   坏 CL 的入口。v0.2.140 把过滤补上，v0.2.141 直接删掉重复的第二个循环。
 	// @RELATED: quick.go handleModels 上方转发点, isConnectionManagementHeader, header_forward_test.go
-	for k, v := range resp.Header {
-		if isConnectionManagementHeader(k) {
-			continue
-		}
-		for _, val := range v {
-			w.Header().Add(k, val)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	json.NewEncoder(w).Encode(upstreamResp)
