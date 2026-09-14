@@ -469,7 +469,17 @@ func (g *Gateway) handlePassthroughNonStream(ctx context.Context, w http.Respons
 		}
 	}
 
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: GATEWAY_NONSTREAM_RESPONSE_HEADERS - 必须过滤，下面 WriteHeader(200) 后 Go 按 resp
+	//   重新算 Content-Length。resp 经 stripToolUseDescription / fixNullUsageInResponse /
+	//   echoAliasInResponseBody 三重改写，长度与上游不同，透传上游 CL 会让非流式客户端报 IncompleteRead。
+	// @REASON: 2026-09-14 实测 /v1/responses 非流式 CL=527 实际 319 字节。本文件 597/921 两处
+	//   早已过滤，此处漏了（修 A 坏 B 的典型漏点）。
+	// @RELATED: quick.go:2686, quick.go:1560, quick.go isConnectionManagementHeader
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}

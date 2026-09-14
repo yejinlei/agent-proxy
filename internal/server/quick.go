@@ -1323,7 +1323,12 @@ func (q *QuickGateway) handlePassthroughStreamWithBody(p provider.Provider, ctx 
 		return
 	}
 
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: STREAM_RESPONSE_HEADERS - 上游 Content-Length 按上游体算，本路径写 SSE 自身体，不能透传
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -1695,8 +1700,12 @@ func (q *QuickGateway) handlePassthroughStream(p provider.Provider, ctx context.
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: STREAM_RESPONSE_HEADERS - 上游 Content-Length 按上游体算，本路径写 SSE 自身体，不能透传
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -2676,8 +2685,17 @@ func (q *QuickGateway) handleNonStreamResponse(p provider.Provider, ctx context.
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: NONSTREAM_RESPONSE_HEADERS - 必须过滤，下面 WriteHeader(200) 后 Go 按 outgoingResp
+	//   重新算 Content-Length，若透传上游的 CL 就是「头按上游体算、体是翻译后的」→ 非流式客户端
+	//   报 IncompleteRead。注意 Content-Type 在过滤之后设置，覆盖不受影响。
+	// @REASON: 2026-09-14 实测 /v1/responses 非流式 CL=527 实际 319 字节；quick.go:1560 早已过滤
+	//   （PASSTHROUGH_RESPONSE_HEADERS），此处与 gateway.go:472 漏了。
+	// @RELATED: quick.go:1560, gateway.go:472, handleModels 的同名过滤
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -2822,8 +2840,14 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 		return
 	}
 
-	// 透传下游响应头
+	// 透传下游响应头（过滤连接管理 header）
+	// @AI_GUARD: NONSTREAM_A2S_HEADERS - 本路径 WriteHeader(200) 已在 SSE 设置阶段发生，
+	//   Go 对已写头会忽略 CL，但过滤保持一致性，避免将来有人把写头顺序调回前面就复发。
+	// @RELATED: quick.go:1560, gateway.go:472
 	for k, v := range headers {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
@@ -3584,8 +3608,18 @@ func (q *QuickGateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 透传上游响应头
+	// 透传上游响应头（过滤连接管理 header）
+	// @AI_GUARD: MODELS_ALIASES_HEADERS - 必须过滤，下面 json.NewEncoder(w).Encode(upstreamResp)
+	//   写的是「上游 data[] 追加别名模型 + metadata.aliases」后的重编码体（Encoder 还会追加换行），
+	//   长度与上游不同。若透传上游 Content-Length，?simple=0 的模型列表会被非流式客户端按上游 CL
+	//   多读 → IncompleteRead。
+	// @REASON: 本函数另一处转发点（上方 ?simple=1 之前）早已过滤；此处漏了，且是 iterate
+	//   resp.Header 而非 headers，header_forward_test.go 的 AST 扫描此前看不到——已一并扩到 resp.Header。
+	// @RELATED: quick.go handleModels 上方转发点, isConnectionManagementHeader, header_forward_test.go
 	for k, v := range resp.Header {
+		if isConnectionManagementHeader(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}

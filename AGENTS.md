@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 79 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 193 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 83 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 199 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -324,12 +324,17 @@ grep -rn "@REASON:" internal/
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
 | `TRANSLATE_STREAM_OUTPUT` | quick.go | Anthropic SSE 事件序列 |
+| `NONSTREAM_RESPONSE_HEADERS` | quick.go | 翻译路径非流式→JSON 的下游响应头透传必须过滤 `Content-Length`（Go 在 `WriteHeader(200)` 后按翻译体重算 CL，透传上游 CL = 头按上游体算、体是翻译后的 → 客户端 IncompleteRead）；全仓 10 个转发点（quick.go 7 + gateway.go 3）都必须过滤，`header_forward_test.go` 用 AST 锁定 |
+| `NONSTREAM_A2S_HEADERS` | quick.go | 翻译路径非流式→SSE 的下游响应头透传同样必须过滤连接管理 header（与 `NONSTREAM_RESPONSE_HEADERS` 同一规则，WriteHeader 已在 SSE 阶段发出） |
+| `STREAM_RESPONSE_HEADERS` | quick.go | 两条流式路径的下游响应头透传必须过滤（上游 CL 按上游体算，本路径写 SSE 自身体） |
+| `MODELS_ALIASES_HEADERS` | quick.go (handleModels) | `/v1/models` 别名注入分支透传头必须过滤（下面 `json.NewEncoder(w).Encode(upstreamResp)` 写的是追加别名后的重编码体）。**注意此转发点遍历的是 `resp.Header` 不是 `headers`，AST 扫描两种形态都得覆盖**——只扫 `headers` 时这里曾漏网 |
 | **gateway.go** | | |
 | `GATEWAY_HANDLE_REQUEST_ENTRY` | gateway.go | 复杂模式总入口，必须同步 quick.go |
 | `GATEWAY_TRANSLATE_TO_PROVIDER` | gateway.go | Central Schema 出口，必须同步 quick.go |
 | `BUILD_CC_REQUEST` | gateway.go | InternalRequest → CC 消息格式转换核心 |
 | `GATEWAY_PASSTHROUGH_STREAM` | gateway.go | 必须同步 quick.go |
 | `GATEWAY_STREAM_REQUEST` | gateway.go | 必须同步 quick.go |
+| `GATEWAY_NONSTREAM_RESPONSE_HEADERS` | gateway.go | 透传非流式的下游响应头必须过滤 `Content-Length`（`resp` 经 stripToolUseDescription / fixNullUsageInResponse / echoAliasInResponseBody 三重改写，长度与上游不同）；本文件另两处转发点早已过滤，此处曾漏 |
 | **provider** | | |
 | `CONNECTION_POOL_CONFIG` | openai.go | 4 个 Provider 配置一致 |
 | `STREAM_TIMEOUT_RETRY` | openai.go | 响应头超时（`context.DeadlineExceeded`）必须在重试预算内重试，否则等于只把失败提前 |
