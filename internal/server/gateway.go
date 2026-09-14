@@ -1475,6 +1475,7 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 	tools := make([]chatcompletion.Tool, 0, len(req.Tools))
 	toolNames := make([]string, 0, len(req.Tools))
 	nUnsupported := 0
+	nToolSearch := 0 // @AI_GUARD: CC_TOOL_SEARCH_SYNTHESIS - 观测计数
 	var droppedTools []string
 	for _, tool := range req.Tools {
 		if tool.IsCustom {
@@ -1528,6 +1529,41 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 			}
 			continue
 		}
+		// @AI_GUARD: CC_TOOL_SEARCH_SYNTHESIS - Codex 的 tool_search 合成 CC function 透传
+		// @CONSTRAINT: 必须与出站改写配对（RESPONSES_TOOL_SEARCH_BRIDGE）：Codex router.rs:244
+		//   只把 ResponseItem::ToolSearchCall 解析成 ToolPayload::ToolSearch；若模型调用这个
+		//   合成函数后代理仍回 type:"function_call"，Codex 会以 ToolPayload::Function 派发到
+		//   ToolSearchHandler，handlers/tool_search.rs:200-207 直接 Fatal
+		//   "tool_search handler received unsupported payload"。单边合成 = 静默致命。
+		// @CONSTRAINT: 工具名必须是字面量 "tool_search"（codex-rs/tools/src/tool_discovery.rs:6
+		//   TOOL_SEARCH_TOOL_NAME 常量），不带 namespace——handler 注册 ToolName::plain。
+		// @CONSTRAINT: description / parameters 原样透传 Codex 发来的原文，不改写。
+		//   代理只承担协议形状转换，不承担语义生成；改描述会让模型行为偏离 Codex 预期。
+		// @REASON: tool_namespaces_info.rs:80 的 deferred 门（native_tool_search_visible）
+		//   以 tools[] 是否含 type:"tool_search" 为条件。代理丢弃该类型 → 用户配置的
+		//   mcp_servers.* 服务器的 deferred 工具完全不可达（只有 3 个 MCP meta 工具能过），
+		//   而 tool_search 自己的 description 明确说要用它替代 list_mcp_resources。
+		// @REASON: v0.2.142 前 buildCCRequest 固定丢 2 个工具（tool_search + web_search），
+		//   日志 "2 tool(s) have no CC equivalent" 12/12 轮。web_search 保持丢弃——Codex 侧
+		//   无本地 executor，CC 侧也没有，合成会造幻影（模型看见调用后无人执行）。
+		// @RELATED: protocol/responses/tool_search.go ToolSearchParams / IsToolSearchArgsValid、
+		//   translator.go TranslateResponse / TranslateStream（出站改写）、
+		//   protocol/responses/tool_search_test.go
+		if tool.Type == responses.ToolSearchTypeName && len(tool.Raw) > 0 {
+			if params, ok := responses.ToolSearchParams(tool.Raw); ok && params.Description != "" {
+				tools = append(tools, chatcompletion.Tool{
+					Type: "function",
+					Function: &chatcompletion.FunctionDef{
+						Name:        responses.ToolSearchFunctionName,
+						Description: params.Description,
+						Parameters:  params.Parameters,
+					},
+				})
+				toolNames = append(toolNames, responses.ToolSearchFunctionName)
+				nToolSearch++
+				continue
+			}
+		}
 		nUnsupported++
 		// @AI_GUARD: CC_CUSTOM_TOOL_SYNTHESIS - 丢弃清单必须可观测
 		// @REASON: v0.2.134 排障——系统提示里 apply_patch 出现 272 次，但 Codex 本次送的
@@ -1559,6 +1595,14 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 	// 配对断了模型就把已读文件当成没读过并停止调工具。
 	if nNamespace := len(responses.CollectNamespaceToolNames(req.Tools)); nNamespace > 0 {
 		log.Printf("[CODEX-DEBUG] buildCCRequest: namespace tools flattened into %d CC function(s) upstream; outbound restores the namespace field", nNamespace)
+	}
+	if nToolSearch > 0 {
+		// @AI_GUARD: CC_TOOL_SEARCH_SYNTHESIS - tool_search 送达必须可观测
+		// @REASON: namespace 分支同款约定——「给了但没用」必须一行 grep 可见，
+		//   否则 v0.2.142 修完后暴露出的另一半盲区（工具确实送达、模型 0 次调用）
+		//   又只能靠人工解析 END 行的 fcs=[...] 数工具名。
+		// @RELATED: responses/translator.go TranslateStream END 汇总行（ns_tools/ns_calls 判据）
+		log.Printf("[CODEX-DEBUG] buildCCRequest: %d tool_search tool(s) synthesized as CC function upstream; outbound rewrites function_call(name=tool_search) → tool_search_call", nToolSearch)
 	}
 
 	logCCRequestShape(req.Model, messages, len(tools), toolNames)

@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 85 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 199 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 90 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 217 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -281,7 +281,12 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TOOL_RAW_PASSTHROUGH` | responses/types.go + translator.go | `ResponseRequest.Tools` 必须是 `[]json.RawMessage`，出站原样回写，不能强类型 `[]Tool` 重建 |
 | `RESPONSES_CUSTOM_TOOL` | responses/custom_tool.go + translator.go | freeform 工具双向桥接：出站必须 `type:"custom_tool_call"` + `input:<裸串>`（非 `arguments`），流式与非流式出口都要实现；custom 不发 `function_call_arguments.*` 事件 |
 | `RESPONSES_CUSTOM_TOOL_NO_SHIM` | responses/translator.go | custom 工具的 `InternalTool.Function` 必须为空；合成只能在 `buildCCRequest` 发生（合成名派生 `exec_<原名>`，出站还原 Codex 原名）。v0.2.132 在入站翻译器填 `Function` → shim 描述串到 7 个普通 function 工具、custom 工具 0 次调用 |
+| `RESPONSES_TOOL_SEARCH_PARAMS` | responses/tool_search.go | 入站 `type:"tool_search"` 的 description/parameters 只能校验、不能改写：Codex 发的 schema 含 `required:["query"]` + `additionalProperties:false`，降级成 `{}` 会让模型以为无参 → 空 query 调用。description 为空时禁止合成（模型会拿到无意义工具说明并误调用） |
+| `RESPONSES_TOOL_SEARCH_ARGS` | responses/tool_search.go | 出站 arguments 校验：`query` 缺失/非字符串/空白 → **拒绝并保留 function_call**；`limit` 非法（负数/非整数/超限）→ **丢弃该字段**保留 query。差别在于 Codex 侧 `limit` 是 `Option<usize>`，缺失即回落 `TOOL_SEARCH_DEFAULT_LIMIT`（合法降级），而 `query` 是必填。出站统一走 `ToolSearchArgsCleanedJSON`，不依赖 `json.Marshal(map)` 的隐式字母序 |：`function_call(name="tool_search")` → `type:"tool_search_call"` + `execution:"client"` + `arguments:<对象>`（不是字符串）。**必须与入站合成配套**（`CC_TOOL_SEARCH_SYNTHESIS`）：单边任一侧都会让 Codex 拿到无法派发/反序列化的 item（Router 只把 `ToolSearchCall` 解析成 `ToolPayload::ToolSearch`，`FunctionCall` 一律解析成 `ToolPayload::Function`）。不发 `function_call_arguments.*` 事件（同 custom 约定）。非法 arguments 保留 `function_call` 而非退化成 `tool_search_call`（Codex 一定拒绝后者） |
+| `RESPONSES_TOOL_SEARCH_VALIDITY` | responses/translator.go | 流式 `tool_search` 的 item type 由**完整参数**决定，禁止按首片参数锁定：真实上游把 tool_call 参数拆成多片，首片常为空或 JSON 前缀（单独 Unmarshal 必失败），锁定会把合法调用永久降级成 `function_call` → Codex 以 `ToolPayload::Function` 派发到 `ToolSearchHandler` → Fatal。`SearchValid` 创建 fc 时钉 `false`，added **必须延后**（`sendOutputItemAddedEarly` 对 `Search` 跳过，`closeFuncCall` 重判后补发），保证 added/done 同型。added 的 item 只用于注册（Codex `handle_non_tool_response_item` 对 `ToolSearchCall` 返回 None），不带 `arguments`；done / `response.completed` 的 `arguments` 必须始终存在且是对象，null 会让 `SearchToolCallParams.query` 缺失 |
+| `RESPONSES_TOOL_SEARCH_BRIDGE` | responses/tool_search.go + translator.go | Codex 的 `tool_search` 出站改写：`function_call(name="tool_search")` → `type:"tool_search_call"` + `execution:"client"` + `arguments:<对象>`（不是字符串）。**必须与入站合成配套**（`CC_TOOL_SEARCH_SYNTHESIS`）：单边任一侧都会让 Codex 拿到无法派发/反序列化的 item（Router 只把 `ToolSearchCall` 解析成 `ToolPayload::ToolSearch`，`FunctionCall` 一律解析成 `ToolPayload::Function`）。不发 `function_call_arguments.*` 事件（同 custom 约定）。非法 arguments 保留 `function_call` 而非退化成 `tool_search_call`（Codex 一定拒绝后者） |
 | `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | CC 侧唯一合成点：`IsCustom` 工具合成 `exec_<原名>` 的 JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默；禁止按 `tool.Type` 白名单丢弃 |
+| `CC_TOOL_SEARCH_SYNTHESIS` | gateway.go (buildCCRequest) | v0.2.142 起 `type:"tool_search"` 合成 CC function（name 字面量 `"tool_search"`，与 Codex 侧 `TOOL_SEARCH_TOOL_NAME` 常量逐字节一致），description/parameters 原样透传。**必须与出站改写配套**（`RESPONSES_TOOL_SEARCH_BRIDGE`）：单边合成会让 Codex 以 `ToolPayload::Function` 派发到 `ToolSearchHandler`，直接 Fatal `unsupported payload` |
 | `INTERNAL_TOOL_RAW` | schema/internal.go | `Raw`/`IsCustom` 承接非 function 工具（`json:"-"`），禁止在入站翻译时按 type 丢弃 |
 | `INTERNAL_RESPONSE_CUSTOM_NAMES` | schema/internal.go | 非流式出站 custom 工具名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
 | `RESPONSES_EMPTY_INPUT_USER_FALLBACK` | responses/translator.go | 空 `input:[]`（Codex prewarm）必须注入一条 **非空** user 消息，否则上游 400 `No user query found in messages` |

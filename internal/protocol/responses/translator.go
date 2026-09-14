@@ -1358,6 +1358,37 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 			})
 			continue
 		}
+		// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - 非流式出站 tool_search_call 形状
+		// @CONSTRAINT: type:"tool_search_call" + execution:"client" + arguments:<对象>。
+		//   与流式路径（TranslateStream customFCItem 的 Search 分支）item 形状必须逐字段一致，
+		//   否则 stream:false 的 Codex 会话会拿到 function_call → Codex 以 ToolPayload::Function
+		//   派发 → ToolSearchHandler 直接 Fatal "unsupported payload"。
+		// @CONSTRAINT: 判定按 tc.Function.Name == "tool_search" 且非 custom 且非 namespace；
+		//   不需要名表——tool_search 的合成名与 Codex 原工具名相同。
+		// @REASON: v0.2.142 前 tool_search 从未送出，本分支恒不命中。与流式同源改动
+		//   必须同时落地（单边 = 静默致命，见 CC_TOOL_SEARCH_SYNTHESIS）。
+		// @RELATED: TranslateStream customFCItem、tool_search.go IsToolSearchArgsValid、
+		//   server/gateway.go buildCCRequest（CC_TOOL_SEARCH_SYNTHESIS）
+		isSearch := tc.Function.Name == ToolSearchFunctionName &&
+			len(nsNames[tc.Function.Name].Namespace) == 0
+		if isSearch {
+			if ok, cleaned := IsToolSearchArgsValid(tc.Function.Arguments); ok {
+				b, _ := json.Marshal(cleaned)
+				log.Printf("[CODEX-DEBUG] TranslateResponse tool_search_call: call_id=%q args_bytes=%d cleaned=%s",
+					callID, len(tc.Function.Arguments), string(b))
+				output = append(output, map[string]interface{}{
+					"id":         callID,
+					"type":       "tool_search_call",
+					"call_id":    callID,
+					"execution":  "client",
+					"status":     "completed",
+					"arguments":  cleaned,
+				})
+				continue
+			}
+			log.Printf("[CODEX-DEBUG] TranslateResponse tool_search_call INVALID args, keeping as function_call: call_id=%q args=%q",
+				callID, tc.Function.Arguments)
+		}
 		args := tc.Function.Arguments
 		if args == "" {
 			args = "{}"
@@ -1531,6 +1562,41 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		//   把调用当成顶层函数执行，而顶层不存在该工具 → 整轮静默失败。
 		Namespace     string
 		NamespaceName string
+		// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - Codex 的 tool_search 出站还原标记
+		// @CONSTRAINT: Search 为 true 时出站 item 必须写 type:"tool_search_call" +
+		//   execution:"client" + arguments:<对象>（不是字符串），不能是 function_call。
+		//   形状依据 codex-rs/protocol/src/models.rs:1081 ToolSearchCall{id, call_id,
+		//   status, execution:String, arguments:Value}——arguments 是 serde_json::Value
+		//   对象，与 function_call 的 arguments:String 不同。
+		// @CONSTRAINT: Search 工具不发 response.function_call_arguments.* 事件——
+		//   该事件只绑定 function_call item，为 tool_search_call 发它们会让 Codex 尝试
+		//   更新不存在的 function_call item。与 Custom 工具的约定一致：
+		//   item 数据完全靠 output_item.done 一次交付。
+		// @REASON: v0.2.142 前 tool_search 从未送到 CC 上游，本标记恒 false。修好后必须
+		//   严格配对入站合成（CC_TOOL_SEARCH_SYNTHESIS）：模型调用后若代理仍回 function_call，
+		//   Codex 会以 ToolPayload::Function 派发，ToolSearchHandler 直接 Fatal
+		//   "tool_search handler received unsupported payload"。单边改动 = 静默致命。
+		// @RELATED: tool_search.go IsToolSearchArgsValid、server/gateway.go buildCCRequest
+		//   （CC_TOOL_SEARCH_SYNTHESIS）、TranslateResponse 非流式路径（同标记同源）
+		Search bool
+		// SearchValid 记录「本 fc 最终 arguments 是否合法」，据此决定出站 item 的 type。
+		// 创建 fc 时钉成 false（参数尚未累积、必然为空 → 必然不合法），
+		// added 恒发 function_call；closeFuncCall 拿到完整参数后重判一次。
+		//
+		// @AI_GUARD: RESPONSES_TOOL_SEARCH_VALIDITY - added/done 类型必须一致
+		// @CONSTRAINT: output_item.added 与 output_item.done 的 type 必须相同。
+		//   Codex 的 process_responses_event 把两者各自独立解析成 ResponseItem：
+		//   OutputItemAdded 走 handle_non_tool_response_item（turn.rs:2619，
+		//   非工具项只建展示用的 turn item），OutputItemDone 才走
+		//   ToolRouter::build_tool_call 并派发工具。added/done 类型不一致会让
+		//   这个 output_index 的 added 注册落空，done 变成孤儿 item。
+		// @REASON: customFCItem 在 added（argsStr==""）和 done（argsStr=最终串）时
+		//   被调用两次，首次调用时还没有 arguments、无法判定合法性。因此创建 fc 时
+		//   就把 SearchValid 定为 false（空参数必然不合法），added 恒为 function_call；
+		//   closeFuncCall 再用最终完整串重判一次，保证 done 与 added 读同一结论。
+		//   closeFuncCall 会在发 done 之前按需补发 added，所以 done 不会先于 added。
+		// @RELATED: getFC 首次分片分支、customFCItem 的 Search 分支、closeFuncCall
+		SearchValid bool
 	}
 	funcCalls := make(map[string]*funcCallState)
 	// customNames 是「发往 CC 上游的合成工具名 → Codex 原 custom 工具名」映射（由调用方
@@ -1579,6 +1645,17 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			codexName, isCustom := customNames[name]
 			// nsEntry 是零值时表示非 namespace 工具（nsNames 只在命名空间工具上有 key）。
 			nsEntry := nsNames[name]
+			// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - 流式 fc 的 Search 标记按 name 判定
+			// @CONSTRAINT: tool_search 的合成名与 Codex 原工具名**相同**（都是 "tool_search"），
+			//   这是与 custom（exec_<原名>）和 namespace（<ns>_<toolname>）的本质区别——
+			//   不需要名表映射，不需要 ctx 通道，也不会与真实 CC function 工具冲突
+			//   （只有入站声明了 type:"tool_search" 的代理请求才会走到这里，见 gateway.go
+			//   的 CC_TOOL_SEARCH_SYNTHESIS；其他协议路径根本不经过 TranslateStream）。
+			isSearch := name == ToolSearchFunctionName && !isCustom && nsEntry.Namespace == ""
+			// SearchValid 在此**不判定**（RESPONSES_TOOL_SEARCH_VALIDITY）：首片通常还没有
+			// 完整 arguments，此刻判定会把「缺参数」误判成「参数非法」，导致合法调用被
+			// 永久退化成 function_call。创建时钉成 false，added 恒发 function_call；
+			// closeFuncCall 拿到完整参数后重判一次，added/done 用同一结论。
 			fc = &funcCallState{
 				ID:            key,
 				Name:          name,
@@ -1588,6 +1665,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				CodexName:     codexName,
 				Namespace:     nsEntry.Namespace,
 				NamespaceName: nsEntry.ToolName,
+				Search:        isSearch,
 			}
 			if nsEntry.Namespace != "" {
 				nNamespaceCalls++
@@ -1605,6 +1683,17 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			if nsEntry := nsNames[newName]; nsEntry.Namespace != "" && fc.Namespace == "" {
 				fc.Namespace = nsEntry.Namespace
 				fc.NamespaceName = nsEntry.ToolName
+			}
+			// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - 流式 fc 的 Search 标记按 name 判定
+			// @CONSTRAINT: tool_search 的合成名与 Codex 原工具名**相同**（都是 "tool_search"），
+			//   这是与 custom（exec_<原名>）和 namespace（<ns>_<toolname>）的本质区别——
+			//   它不需要名表映射。因此不需要 ctx 通道，也不会与真实 CC function 工具冲突
+			//   （只有入站声明了 type:"tool_search" 的代理请求才会走到这里，见 gateway.go
+			//   的 CC_TOOL_SEARCH_SYNTHESIS；其他协议路径根本不经过 TranslateStream）。
+			if newName == ToolSearchFunctionName && !fc.Custom && fc.Namespace == "" {
+				fc.Search = true
+				// SearchValid 在此不判定：续片可能只带 name、参数还在后面（或首片参数
+				// 只是前缀，单独解析必失败）。一律等 closeFuncCall 用完整串判定。
 			}
 		}
 		return fc
@@ -1731,6 +1820,68 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				"input":   input,
 			}
 		}
+		if fc.Search {
+			// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - 出站 item 形状
+			// @CONSTRAINT: type:"tool_search_call" + execution:"client" + arguments:<对象>。
+			//   arguments 必须是 JSON 对象（SearchToolCallParams{query,limit}），不能是
+			//   字符串——与 function_call 的 arguments:String 相反。形状依据
+			//   codex-rs/protocol/src/models.rs:1081 ToolSearchCall.arguments:Value。
+			// @CONSTRAINT: 合法 arguments 时 added/done 都发 tool_search_call——
+			//   与 custom_tool_call 完全对齐：added 时 argsStr==""，只写类型不带 arguments
+			//   字段，done 时带完整 arguments。Codex 建 item 靠 output_item.done，
+			//   added 只用于注册（codex-rs/core/src/tools/handlers/tool_search.rs 与
+			//   custom_tool_call 共享这条路径）。added 是 function_call 而 done 是
+			//   tool_search_call 会类型不一致——禁止。
+			// @CONSTRAINT: 只有 IsToolSearchArgsValid 通过时才改写成 tool_search_call。
+			//   其余情形（argsStr=="" 或非法）一律回退成 function_call，added/done 都保持
+			//   function_call——避免 added/done 类型冲突。合法/非法判定在 added 时
+			//   还没有 arguments 可判，因此在 getFC 首次见到 name 时按 args 内容锁定
+			//   fc.SearchValid，added 与 done 用同一个结论。
+			// @REASON: 单边合成（只改入站，不改出站）会让 Codex 把该调用当普通函数派发，
+			//   ToolSearchHandler 收到 ToolPayload::Function 直接 Fatal。
+			// @RELATED: tool_search.go IsToolSearchArgsValid（形状校验）、
+			//   server/gateway.go buildCCRequest（CC_TOOL_SEARCH_SYNTHESIS）、
+			//   TranslateResponse 非流式路径（同源 item 形状）、
+			//   同函数内 Custom 分支（added/done 一致性约定）
+			if !fc.SearchValid {
+				log.Printf("[CODEX-DEBUG] TranslateStream tool_search_call INVALID args, keeping as function_call: call_id=%q args=%q",
+					fc.CallID, argsStr)
+				return map[string]interface{}{
+					"id":        fc.CallID,
+					"type":      "function_call",
+					"call_id":   fc.CallID,
+					"name":      funcCallOutboundName(fc),
+					"status":    status,
+					"arguments": argsStr,
+				}
+			}
+			item := map[string]interface{}{
+				"id":        fc.CallID,
+				"type":      "tool_search_call",
+				"call_id":   fc.CallID,
+				"execution": "client",
+				"status":    status,
+				// @CONSTRAINT: arguments 必须是**对象**，不能是字符串（FunctionCall 的形状），
+				//   也不能是 null（Codex 的 OutputItemDone 分支无条件调
+				//   ToolRouter::build_tool_call，arguments:null 会让
+				//   SearchToolCallParams.query 缺失 → RespondToModel）。
+				//   added 事件（status="in_progress"、argsStr==""）不写 arguments 字段——
+				//   ResponseItem::ToolSearchCall.arguments 在 serde 侧无 default，
+				//   但 absent 会序列化成 null，而 added 的 item 只用于注册
+				//   （handle_non_tool_response_item 对 ToolSearchCall 直接返回 None，
+				//   stream_events_utils.rs:407），不承载参数。
+				// @CONSTRAINT: 用 ToolSearchArgsCleanedJSON 而不是各调用点各自
+				//   json.Marshal(map)——Go 对 map 按 key 字母序输出，依赖这个
+				//   隐式排序会让 added/done/completed 的形状不可直接比对。
+			}
+			if argsStr != "" {
+				item["arguments"] = json.RawMessage(ToolSearchArgsCleanedJSON(argsStr))
+				b, _ := json.Marshal(item["arguments"])
+				log.Printf("[CODEX-DEBUG] TranslateStream tool_search_call: call_id=%q args_bytes=%d cleaned=%s status=%s",
+					fc.CallID, len(argsStr), string(b), status)
+			}
+			return item
+		}
 		item := map[string]interface{}{
 			"id":        fc.CallID,
 			"type":      "function_call",
@@ -1767,6 +1918,25 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		})
 	}
 
+	// sendOutputItemAddedEarly 是流式 delta 循环里的 added 发送点。
+	// @AI_GUARD: RESPONSES_TOOL_SEARCH_VALIDITY - tool_search 的 added 必须延后
+	// @CONSTRAINT: 普通 function_call 在第一个 delta 就发 added（客户端可即时渲染）；
+	//   但 tool_search 的 item type 取决于最终参数是否合法（SearchValid 只能在
+	//   closeFuncCall 拿到完整参数后判定）。若此刻先发 added，type 只能是
+	//   function_call（参数为空必然非法），随后 done 才是 tool_search_call ——
+	//   同一 output_index 的两个 item 类型不一致。所以对 Search 的 fc 跳过本处，
+	//   由 closeFuncCall 在重判 SearchValid 之后补发 added、紧接发 done。
+	// @REASON: added/done 类型不一致会让 Codex 的 OutputItemAdded 分支按
+	//   handle_non_tool_response_item 处理这个 output_index（turn.rs:2619），
+	//   而 OutputItemDone 分支走 ToolRouter::build_tool_call —— 注册落空、done 成孤儿。
+	// @RELATED: closeFuncCall 的 SearchValid 重判、funcCallState.SearchValid
+	sendOutputItemAddedEarly := func(fc *funcCallState) {
+		if fc.Search {
+			return
+		}
+		sendOutputItemAddedFunc(fc)
+	}
+
 	// closeFuncCall 关闭一个 function_call / custom_tool_call item：fc_arguments.done + output_item.done 各一次。
 	// @AI_GUARD: RESPONSES_FC_TEARDOWN - added/done 必须严格配对
 	// @AI_GUARD: RESPONSES_FC_ARGUMENTS_STRING - function_call.arguments 必须是 JSON 字符串，不能是对象
@@ -1780,6 +1950,19 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	//   且 sendCompleted 对空 buffer 幽灵条目补发 "{}" fc_arguments.done，与流式期间已发的
 	//   真 done 重复 → Codex 先绑定空参数 → pwd 工具空 Path。
 	closeFuncCall := func(fc *funcCallState) {
+		// @AI_GUARD: RESPONSES_TOOL_SEARCH_VALIDITY - 用**完整**参数重判合法性，
+		// 然后立刻补发 added（若还没发）。
+		// @CONSTRAINT: 顺序必须是「重判 → 补发 added → 发 done」，三者读同一个
+		//   SearchValid 结论，type 才一致。若判在补发 added 之后，added 会带着
+		//   创建时的 false 先发出去，而 done 变成 tool_search_call —— 两个
+		//   output_index 相同的 item 类型不同（见 funcCallState.SearchValid 的
+		//   @REASON）。本处只负责定 type，不重复「空串不落 "{}"」的判断。
+		if fc.Search {
+			fc.SearchValid, _ = IsToolSearchArgsValid(fc.argsBuffer.String())
+			log.Printf("[CODEX-DEBUG] TranslateStream tool_search_call: call_id=%q args_bytes=%d valid=%v outbound_type=%s",
+				fc.CallID, fc.argsBuffer.Len(), fc.SearchValid,
+				map[bool]string{true: "tool_search_call", false: "function_call"}[fc.SearchValid])
+		}
 		if !fc.addedSent {
 			sendOutputItemAddedFunc(fc)
 		}
@@ -1789,6 +1972,11 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				// custom 工具没有 JSON 参数对象可兜底：input 必须是模型给的裸串。
 				// 空串保留原样，让 Codex 按「工具输入为空」如实报错，
 				// 而不是喂一个语义为「无参数 JSON 对象」的 "{}" 给它执行。
+			} else if fc.Search {
+				// tool_search 同样不能兜底成 "{}"：SearchToolCallParams.query 必填，
+				// 空对象会被 Codex 判成 "failed to parse tool_search arguments"。
+				// 保留空串，由 customFCItem 的 IsToolSearchArgsValid 分支落成
+				// function_call 保留 + 日志，而不是一个必然被拒的 tool_search_call。
 			} else {
 				finalArgs = "{}"
 			}
@@ -1798,6 +1986,16 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			//   Codex 只为 function_call item 消费那类事件，为 custom_tool_call 发它们是噪声。
 			//   标 argsDone 防止后续 delta 事件被转发成 function_call_arguments.delta。
 			//   item 数据完全靠下面的 output_item.done 交付（customFCItem 内已解包 input）。
+			fc.argsDone = true
+		} else if fc.Search {
+			// @AI_GUARD: RESPONSES_TOOL_SEARCH_BRIDGE - tool_search_call 不发
+			//   response.function_call_arguments.* 事件（同 custom_tool_call 约定）。
+			// @CONSTRAINT: 该事件只绑定 function_call item，为 tool_search_call 发它们
+			//   会让 Codex 尝试更新不存在的 function_call item。
+			//   标 argsDone 防止后续 delta 被转发成 function_call_arguments.delta。
+			//   item 数据完全靠 output_item.done 一次交付（customFCItem 的 Search 分支）。
+			// @REASON: 与 custom 工具同款约定；两条本地执行通道（custom + tool_search）
+			//   都不走 function_call_arguments 通道，Codex 对它们的 item 只从 done 事件取。
 			fc.argsDone = true
 		} else if !fc.argsDone {
 			fc.argsDone = true
@@ -1862,7 +2060,10 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		// @CONSTRAINT: custom_tool_call 不发 function_call_arguments.delta 事件（同 closeFuncCall 的约定）——
 		//   该事件是 function_call 专属的增量通道，为 custom item 发它会让 Codex 把参数绑定到不存在的 item。
 		//   裸串仍写入 fc.argsBuffer，最终由 output_item.done 一次交付。
-		if fc.Custom {
+		// @CONSTRAINT: tool_search_call 同样不发（RESPONSES_TOOL_SEARCH_BRIDGE）——
+		//   该事件只绑定 function_call item，为 tool_search_call 发会让 Codex 尝试更新不存在的
+		//   function_call item。参数累积仍在 fc.argsBuffer，最终由 output_item.done 一次交付。
+		if fc.Custom || fc.Search {
 			return
 		}
 		nFuncArgsDeltas++
@@ -1889,10 +2090,16 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		for _, key := range funcCallOrder {
 			fc := funcCalls[key]
 			closeFuncCall(fc)
-			var argsStr string
-			if raw := fc.argsBuffer.String(); raw != "" {
-				argsStr = raw
-			} else {
+			// @AI_GUARD: RESPONSES_TOOL_SEARCH_VALIDITY - completed.output[] 必须与
+			// output_item.done 逐字段一致（Codex 两条通道都解析成 ResponseItem）。
+			// 空参数兜底 "{}" 的语义与 closeFuncCall 保持一致：只有普通 function_call
+			// 才兜底（Codex 的 FunctionCall.arguments 是 String，空串无法解析成 Value）；
+			// custom 与 tool_search 保持原样——custom 的 input 是模型给的裸串，
+			// tool_search 的参数合法性已由 closeFuncCall 判定并决定 type。
+			// 无差别兜底 "{}" 会让非法 tool_search 带上 arguments:{"query":""}，
+			// 造成 done 与 completed 形状分叉。
+			argsStr := fc.argsBuffer.String()
+			if argsStr == "" && !fc.Custom && !fc.Search {
 				argsStr = "{}"
 			}
 			output = append(output, customFCItem(fc, status, argsStr))
@@ -2080,7 +2287,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 					for i, tc := range choice.Message.ToolCalls {
 						fc := getFC(tc, i)
-						sendOutputItemAddedFunc(fc)
+						sendOutputItemAddedEarly(fc)
 						if tc.Function.Arguments != "" {
 							sendFuncArgsDelta(fc, tc.Function.Arguments)
 							fc.argsBuffer.WriteString(tc.Function.Arguments)
@@ -2137,7 +2344,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 						}
 						for i, tc := range choice.Message.ToolCalls {
 							fc := getFC(tc, i)
-							sendOutputItemAddedFunc(fc)
+							sendOutputItemAddedEarly(fc)
 							if tc.Function.Arguments != "" {
 								sendFuncArgsDelta(fc, tc.Function.Arguments)
 								fc.argsBuffer.WriteString(tc.Function.Arguments)
