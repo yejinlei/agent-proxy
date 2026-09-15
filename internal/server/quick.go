@@ -76,19 +76,10 @@ type QuickGateway struct {
 var heartbeatEvent = []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
 // largeBodyThreshold 是「大请求跳过原生流式」的阈值：超过此字节数直接走非流式→SSE 包装。
-// 阈值依据与 @REASON 见 LARGE_BODY_SKIP_STREAM guard；本处只定义常量，两处（透传 + 翻译）共用。
+// 阈值依据与 @REASON 见 LARGE_BODY_SKIP_STREAM guard（透传路径仍在用）。
+// 翻译路径已不再引用本阈值（v0.2.148 撤回降级，见 LARGE_BODY_SKIP_STREAM_TRANSLATION），
+// 此处仅保留给透传路径与单测锁值。
 const largeBodyThreshold = 100 * 1024 // 100KB
-
-// translationStreamRoute 判定翻译路径是否走原生流式。
-//
-// 返回 true = 走 handleStreamRequest（原生流式），false = 走 handleNonStreamResponseAsSSE。
-// 判据与 @REASON 见 LARGE_BODY_SKIP_STREAM_TRANSLATION guard，本处不重复。
-//
-// 抽成纯函数便于单测锁住阈值边界：直接内联在路由分支里会让「大请求是否降级」
-// 只能靠 e2e 或肉眼确认。
-func translationStreamRoute(downstreamReq json.RawMessage) bool {
-	return len(downstreamReq) <= largeBodyThreshold
-}
 
 // upstreamStallTimeout 是「translator 侧静默多久判定上游无响应、强制收尾」的阈值。
 // 由 UPSTREAM_STALL_DETECT 的 @CONSTRAINT 定义取值依据，本处不重复。
@@ -708,30 +699,37 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		log.Printf("[diag] translation path produced nil downstreamReq (providerType=%s) — 请求将无法发送", providerType)
 	}
 	if stream {
-		// @AI_GUARD: LARGE_BODY_SKIP_STREAM_TRANSLATION - 翻译路径大请求跳过原生流式
-		// @CONSTRAINT: 与 LARGE_BODY_SKIP_STREAM（透传路径）共用 largeBodyThreshold。判据用
-		//   len(downstreamReq) 而非 len(body)——翻译后体积可能变化，下游体才是真正发给上游的
-		//   东西。downstreamReq 为 nil 时 len==0，天然安全。
-		// @REASON: agent-proxy-9091.log v0.2.144 — 第一轮走 Responses→CC 翻译路径，上游 502
-		//   "stream read failed: context canceled"，14.95s 后 broken pipe。透传路径早有大请求
-		//   guard（v0.2.73 血泪教训），翻译路径一直缺。非流式 p.Call 不受大请求流式故障影响
-		//   ——它等上游返回完整 JSON，不走 SSE。
-		// @CONSTRAINT: 必须走 handleNonStreamResponseAsSSE 而非 handleNonStreamResponse。
-		//   客户端带 stream:true，期望 SSE；handleNonStreamResponse 回 raw JSON，Codex 解析失败。
-		// @RELATED: LARGE_BODY_SKIP_STREAM（透传路径）、gateway.go 同名 guard（双模式同步）、
-		//   handleNonStreamResponseAsSSE
-		if translationStreamRoute(downstreamReq) {
-			if q.verboseLevel >= 2 {
-				log.Printf("[route] translation stream=true, calling handleStreamRequest")
-			}
-			q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
-		} else {
-			if q.verboseLevel >= 2 {
-				log.Printf("[route] translation stream=true, large body (%d bytes > %d) → use non-stream→SSE",
+		// @AI_GUARD: LARGE_BODY_SKIP_STREAM_TRANSLATION - 翻译路径**不降级**，始终走原生流式
+		// @CONSTRAINT: 此处必须始终调用 handleStreamRequest。禁止按 body 大小降级到
+		//   handleNonStreamResponseAsSSE —— v0.2.146 引入过该降级，v0.2.148 撤回（见 @REASON）。
+		//   分支判断已删除（不留死代码），大请求只多打一行 [route] 日志供观测。
+		// @REASON: agent-proxy-9091.log v0.2.146/v0.2.147（2026-09-15 17:02–17:08）—— Codex 侧
+		//   同时报 10054 与 stream closed before response.completed，4 份 rollout 里 18 轮
+		//   task_complete 的 error 全是同一条。降级把 Responses 出站从
+		//   {"type":"response.created",...} 换成 {"id":...,"object":"response.text_delta","output":[...]}
+		//   —— 无 type 字段、无 created_at、只有 object。grep 整份日志 created_at 出现 0 次、
+		//   "object":"response" 出现 0 次，Codex 拿不到任何合法终态事件。
+		//   同一体量对照：glm-5.2 走 handleStreamRequest 2.6–9.6s 完整收尾、返回真实 usage
+		//   （usage=&{4412 184 4596 0 0}）；走降级路径的 17:08:28 那轮 11s 就拿到合法响应体，
+		//   Codex 却在 17:09:48 报 stream closed → 响应体合法、事件序列不合法。
+		//   v0.2.146 降级要规避的 v0.2.144「502」现场，在 v0.2.144 的 usage 修复之后**已不复现**：
+		//   本次日志窗口内 0 次 502，5 次大请求全部成功。降级是在修一个已被修好的问题，
+		//   而每次降级都必然让 Codex 丢响应。
+		// @CONSTRAINT: 大请求在翻译路径的保活由 WS 心跳（observeHeartbeatState / WritePing，
+		//   v0.2.126 起发合法的空 response.output_text.delta）与 UPSTREAM_STALL_DETECT 承担，
+		//   不需要靠切换调用方式解决。
+		// @RELATED: writeNonStreamAsSSE 的 OpenAI Responses 分支（已修好、但本路径不再使用）、
+		//   gateway.go 同名 guard（本就只打日志不降级，两边现在一致）、UPSTREAM_STALL_DETECT
+		if q.verboseLevel >= 2 {
+			if len(downstreamReq) > largeBodyThreshold {
+				log.Printf("[route] translation stream=true, large body (%d bytes > %d) — 保持原生流式（v0.2.148 撤回降级）",
 					len(downstreamReq), largeBodyThreshold)
+			} else {
+				log.Printf("[route] translation stream=true, calling handleStreamRequest (body=%d bytes, 不降级)",
+					len(downstreamReq))
 			}
-			q.handleNonStreamResponseAsSSE(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 		}
+		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	} else {
 		if q.verboseLevel >= 2 {
 			log.Printf("[route] translation stream=false, calling handleNonStreamResponse")
@@ -2546,29 +2544,131 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 		flusher.Flush()
 	} else if output, ok := respMap["output"]; ok {
 		// ── OpenAI Responses 格式 ──
+		// @AI_GUARD: NONSTREAM_A2S_RESPONSES_EVENTS - Responses 出站必须发「带 type 字段 + event: 前缀」的
+		//   完整事件序列，禁止发 {"object":"response.text_delta",...} 这种裸 chunk。
+		// @CONSTRAINT: 每条帧的 data 载荷必须是 {"type":"<事件名>",...}。Codex 的 WS 路径对整帧做
+		//   serde_json::from_str::<ResponsesStreamEvent>（ws_endpoint.rs:737，无 SSE 解包），靠
+		//   `type` 字段做事件分发；缺 type 一律解析失败被静默丢弃。本分支原先只写 object/
+		//   response/output，既无 type 也无 created_at —— 整个日志窗口 grep created_at 0 次、
+		//   "object":"response" 0 次，Codex 收不到任何合法事件，只看到 WS ping，最终
+		//   stream closed before response.completed / 10054。
+		// @CONSTRAINT: response.completed 必须收尾（带 response.id + response.status + 非空 usage
+		//   三键），且必须在 [DONE] 之前。少了 completed，客户端报
+		//   "stream closed before response.completed"。
+		// @CONSTRAINT: 不能发 response.failed / response.incomplete —— 这两个 kind 在 Codex 的
+		//   process_responses_event 里直接 return Err 中止整个事件循环（其余事件解析失败只是丢弃）。
+		//   上游失败请走 handleNonStreamResponseAsSSE 的 sendUpstreamSSEError 分支，那里发的是
+		//   response.error + response.completed(status=failed)。
+		// @CONSTRAINT: item 形状按 type 补齐必填字段：message 必须带 id/role/content(数组)，
+		//   function_call 必须带 name/arguments(字符串)/call_id；content 为空必须写成 [] 而非 null。
+		// @REASON: v0.2.146 引入 LARGE_BODY_SKIP_STREAM_TRANSLATION 降级后本分支才有 Responses
+		//   调用方（此前只服务 Anthropic/Gemini/CC），bug 潜伏到 2026-09-15 才暴露。v0.2.148
+		//   撤回该降级（见 LARGE_BODY_SKIP_STREAM_TRANSLATION），本分支改为合规事件序列，
+		//   防止将来任何调用方再次复用本路径时复发。
+		// @RELATED: internal/protocol/responses/translator.go 的 TranslateStream（本路径的合规范本）、
+		//   sendResponsesSSEError、unwrapWSSEFrame
 		outputArr, ok := output.([]interface{})
 		if !ok {
 			outputArr = []interface{}{}
 		}
+		respID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
+		if idRaw, ok := respMap["id"].(string); ok && idRaw != "" {
+			respID = idRaw
+		}
+		finishReason := "stop"
+		if frRaw, ok := respMap["finish_reason"].(string); ok && frRaw != "" {
+			finishReason = frRaw
+		}
+		// 非流式响应里没有 finish_reason 时，有工具调用则视为 function_call
 		for _, itemAny := range outputArr {
-			itemMap, ok := itemAny.(map[string]interface{})
+			if im, ok := itemAny.(map[string]interface{}); ok && im["type"] == "function_call" {
+				finishReason = "function_call"
+			}
+		}
+
+		normalizeItem := func(itemAny interface{}) interface{} {
+			im, ok := itemAny.(map[string]interface{})
 			if !ok {
-				continue
+				return itemAny
 			}
-			chunk := map[string]interface{}{
-				"id":       fmt.Sprintf("resp_%d", time.Now().UnixNano()),
-				"object":   "response.text_delta",
-				"response": map[string]interface{}{"id": itemMap["id"], "model": effectiveModel},
-				"output":   []interface{}{itemMap},
-				"usage":    itemMap["usage"],
+			switch im["type"] {
+			case "message":
+				if _, ok := im["id"]; !ok || im["id"] == "" {
+					im["id"] = fmt.Sprintf("msg_%d", time.Now().UnixNano())
+				}
+				if _, ok := im["role"]; !ok || im["role"] == "" {
+					im["role"] = "assistant"
+				}
+				if _, ok := im["content"]; !ok {
+					im["content"] = []interface{}{}
+				}
+				if _, ok := im["status"]; !ok {
+					im["status"] = "completed"
+				}
+			case "function_call":
+				if _, ok := im["id"]; !ok || im["id"] == "" {
+					im["id"] = fmt.Sprintf("call_%d", time.Now().UnixNano())
+				}
+				if _, ok := im["call_id"]; !ok || im["call_id"] == "" {
+					im["call_id"] = im["id"]
+				}
+				if _, ok := im["arguments"]; !ok {
+					im["arguments"] = ""
+				}
 			}
-			chunkJSON, err := json.Marshal(chunk)
+			return im
+		}
+		items := make([]interface{}, 0, len(outputArr))
+		for _, itemAny := range outputArr {
+			items = append(items, normalizeItem(itemAny))
+		}
+
+		writeResponseEvent := func(eventType string, fields map[string]interface{}) bool {
+			fields["type"] = eventType
+			b, err := json.Marshal(fields)
 			if err != nil {
-				continue
+				return false
 			}
-			if !writeSSE(w, []byte("data: "+string(chunkJSON)+"\n\n")) {
+			return writeSSE(w, []byte("event: "+eventType+"\ndata: "+string(b)+"\n\n"))
+		}
+
+		// response.created —— 让客户端确认连接活着并拿到 response.id
+		// 载荷形状与 responses/translator.go 的 sendCreated 保持一致（不带 object）。
+		if !writeResponseEvent("response.created", map[string]interface{}{
+			"response": map[string]interface{}{
+				"id": respID, "status": "in_progress", "model": effectiveModel,
+			},
+		}) {
+			return usage
+		}
+		// 每个 output item 一对 added/done；done 紧跟 added，非增量流不需要中间 delta。
+		// output_index 取数组下标（translator 用 message=0、function_call=1..N，这里同理）。
+		for i, item := range items {
+			ev := map[string]interface{}{"item": item, "output_index": i}
+			if !writeResponseEvent("response.output_item.added", ev) {
 				return usage
 			}
+			if !writeResponseEvent("response.output_item.done", ev) {
+				return usage
+			}
+		}
+		// response.completed —— 全流唯一终态。usage 三键必须齐全且为数字，不能省略。
+		usageMap := map[string]interface{}{
+			"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+		}
+		if usage != nil {
+			usageMap["input_tokens"] = usage.PromptTokens
+			usageMap["output_tokens"] = usage.CompletionTokens
+			usageMap["total_tokens"] = usage.TotalTokens
+		}
+		if !writeResponseEvent("response.completed", map[string]interface{}{
+			"response": map[string]interface{}{
+				"id": respID, "status": "completed", "model": effectiveModel,
+				"output": items, "usage": usageMap, "finish_reason": finishReason,
+				"incomplete_details": map[string]interface{}{"reason": nil},
+			},
+		}) {
+			return usage
 		}
 		if !writeSSE(w, []byte("data: [DONE]\n\n")) {
 			return usage
