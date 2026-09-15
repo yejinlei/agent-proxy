@@ -322,7 +322,20 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	// ── 执行 Provider 调用 ──
 	ctx := r.Context()
 	if stream {
-		if g.verboseLevel >= 2 {
+		// @AI_GUARD: LARGE_BODY_SKIP_STREAM_TRANSLATION - 翻译路径大请求诊断（仅日志，不降级）
+		// @CONSTRAINT: 与 quick.go 同名 guard 是**有意分叉**：quick.go 有大请求→非流式SSE
+		//   降级，gateway.go 没有 handleNonStreamResponseAsSSE 包装函数，无法降级，只能
+		//   打日志观测。与本文件透传路径的 LARGE_BODY_SKIP_STREAM（line ~269）同一模式。
+		//   要真正降级需先给 gateway.go 补 handleNonStreamResponseAsSSE，属独立工作量。
+		// @REASON: 见 quick.go 同名 guard 的 @REASON（v0.2.144 翻译路径 502 现场）。
+		// @RELATED: quick.go LARGE_BODY_SKIP_STREAM_TRANSLATION（真正降级的那一侧）、
+		//   本文件透传路径 LARGE_BODY_SKIP_STREAM（同为 log-only）
+		if len(downstreamReq) > largeBodyThreshold {
+			if g.verboseLevel >= 2 {
+				log.Printf("[route] translation stream=true, large body (%d bytes > %d) — no non-stream→SSE wrapper in gateway.go, staying on stream path",
+					len(downstreamReq), largeBodyThreshold)
+			}
+		} else if g.verboseLevel >= 2 {
 			log.Printf("[route] translation stream=true, calling handleStreamRequest")
 		}
 		g.handleStreamRequest(ctx, w, r, providerClient, callInfo, downstreamReq, providerTranslator, ingressTranslator, ingressProtocol, internalReq, startTime)

@@ -75,6 +75,21 @@ type QuickGateway struct {
 // @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n、: heartbeat\n\n、data: {"type":"ping"}，各有问题
 var heartbeatEvent = []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
+// largeBodyThreshold 是「大请求跳过原生流式」的阈值：超过此字节数直接走非流式→SSE 包装。
+// 阈值依据与 @REASON 见 LARGE_BODY_SKIP_STREAM guard；本处只定义常量，两处（透传 + 翻译）共用。
+const largeBodyThreshold = 100 * 1024 // 100KB
+
+// translationStreamRoute 判定翻译路径是否走原生流式。
+//
+// 返回 true = 走 handleStreamRequest（原生流式），false = 走 handleNonStreamResponseAsSSE。
+// 判据与 @REASON 见 LARGE_BODY_SKIP_STREAM_TRANSLATION guard，本处不重复。
+//
+// 抽成纯函数便于单测锁住阈值边界：直接内联在路由分支里会让「大请求是否降级」
+// 只能靠 e2e 或肉眼确认。
+func translationStreamRoute(downstreamReq json.RawMessage) bool {
+	return len(downstreamReq) <= largeBodyThreshold
+}
+
 // upstreamStallTimeout 是「translator 侧静默多久判定上游无响应、强制收尾」的阈值。
 // 由 UPSTREAM_STALL_DETECT 的 @CONSTRAINT 定义取值依据，本处不重复。
 const upstreamStallTimeout = 60 * time.Second
@@ -600,7 +615,7 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 				//          probe 用小请求测得 SSE=345ms 选择了流式，但实际大请求流式需 12-18s 才失败。
 				//          客户端等不及断开连接（broken pipe），fallback 即使成功也写不回去。
 				//          阈值 100KB：超过此大小直接走非流式 SSE 包装，避免长等待。
-				const largeBodyThreshold = 100 * 1024 // 100KB
+				// @RELATED: LARGE_BODY_SKIP_STREAM_TRANSLATION（翻译路径同名 guard，用同一阈值）
 				if len(body) > largeBodyThreshold {
 					if q.verboseLevel >= 2 {
 						log.Printf("[route] stream=true, large body (%d bytes > %d) → use non-stream→SSE", len(body), largeBodyThreshold)
@@ -673,10 +688,30 @@ func (q *QuickGateway) handleRequest(w http.ResponseWriter, r *http.Request, ing
 		log.Printf("[diag] translation path produced nil downstreamReq (providerType=%s) — 请求将无法发送", providerType)
 	}
 	if stream {
-		if q.verboseLevel >= 2 {
-			log.Printf("[route] translation stream=true, calling handleStreamRequest")
+		// @AI_GUARD: LARGE_BODY_SKIP_STREAM_TRANSLATION - 翻译路径大请求跳过原生流式
+		// @CONSTRAINT: 与 LARGE_BODY_SKIP_STREAM（透传路径）共用 largeBodyThreshold。判据用
+		//   len(downstreamReq) 而非 len(body)——翻译后体积可能变化，下游体才是真正发给上游的
+		//   东西。downstreamReq 为 nil 时 len==0，天然安全。
+		// @REASON: agent-proxy-9091.log v0.2.144 — 第一轮走 Responses→CC 翻译路径，上游 502
+		//   "stream read failed: context canceled"，14.95s 后 broken pipe。透传路径早有大请求
+		//   guard（v0.2.73 血泪教训），翻译路径一直缺。非流式 p.Call 不受大请求流式故障影响
+		//   ——它等上游返回完整 JSON，不走 SSE。
+		// @CONSTRAINT: 必须走 handleNonStreamResponseAsSSE 而非 handleNonStreamResponse。
+		//   客户端带 stream:true，期望 SSE；handleNonStreamResponse 回 raw JSON，Codex 解析失败。
+		// @RELATED: LARGE_BODY_SKIP_STREAM（透传路径）、gateway.go 同名 guard（双模式同步）、
+		//   handleNonStreamResponseAsSSE
+		if translationStreamRoute(downstreamReq) {
+			if q.verboseLevel >= 2 {
+				log.Printf("[route] translation stream=true, calling handleStreamRequest")
+			}
+			q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
+		} else {
+			if q.verboseLevel >= 2 {
+				log.Printf("[route] translation stream=true, large body (%d bytes > %d) → use non-stream→SSE",
+					len(downstreamReq), largeBodyThreshold)
+			}
+			q.handleNonStreamResponseAsSSE(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 		}
-		q.handleStreamRequest(p, ctx, w, downstreamReq, providerTranslator, ingressTranslator, internalReq, startTime)
 	} else {
 		if q.verboseLevel >= 2 {
 			log.Printf("[route] translation stream=false, calling handleNonStreamResponse")
@@ -2810,7 +2845,23 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
 	upstreamStart := time.Now()
-	resp, headers, err := p.Call(callCtx, downstreamReq, q.info)
+	// @AI_GUARD: NONSTREAM_AS_SSE_STREAM_FLAG - 非流式调用前必须去掉 stream 标记 + 应用字段过滤
+	// @CONSTRAINT: p.Call 是非流式调用（等完整 JSON 返回），但调用方（LARGE_BODY_SKIP_STREAM_TRANSLATION
+	//   的降级路由）传进来的 downstreamReq 仍带 "stream":true——那是**客户端**的诉求，不是上游的。
+	//   不剥掉，上游会把流式 SSE 塞进 p.Call 的 body 解析路径，响应体是 SSE 事件而非 JSON，
+	//   TranslateFromProvider 反序列化失败。剥法与 handlePassthroughNonStreamAsSSE 一致
+	//   （quickRemoveStreamFlag），不是另起一套。
+	// @CONSTRAINT: applyRequestStripper 同样在此处补上——翻译路径的 downstreamReq 由 translateToProvider
+	//   重建（buildCCRequest / TranslateToProvider），从未经过透传入口的字段过滤。此函数是翻译路径
+	//   唯一真正调用 p.Call 的包装点，补在这里覆盖面最大；stream:true 的剥除必须在此之前，
+	//   否则 stripper 可能把已改写的字段又按原形态处理。
+	// @REASON: v0.2.146 引入 LARGE_BODY_SKIP_STREAM_TRANSLATION 后本函数从「无调用方」变成有调用方，
+	//   这个潜在 bug 才暴露。此前 0 调用方，所以历史上没炸。
+	// @RELATED: handlePassthroughNonStreamAsSSE（透传路径同类处理，已正确）、quickRemoveStreamFlag、
+	//   applyRequestStripper、LARGE_BODY_SKIP_STREAM_TRANSLATION
+	nsBody := quickRemoveStreamFlag(downstreamReq)
+	nsBody = q.applyRequestStripper(nsBody)
+	resp, headers, err := p.Call(callCtx, nsBody, q.info)
 	cancel()
 	if q.verboseLevel >= 2 {
 		log.Printf("[upstream] Call %s → %v", internalReq.Model, time.Since(upstreamStart))

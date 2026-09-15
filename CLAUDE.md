@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 98 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 236 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 101 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 240 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -325,8 +325,11 @@ grep -rn "@REASON:" internal/
 | `PASSTHROUGH_STREAM` | quick.go | 透传流式 |
 | `NONSTREAM_RESPONSE` | quick.go | 翻译路径非流式→JSON |
 | `NONSTREAM_RESPONSE_AS_SSE` | quick.go | 翻译路径非流式→SSE |
+| `NONSTREAM_AS_SSE_STREAM_FLAG` | quick.go | `handleNonStreamResponseAsSSE` 调 `p.Call` 前必须 `quickRemoveStreamFlag` + `applyRequestStripper`。`p.Call` 是非流式（等完整 JSON），但 `LARGE_BODY_SKIP_STREAM_TRANSLATION` 降级路由传来的 `downstreamReq` 仍带 `"stream":true`（客户端诉求）——不剥掉，上游按流式回 SSE 体，`TranslateFromProvider` 反序列化失败。剥法与 `handlePassthroughNonStreamAsSSE` 同一函数，不另起一套。v0.2.146 前该函数 0 调用方，bug 潜伏；降级路由引入后才暴露。`stream` 字段 wire form 是 `"stream":true`（Go 无空格），与替换字符串一字节偏差就静默失效，`nonstream_sse_flag_test.go` 用 `buildCCRequest` 真实产物体锁定 |
 | `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
 | `UPSTREAM_STALL_DETECT` | quick.go + gateway.go | 上游 SSE 流连续静默超过 `upstreamStallTimeout`（60s）必须主动断流。**判据是 `lines` channel idle**，包装在 `stallTimeoutChan`（quick.go 定义，gateway.go 复用）：超时后关闭输出 channel → 生产者 `for line := range` 退出 → `defer close(events)` → `TranslateStream` 走 channel 关闭分支补发完整终止序列。禁止改为 `cancel(ctx)`（走 ctx.Done 分支语义是「客户端断连」，且让 END 日志失去区分度）。60s 依据：感诺冷启动首 token 2.4~12.0s、单轮长推理 10~35s，60s 是正常最长静默的 2 倍。v0.2.144 前只靠 `q.timeout`（300s）兜底，感诺挂起时 goroutine + 上游连接一直被占着，WS 心跳把连接养活着反而阻止 Codex 自己判死 → 表现为无限 working |
+| `LARGE_BODY_SKIP_STREAM` | quick.go | 透传路径大请求跳过原生流式。`len(body) > largeBodyThreshold`（100KB）时改走 `handlePassthroughNonStreamAsSSE`（上游 `p.Call` 非流式 + SSE 包装出站），避免感诺对 >100KB 请求的流式 502。阈值常量在 quick.go 包级定义，翻译路径共用 |
+| `LARGE_BODY_SKIP_STREAM_TRANSLATION` | quick.go + gateway.go | 翻译路径大请求同样跳过原生流式。**quick.go 真降级**：`translationStreamRoute(downstreamReq)` 判 `len(downstreamReq) <= largeBodyThreshold`，超阈值走 `handleNonStreamResponseAsSSE`（必须走这个而非 `handleNonStreamResponse`——客户端带 `stream:true` 期望 SSE，回 raw JSON 会让 Codex 解析失败）。**gateway.go 只打日志**：本文件没有 `handleNonStreamResponseAsSSE` 包装函数，无法降级，与本文件透传路径的 `LARGE_BODY_SKIP_STREAM` 同一模式（log-only）。要真降级需先给 gateway.go 补该包装函数，属独立工作量。**判据用 `len(downstreamReq)` 而非 `len(body)`**——翻译后体积可能变化，下游体才是真正发给上游的东西；nil 时 len==0 天然安全。v0.2.144 前翻译路径完全没有此 guard，只有透传路径有 |
 | `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
 | `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`event: ping\ndata: {"type":"ping"}\n\n`，必须带 `event:` 前缀） |
