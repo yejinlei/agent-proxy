@@ -1011,6 +1011,14 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 	close(callDone1) // 停止阶段 1 心跳
 	<-callFinished1  // 等待心跳 goroutine 退出
 
+	// @AI_GUARD: UPSTREAM_STALL_DETECT - 上游静默必须主动断流，不能只靠全局超时兜底
+	// @CONSTRAINT: 与 quick.go handleStreamRequest 同一逻辑，必须保持同步。
+	// @REASON: agent-proxy-9091.log v0.2.144 — 感诺挂起后代理靠 q.timeout（300s）兜底，
+	//   goroutine + 上游连接一直被占着；WS 心跳把连接养活着反而阻止 Codex 自己判死。
+	//   取 60s（quick.go 的 upstreamStallTimeout 同值），判据与收尾路径见 quick.go 同名 guard。
+	// @RELATED: quick.go handleStreamRequest UPSTREAM_STALL_DETECT、stallTimeoutChan
+	lines = stallTimeoutChan(lines, streamCtx, upstreamStallTimeout, info.Name, "gateway-stream")
+
 	if err != nil {
 		// SSE 错误事件，避免 superfluous response.WriteHeader
 		if g.verboseLevel >= 2 {

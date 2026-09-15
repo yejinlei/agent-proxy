@@ -75,6 +75,55 @@ type QuickGateway struct {
 // @REASON: 历史血泪教训 - 先后尝试过 data: \n\n、data: {}\n\n、: heartbeat\n\n、data: {"type":"ping"}，各有问题
 var heartbeatEvent = []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 
+// upstreamStallTimeout 是「translator 侧静默多久判定上游无响应、强制收尾」的阈值。
+// 由 UPSTREAM_STALL_DETECT 的 @CONSTRAINT 定义取值依据，本处不重复。
+const upstreamStallTimeout = 60 * time.Second
+
+// stallTimeoutChan 包装上游 SSE 行 channel：连续 idle 超过 d 就关闭输出 channel。
+//
+// 关闭是让下游 `for line := range` 正常退出的信号——生产者 goroutine 的
+// defer close(events) 随后触发，TranslateStream 走 channel 关闭分支补发完整终止序列。
+// 用关闭而非 cancel(ctx)，是为了让收尾路径与「上游正常结束」一致，且保留
+// TranslateStream END 日志的区分度。
+//
+// 返回的 channel 在 ctx 取消、上游 EOF、或 idle 超时三种情况下都会被关闭，
+// 三种情况对下游不可区分（都是「上游没了」），语义上也不需要区分。
+func stallTimeoutChan(src <-chan json.RawMessage, ctx context.Context, d time.Duration, proxyName, label string) <-chan json.RawMessage {
+	out := make(chan json.RawMessage, 16)
+	go func() {
+		defer close(out)
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case line, ok := <-src:
+				if !ok {
+					return
+				}
+				// 重置 idle 计时；timer 可能已到期但还没被读走，先排空再 Reset
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(d)
+				select {
+				case out <- line:
+				case <-ctx.Done():
+					return
+				}
+			case <-timer.C:
+				log.Printf("[%s-stall] upstream silent for %v, forcing stream close (%s)", label, d, proxyName)
+				return
+			}
+		}
+	}()
+	return out
+}
+
 // applyRequestStripper 应用上游类型自适应的请求字段过滤（未配置 stripper 时原样返回）
 // @AI_GUARD: PASSTHROUGH_REQUEST_FILTER - 所有透传入口点必须调用此方法
 func (q *QuickGateway) applyRequestStripper(body json.RawMessage) json.RawMessage {
@@ -2933,6 +2982,27 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 	}
 	close(callDone1) // 停止阶段 1 心跳
 	<-callFinished1  // 等待心跳 goroutine 退出
+
+	// @AI_GUARD: UPSTREAM_STALL_DETECT - 上游静默必须主动断流，不能只靠全局超时兜底
+	// @CONSTRAINT: 静默判据是「上游 SSE 流连续 idle 超过 upstreamStallTimeout」。包装在
+	//   lines channel 上：超时后包装层关闭输出 channel，生产者 goroutine 的 range 退出、
+	//   defer close(events) 触发，TranslateStream 走 channel 关闭分支补发完整终止序列
+	//   （response.completed + event:done/[DONE]）。禁止改为 cancel() 上游 ctx：那走
+	//   ctx.Done 分支语义是「客户端断连」而非「上游无响应」，且让 END 日志失去区分度。
+	// @REASON: agent-proxy-9091.log v0.2.144 — 12:05:03 一条 WS 连接收到 response.created +
+	//   output_item.added 后上游再无任何事件，无 TranslateStream END、无 [request] total，
+	//   WS 心跳 36 次连续 2 分 50 秒全 err=<nil>。代理靠 q.timeout（默认 300s）兜底，
+	//   期间 goroutine + 上游 HTTP 连接一直被占着，感诺每次挂都留一个。Codex 侧表现为
+	//   无限 working；WS 心跳把连接养活着反而阻止 Codex 自己判死。
+	// @CONSTRAINT: upstreamStallTimeout 取 60s。感诺冷启动首 token 实测 2.4~12.0s、
+	//   单轮长推理 10~35s（见 WS_HEARTBEAT_INTERVAL 的 @REASON），60s 是正常最长静默的
+	//   2 倍。放大拉长泄漏窗口，放小误杀长推理。
+	// @CONSTRAINT: 本包装不阻塞生产者——若生产者被 events 缓冲满卡住、读不到本 channel，
+	//   说明上游仍在流动，静默判断不成立（包装层的 out<- 也会同时阻塞，不会误触发）。
+	// @RELATED: gateway.go handleStreamRequest（同一逻辑，必须保持同步）、
+	//   protocol/responses/translator.go channel 关闭分支（收尾路径）、
+	//   WS_HEARTBEAT_INTERVAL（静默期与保活的取舍）
+	lines = stallTimeoutChan(lines, callCtx, upstreamStallTimeout, q.proxyName, "stream")
 
 	if err != nil {
 		// SSE 头已设置，不能调用 sendError，直接写 SSE 错误事件

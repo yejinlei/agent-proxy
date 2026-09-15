@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 97 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 234 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 98 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 236 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -326,6 +326,7 @@ grep -rn "@REASON:" internal/
 | `NONSTREAM_RESPONSE` | quick.go | 翻译路径非流式→JSON |
 | `NONSTREAM_RESPONSE_AS_SSE` | quick.go | 翻译路径非流式→SSE |
 | `HANDLE_STREAM_REQUEST` | quick.go | 翻译路径流式处理 |
+| `UPSTREAM_STALL_DETECT` | quick.go + gateway.go | 上游 SSE 流连续静默超过 `upstreamStallTimeout`（60s）必须主动断流。**判据是 `lines` channel idle**，包装在 `stallTimeoutChan`（quick.go 定义，gateway.go 复用）：超时后关闭输出 channel → 生产者 `for line := range` 退出 → `defer close(events)` → `TranslateStream` 走 channel 关闭分支补发完整终止序列。禁止改为 `cancel(ctx)`（走 ctx.Done 分支语义是「客户端断连」，且让 END 日志失去区分度）。60s 依据：感诺冷启动首 token 2.4~12.0s、单轮长推理 10~35s，60s 是正常最长静默的 2 倍。v0.2.144 前只靠 `q.timeout`（300s）兜底，感诺挂起时 goroutine + 上游连接一直被占着，WS 心跳把连接养活着反而阻止 Codex 自己判死 → 表现为无限 working |
 | `STREAM_REQUEST_AS_NONSTREAM` | quick.go | 流式→非流式 JSON |
 | `NONSTREAM_AS_SSE` | quick.go | 4 种协议拆分逻辑 |
 | `SSE_HEARTBEAT_FORMAT` | quick.go | 心跳格式（`event: ping\ndata: {"type":"ping"}\n\n`，必须带 `event:` 前缀） |
