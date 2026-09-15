@@ -241,7 +241,7 @@ grep -rn "@CONSTRAINT:" internal/
 grep -rn "@REASON:" internal/
 ```
 
-**已标记的关键约束点（本表收录 91 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 217 处标记，本表只列核心项）：**
+**已标记的关键约束点（本表收录 97 项；`grep -rhoE "@AI_GUARD: [A-Z_]+" internal/ | wc -l` 实际有 234 处标记，本表只列核心项）：**
 
 | 类别 | 文件 | 约束 |
 |------|------|------|
@@ -262,6 +262,8 @@ grep -rn "@REASON:" internal/
 | `ANTHROPIC_TRANSLATE_REQUEST` | anthropic/translator.go | Anthropic → InternalRequest 消息格式转换 |
 | `ANTHROPIC_TRANSLATE_RESPONSE` | anthropic/translator.go | InternalResponse → Anthropic 消息格式转换，usage 必须为非空对象（Claude Code 校验 K.usage.input_tokens） |
 | `ANTHROPIC_TRANSLATE_STREAM` | anthropic/translator.go | SSE 事件生命周期（Claude Code 兼容，message_start.id 必填、output_tokens 必须为 0、message_delta 必须始终发送） |
+| `ANTHROPIC_USAGE_ONLY_FRAME` | anthropic/translator.go | **流式 usage 的唯一来源是 `choices:[]` 的独立尾帧**（OpenAI 系含感诺把它放在 finish 帧之后、`[DONE]` 之前）。`case "done"` 与 channel 关闭分支都必须先做 `finishUsageWait`（100ms）有界等待再收尾，禁止直接发完终态就 return。感诺只声明 `capabilities:["openai"]`，`/v1/messages` 入站必然走翻译路径——本翻译器是 Claude Code 拿到 usage 的唯一出口。v0.2.143 及之前 `case "done"` 的 `if usage != nil` 在感诺恒为 false（finish 帧不带 usage）→ **只发 `message_delta` 不发 `message_stop`**，违反 Anthropic 事件生命周期 |
+| `ANTHROPIC_TERMINAL_ONCE` | anthropic/translator.go | 终态序列（`content_block_stop` → `message_delta` → `message_stop`）由 `sendTerminal` 闭包统一发出，`terminalSent` 保证 `case "done"` / channel 关闭 / `ctx.Done` 三条路径下**恰好发一次**。`message_stop` 必须无条件发送，绝不能只在 `usage != nil` 时发 |
 | `MESSAGE_START_CONTENT` | anthropic/translator.go | Content 必须 `[]ContentBlock{}` |
 | `CONTENT_BLOCK_START_BEFORE_DELTA` | anthropic/translator.go | `citations: []` 必须存在 |
 | `TRANSLATE_STREAM_EVENT` | anthropic/translator.go | 上游 Anthropic SSE → InternalStreamEvent |
@@ -275,6 +277,8 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TRANSLATE_RESPONSE` | responses/translator.go | InternalResponse → Responses 消息格式转换，status 必须从 finish_reason 动态映射，usage 必须为非空对象 |
 | `RESPONSES_TRANSLATE_STREAM` | responses/translator.go | Responses SSE 流式出口（Codex 兼容，必须生成完整事件序列：response.created → output_item.added → output_text.delta → output_item.done → response.completed） |
 | `RESPONSES_TRANSLATE_STREAM_EVENT` | responses/translator.go | 上游 Responses SSE → InternalStreamEvent |
+| `RESPONSES_USAGE_ONLY_FRAME` | responses/translator.go | **流式 usage 的唯一来源是 `choices:[]` 的独立尾帧**。`case "done"` 禁止直接 `sendCompleted()` + `return`——必须先做 `doneUsageWait`（100ms）有界等待取尾帧，再统一收尾；channel 关闭分支同样要补等。`case "usage"` 负责「上游不发 finish 帧、只发 delta 后直接给 usage」的退化形态。**实测感诺 finish 帧与 usage 帧连发（间隔 0ms），故 100ms 是收尾兜底而非等待机制，不得放大**。这是 Codex 历史无界增长的第二半根因：前半是 `buildCCRequest` 按上游类型把 `stream_options` 置 nil（`CC_STREAM_OPTIONS_SENSENOVA`，该 guard 的归因写错了）；Codex 的 `auto_compact_scope_tokens` 严格等于 `total_usage_tokens`（实测 223/223 精确相等），usage=0 → 阈值 0 → 自动压缩永不触发 → 历史无界增长 → 撞 body 上限 |
+| `RESPONSES_COMPLETED_ONCE` | responses/translator.go | `response.completed` 是全流唯一终态，`completedSent` 保证 `case "done"` 与 `case "usage"` 都可能触发 `sendCompleted` 时只发一次（Codex 状态机只认一个终态） |
 | `RESPONSES_INPUT_ITEM_TYPES` | responses/types.go + translator.go | 入站 input 必须识别 `function_call`/`function_call_output`/`reasoning` item，禁止整条丢弃（Codex 工具回灌历史靠它） |
 | `RESPONSES_FC_ROLE_DEFAULT` | responses/translator.go | 入站 item 缺 `role` 必须补默认（`function_call`→assistant；`input_text` 块→user；其余→assistant），否则上游 400 `Messages[N].Role invalid` |
 | `RESPONSES_FILTER_BUILTIN_TOOLS` | responses/translator.go | 入站 tools 只拦「`type=="function"` 且 name 为空」；其余（`custom`/`web_search`/`tool_search` 等）全部进 `InternalTool`，禁止 type 白名单丢弃 |
@@ -286,6 +290,7 @@ grep -rn "@REASON:" internal/
 | `RESPONSES_TOOL_SEARCH_VALIDITY` | responses/translator.go | 流式 `tool_search` 的 item type 由**完整参数**决定，禁止按首片参数锁定：真实上游把 tool_call 参数拆成多片，首片常为空或 JSON 前缀（单独 Unmarshal 必失败），锁定会把合法调用永久降级成 `function_call` → Codex 以 `ToolPayload::Function` 派发到 `ToolSearchHandler` → Fatal。`SearchValid` 创建 fc 时钉 `false`，added **必须延后**（`sendOutputItemAddedEarly` 对 `Search` 跳过，`closeFuncCall` 重判后补发），保证 added/done 同型。added 的 item 只用于注册（Codex `handle_non_tool_response_item` 对 `ToolSearchCall` 返回 None），不带 `arguments`；done / `response.completed` 的 `arguments` 必须始终存在且是对象，null 会让 `SearchToolCallParams.query` 缺失 |
 | `RESPONSES_TOOL_SEARCH_BRIDGE` | responses/tool_search.go + translator.go | Codex 的 `tool_search` 出站改写：`function_call(name="tool_search")` → `type:"tool_search_call"` + `execution:"client"` + `arguments:<对象>`（不是字符串）。**必须与入站合成配套**（`CC_TOOL_SEARCH_SYNTHESIS`）：单边任一侧都会让 Codex 拿到无法派发/反序列化的 item（Router 只把 `ToolSearchCall` 解析成 `ToolPayload::ToolSearch`，`FunctionCall` 一律解析成 `ToolPayload::Function`）。不发 `function_call_arguments.*` 事件（同 custom 约定）。非法 arguments 保留 `function_call` 而非退化成 `tool_search_call`（Codex 一定拒绝后者） |
 | `CC_CUSTOM_TOOL_SYNTHESIS` | gateway.go (buildCCRequest) | CC 侧唯一合成点：`IsCustom` 工具合成 `exec_<原名>` 的 JSON 函数（`{input:string}` schema）；CC 无法表达的类型必须丢弃并打日志，不得静默；禁止按 `tool.Type` 白名单丢弃 |
+| `CC_STREAM_OPTIONS_SENSENOVA` | gateway.go (buildCCRequest) | `stream_options:{include_usage:true}` 必须**无条件**注入，包括感诺（token.sensenova.cn / api.sensenova.com），它是流式 usage 的唯一开关。**禁止按上游类型把 `streamOptions` 置 nil**——v0.2.142 前的实现这么做，注释归因写错了：该 guard 声称感诺「拒绝该未知字段 → HTTP 400 Invalid request format」，但用代理真实 `buildCCRequest` 输出体直连实测：F1 原样=200 无 usage、F2 加 `stream_options`=200 有 usage、F3 把 `system` 改成 `developer`=400。**真凶是 `role:"developer"`，不是 `stream_options`**；感诺在所有开通模型上接受 `stream_options` 甚至容忍其内未知键，而本函数第 1411 行硬编码 `"system"`、`mapRoleToCC` 把 developer→system，代理从不发 developer。该 guard 的报错文本「Invalid request format」在感诺 0 次复现，实测 400 全是「inference request is invalid」。`root_cause_test.go` 用 `TestCodex_StreamOptionsAlwaysInjected` + `TestBuildCCRequest_NeverEmitsDeveloperRole` 双向锁定 |
 | `CC_TOOL_SEARCH_SYNTHESIS` | gateway.go (buildCCRequest) | v0.2.142 起 `type:"tool_search"` 合成 CC function（name 字面量 `"tool_search"`，与 Codex 侧 `TOOL_SEARCH_TOOL_NAME` 常量逐字节一致），description/parameters 原样透传。**必须与出站改写配套**（`RESPONSES_TOOL_SEARCH_BRIDGE`）：单边合成会让 Codex 以 `ToolPayload::Function` 派发到 `ToolSearchHandler`，直接 Fatal `unsupported payload` |
 | `INTERNAL_TOOL_RAW` | schema/internal.go | `Raw`/`IsCustom` 承接非 function 工具（`json:"-"`），禁止在入站翻译时按 type 丢弃 |
 | `INTERNAL_RESPONSE_CUSTOM_NAMES` | schema/internal.go | 非流式出站 custom 工具名表通道（`TranslateResponse` 无 ctx）；其他协议读不到即走纯 `function_call`，无副作用 |
@@ -329,6 +334,7 @@ grep -rn "@REASON:" internal/
 | `THINKING_BLOCK_FILTER` | quick.go | thinking 块过滤 |
 | `TRANSLATE_STREAM_EVENT_SIGNATURE` | quick.go | 签名必须 `json.RawMessage` |
 | `TRANSLATE_STREAM_OUTPUT` | quick.go | Anthropic SSE 事件序列 |
+| `CC_USAGE_ONLY_FRAME` | quick.go + gateway.go | OpenAI 兼容上游（含感诺）把 `stream_options.include_usage` 的统计量放在**独立尾帧 `choices:[]` + `usage`**，位置在 finish 帧之后、`[DONE]` 之前。解析出该帧时必须发一条 `Type:"usage"` 的 `InternalStreamEvent`，**绝不能 `continue` 跳过**。该事件必须排在 start/delta/done 之后发出。这是流式 usage 的唯一来源；丢掉 → 下游 usage 恒 0 → Codex `auto_compact_scope_tokens` 恒 0 → 自动压缩永不触发。quick.go（流式 + `handleStreamRequestAsNonStream` 聚合）与 gateway.go 三处都必须同步 |
 | `NONSTREAM_RESPONSE_HEADERS` | quick.go | 翻译路径非流式→JSON 的下游响应头透传必须过滤 `Content-Length`（Go 在 `WriteHeader(200)` 后按翻译体重算 CL，透传上游 CL = 头按上游体算、体是翻译后的 → 客户端 IncompleteRead）；全仓 9 个转发点（quick.go 6 + gateway.go 3）都必须过滤，`header_forward_test.go` 用 AST 锁定 |
 | `NONSTREAM_A2S_HEADERS` | quick.go | 翻译路径非流式→SSE 的下游响应头透传同样必须过滤连接管理 header（与 `NONSTREAM_RESPONSE_HEADERS` 同一规则，WriteHeader 已在 SSE 阶段发出） |
 | `STREAM_RESPONSE_HEADERS` | quick.go | 两条流式路径的下游响应头透传必须过滤（上游 CL 按上游体算，本路径写 SSE 自身体） |

@@ -132,9 +132,16 @@ func TestDeveloperToSystem(t *testing.T) {
 	t.Logf("✅ developer → system")
 }
 
-// TestCodex_SensenovaStreamOptionsFilter 验证 sensenova 翻译路径上 buildCCRequest 不再注入 stream_options
-// （Codex 400 "Invalid request format" 根因）
-func TestCodex_SensenovaStreamOptionsFilter(t *testing.T) {
+// TestCodex_StreamOptionsAlwaysInjected 验证 stream_options 对任何上游都必须注入。
+//
+// @AI_GUARD: CC_STREAM_OPTIONS_SENSENOVA - 回归 v0.2.142 的错误归因
+// @REASON: 旧测试断言「sensenova 上游必须省略 stream_options」，据说是修复
+//   Codex 400 "Invalid request format"。该归因错误：直连实测代理真实 buildCCRequest 输出体，
+//   原样发 = 200 但无 usage，加 stream_options = 200 且有 usage，把 system 改成 developer = 400。
+//   真凶是 role:"developer"（本函数已 mapRoleToCC 映射成 system），与 stream_options 无关。
+//   省略 stream_options 的代价是感诺上游永不回 usage → Codex auto_compact 阈值恒 0 → 历史无界增长。
+// @CONSTRAINT: 两个上游都必须带 stream_options.include_usage=true。禁止按 baseURL 分支省略。
+func TestCodex_StreamOptionsAlwaysInjected(t *testing.T) {
 	content := json.RawMessage(`"hi"`)
 	ir := &schema.InternalRequest{
 		Model:    "sensenova-6.8-flash-lite",
@@ -146,25 +153,64 @@ func TestCodex_SensenovaStreamOptionsFilter(t *testing.T) {
 		},
 	}
 
-	// sensenova 上游：stream_options 必须省略
-	cc := buildCCRequest(ir, "https://token.sensenova.cn/v1")
-	raw, _ := json.Marshal(cc)
+	hasStreamOptions := func(raw []byte) bool {
+		var decoded map[string]interface{}
+		json.Unmarshal(raw, &decoded)
+		so, ok := decoded["stream_options"].(map[string]interface{})
+		if !ok {
+			return false
+		}
+		return so["include_usage"] == true
+	}
+
+	for _, base := range []string{
+		"https://token.sensenova.cn/v1",
+		"https://api.sensenova.com/v1",
+		"https://api.openai.com/v1",
+		"https://example.com/v1",
+	} {
+		raw, _ := json.Marshal(buildCCRequest(ir, base))
+		if !hasStreamOptions(raw) {
+			t.Fatalf("上游 %s 必须带 stream_options.include_usage=true（流式 usage 的唯一开关），实际: %s", base, raw)
+		}
+	}
+	t.Logf("✅ 所有上游均带 stream_options.include_usage=true")
+}
+
+// TestBuildCCRequest_NeverEmitsDeveloperRole 锁定感诺 400 的真凶不会外泄。
+//
+// @REASON: 感诺对 role:"developer" 一律 400 "inference request is invalid"
+//   （glm-5.2 与 sensenova-6.8 均如此），而 system/user/assistant/tool 全部 200。
+//   buildCCRequest 第 1411 行写 "system"、mapRoleToCC 把 "developer"→"system"，
+//   这里把这个不变量钉住——一旦回归成 developer，就重新变成一条必然 400 的线。
+func TestBuildCCRequest_NeverEmitsDeveloperRole(t *testing.T) {
+	ir := &schema.InternalRequest{
+		Model:        "glm-5.2",
+		SystemPrompt: json.RawMessage(`"you are a coding agent"`),
+		Messages: []schema.InternalMessage{
+			{Role: "developer", Content: json.RawMessage(`"extra dev instructions"`)},
+			{Role: "system", Content: json.RawMessage(`"skipped"`)},
+			{Role: "user", Content: json.RawMessage(`"hi"`)},
+		},
+		Stream: true,
+	}
+
+	raw, _ := json.Marshal(buildCCRequest(ir, "https://token.sensenova.cn/v1"))
 	var decoded map[string]interface{}
 	json.Unmarshal(raw, &decoded)
-	if _, ok := decoded["stream_options"]; ok {
-		t.Fatalf("sensenova 上游不应带 stream_options: %s", raw)
+	msgs, _ := decoded["messages"].([]interface{})
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		role := m.(map[string]interface{})["role"]
+		if role == "developer" {
+			t.Fatalf("感诺对 role:\"developer\" 一律 400；代理不得外泄该 role: %s", raw)
+		}
+		seen[role.(string)] = true
 	}
-	t.Logf("✅ sensenova 上游 stream_options 已省略")
-
-	// 非 sensenova 上游：stream_options 必须保留（Claude Code 依赖 usage）
-	cc2 := buildCCRequest(ir, "https://api.openai.com/v1")
-	raw2, _ := json.Marshal(cc2)
-	var decoded2 map[string]interface{}
-	json.Unmarshal(raw2, &decoded2)
-	if _, ok := decoded2["stream_options"]; !ok {
-		t.Fatalf("非 sensenova 上游应带 stream_options: %s", raw2)
+	if !seen["system"] {
+		t.Fatalf("system 提示必须落到 role:\"system\"（感诺接受）: %s", raw)
 	}
-	t.Logf("✅ 非 sensenova 上游 stream_options 保留")
+	t.Logf("✅ 无 developer role 外泄；role 集合 = %v", seen)
 }
 
 // TestBuildCCRequest_EmptyToolSlotFiltered 验证 nil Function 的 Tool 槽不会序列化为 {"type":"","function":null}

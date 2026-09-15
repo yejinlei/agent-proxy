@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-proxy/agent-proxy/internal/protocol/schema"
 )
@@ -367,6 +368,18 @@ func mapStopReasonReverse(reason string) string {
 //  STREAM: InternalStreamEvents → Anthropic SSE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// finishUsageWait 是上游流收尾（finish 帧之后 / channel 关闭）时，为等「usage-only 尾帧」
+// 额外等待的时间上限。
+//
+// @AI_GUARD: ANTHROPIC_USAGE_ONLY_FRAME - 必须保持短
+// @CONSTRAINT: 实测感诺的 finish 帧与 usage 尾帧连发（间隔 0ms），此超时不是等待机制而是
+//   收尾兜底。放大会把每个正常流的收尾延迟拉长；放小（如 0）会在上游 usage 帧稍有排队时
+//   漏发 usage。100ms 是两端的折中，与 responses 包 doneUsageWait 保持同值。
+// @REASON: usage-only 尾帧只可能在 finish 帧之后到达，而收尾分支需要让出循环等它，
+//   必须有一个上界保证「上游不发 usage」时仍能收尾（否则会永久挂住）。
+// @RELATED: responses/translator.go doneUsageWait（同一机制，必须同值）
+const finishUsageWait = 100 * time.Millisecond
+
 // TranslateStream 将内部流式事件翻译为 Anthropic 格式 SSE
 // @AI_GUARD: ANTHROPIC_TRANSLATE_STREAM - Anthropic SSE 事件生命周期，绝对不可修改序列
 // @CONSTRAINT: 必须严格遵循事件序列：
@@ -405,27 +418,88 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 		fn(buf, isDone)
 	}
 	blockStarted := false // 当前内容块是否已发送 content_block_start
+	terminalSent := false // 终态序列（message_delta + message_stop）是否已发出
+
+	// @AI_GUARD: ANTHROPIC_TERMINAL_ONCE - 终态序列只能发一次
+	// @CONSTRAINT: case "done"、channel 关闭、ctx.Done 三条路径都会调用本闭包，必须靠
+	//   terminalSent 幂等。重复发 message_delta/message_stop 会让 Claude Code 收到两个终态，
+	//   解析为异常。
+	// @CONSTRAINT: message_stop 必须无条件发送，绝不能只在 usage != nil 时发。
+	//   原实现在 usage==nil 时跳过 message_stop 只调 fn(nil,true)，而 OpenAI 系上游把
+	//   usage 放在独立的 choices:[] 尾帧——finish 帧不带 usage，因此生产上 Claude Code
+	//   收得到 message_delta 却收不到 message_stop，违反 Anthropic 事件生命周期。
+	// @RELATED: ANTHROPIC_STREAM_ERROR_TEARDOWN、responses/translator.go sendCompleted（completedSent 同模式）
+	sendTerminal := func(stopReason string, usage *Usage, isDone bool) {
+		if terminalSent {
+			return
+		}
+		terminalSent = true
+		if blockStarted {
+			blockStarted = false
+			if raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0}); raw != nil {
+				writeData(raw, false)
+			}
+		}
+		if stopReason == "" {
+			stopReason = "end_turn"
+		}
+		if raw, _ := json.Marshal(StreamEvent{
+			Type:         "message_delta",
+			MessageDelta: &MessageDelta{StopReason: stopReason},
+		}); raw != nil {
+			writeData(raw, false)
+		}
+		var stopRaw []byte
+		if usage != nil {
+			stopRaw, _ = json.Marshal(map[string]interface{}{
+				"type":  "message_stop",
+				"usage": usage,
+			})
+		} else {
+			stopRaw, _ = json.Marshal(map[string]string{"type": "message_stop"})
+		}
+		writeData(stopRaw, isDone)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			if blockStarted {
-				raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
-				writeData(raw, false)
-			}
-			// 补全 message_delta + message_stop，符合 Anthropic 协议事件序列
-			raw, _ := json.Marshal(StreamEvent{
-				Type:         "message_delta",
-				MessageDelta: &MessageDelta{StopReason: "end_turn"},
-			})
-			writeData(raw, false)
-			raw, _ = json.Marshal(map[string]string{"type": "message_stop"})
-			writeData(raw, true)
+			// @AI_GUARD: ANTHROPIC_STREAM_ERROR_TEARDOWN - 断连时不补等 usage 尾帧
+			// @CONSTRAINT: 客户端已断开，补等 usage 只会延迟收尾；直接按既有格式收尾，
+			//   usage 保持 nil（Anthropic 的 message_stop 允许不带 usage）。
+			// @CONSTRAINT: 仍必须发送终态序列（Claude Code 校验完整事件生命周期）。
+			sendTerminal("end_turn", nil, true)
 			return
 		case event, ok := <-events:
 			if !ok {
-				// channel 关闭 → 发送 message_stop 结束
-				raw, _ := json.Marshal(map[string]string{"type": "message_stop"})
-				writeData(raw, true)
+				// channel 关闭 → 上游流结束
+				// @AI_GUARD: ANTHROPIC_USAGE_ONLY_FRAME - 关闭前必须补等 usage 尾帧
+				// @CONSTRAINT: provider/openai.go 的 CallStream 在最后一帧数据之后可能立即
+				//   close channel，不等消费者读走。因此关闭分支也要做一次有界等待，否则
+				//   usage-only 尾帧会在 done 分支的 select 与 channel 关闭之间被丢弃。
+				// @CONSTRAINT: finishUsageWait 必须保持短（100ms）。实测感诺 finish 帧与
+				//   usage 帧连发（间隔 0ms），正常路径 0ms 内取到尾帧；该超时只是「上游不发
+				//   usage」的收尾兜底，绝不能成为正常流的额外延迟。
+				// @REASON: 感诺只声明 capabilities:["openai"]，Claude Code 的 /v1/messages
+				//   入站必然走翻译路径——本翻译器是 Claude Code 拿到 usage 的唯一出口。
+				//   v0.2.144 之前 case "done" 发完就 return，尾帧被丢，usage 恒 0；且
+				//   usage==nil 时连 message_stop 都不发。
+				// @RELATED: responses/translator.go RESPONSES_USAGE_ONLY_FRAME（doneUsageWait，同模式）、
+				//   server/quick.go + gateway.go CC_USAGE_ONLY_FRAME（本事件的产出端）
+				select {
+				case <-ctx.Done():
+				case ev, ok2 := <-events:
+					if ok2 && ev.Type == "usage" && ev.Data != nil && ev.Data.Usage != nil {
+						sendTerminal("end_turn", &Usage{
+							InputTokens:  ev.Data.Usage.PromptTokens,
+							OutputTokens: ev.Data.Usage.CompletionTokens,
+							TotalTokens:  ev.Data.Usage.TotalTokens,
+						}, true)
+						return
+					}
+				case <-time.After(finishUsageWait):
+				}
+				sendTerminal("end_turn", nil, true)
 				return
 			}
 
@@ -503,16 +577,34 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 				continue
 
 			case "done":
-				// 发送 content_block_stop 后 再发送 message_delta
-				if blockStarted {
-					blockStarted = false
-					raw, _ := json.Marshal(StreamEvent{Type: "content_block_stop", Index: 0})
-					writeData(raw, false)
-				}
+				// @AI_GUARD: ANTHROPIC_USAGE_ONLY_FRAME - done 处先做有界等待，拿完 usage 再收尾
+				// @CONSTRAINT: 此处禁止直接发完 message_delta/message_stop 就 return。OpenAI 系
+				//   （含感诺 token.sensenova.cn）把 stream_options.include_usage 的统计量放在
+				//   独立尾帧 choices:[] + usage，位置在 finish 帧之后、[DONE] 之前；直接 return
+				//   会让 usage 永久为 0。正确做法是先做一次有界等待取尾帧，再统一 sendTerminal。
+				// @CONSTRAINT: sendTerminal 保证终态序列（content_block_stop + message_delta +
+				//   message_stop）恰好发一次；ctx.Done 与 events 在下方 select 内竞争，断连时
+				//   立即收尾、不等尾帧。
+				// @REASON: 感诺只声明 capabilities:["openai"]，Claude Code 的 /v1/messages 入站
+				//   必然走翻译路径——本翻译器是 Claude Code 拿到 usage 的唯一出口。
 				stopReason := "end_turn"
 				if event.Data != nil && len(event.Data.Choices) > 0 {
 					stopReason = mapStopReasonReverse(event.Data.Choices[0].FinishReason)
 				}
+				select {
+				case <-ctx.Done():
+				case ev, ok := <-events:
+					if ok && ev.Type == "usage" && ev.Data != nil && ev.Data.Usage != nil {
+						sendTerminal(stopReason, &Usage{
+							InputTokens:  ev.Data.Usage.PromptTokens,
+							OutputTokens: ev.Data.Usage.CompletionTokens,
+							TotalTokens:  ev.Data.Usage.TotalTokens,
+						}, true)
+						return
+					}
+				case <-time.After(finishUsageWait):
+				}
+				// finish 帧自带 usage 且上游未另发尾帧时，沿用 finish 帧的统计量
 				var usage *Usage
 				if event.Data != nil && event.Data.Usage != nil {
 					usage = &Usage{
@@ -521,23 +613,26 @@ func (t *AnthropicTranslator) TranslateStream(ctx context.Context, events <-chan
 						TotalTokens:  event.Data.Usage.TotalTokens,
 					}
 				}
-				raw, _ := json.Marshal(StreamEvent{
-					Type:         "message_delta",
-					MessageDelta: &MessageDelta{StopReason: stopReason},
-				})
-				writeData(raw, false)
-
-				// 最后发送 usage 行
-				if usage != nil {
-					usageRaw, _ := json.Marshal(map[string]interface{}{
-						"type":  "message_stop",
-						"usage": usage,
-					})
-					writeData(usageRaw, false)
-				}
-				// Anthropic 协议以 message_stop 结束，不发送 [DONE]
-				fn(nil, true)
+				sendTerminal(stopReason, usage, true)
 				return
+
+			case "usage":
+				// @AI_GUARD: ANTHROPIC_USAGE_ONLY_FRAME - usage-only 尾帧可能是唯一 usage 来源
+				// @CONSTRAINT: 必须在此更新 usage 并通过 sendTerminal 重发终态。正常路径下
+				//   case "done" 已在自己的有界 select 里拿过这一帧；本分支覆盖的是「上游未发
+				//   finish 帧、只发 delta 后直接给 usage」的退化形态。
+				// @REASON: 同 case "done"。usage=0 会让客户端统计不到上下文占用，
+				//   Codex 侧表现为 auto_compact 阈值恒 0、历史无界增长。
+				// @CONSTRAINT: sendTerminal 的 terminalSent 开关保证终态只发一次；done 分支
+				//   已发过时本分支是空操作，不会给客户端发第二个 message_stop。
+				if event.Data != nil && event.Data.Usage != nil {
+					sendTerminal("end_turn", &Usage{
+						InputTokens:  event.Data.Usage.PromptTokens,
+						OutputTokens: event.Data.Usage.CompletionTokens,
+						TotalTokens:  event.Data.Usage.TotalTokens,
+					}, true)
+				}
+				continue
 			}
 		}
 	}

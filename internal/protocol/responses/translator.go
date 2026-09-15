@@ -299,19 +299,37 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 //
 // @AI_GUARD: RESPONSES_EMPTY_USER_CONTENT - 空 user 消息必须换成非空占位符
 // @CONSTRAINT: 占位符必须是固定常量（本变量）且**非空白**，不得随请求变化。
-//   原因有二：
-//   ① 上游 SenseNova 校验 user content 非空，空串/纯空白一律 400
-//      "user content required"（09-12 加严，同字节序列此前 200）；
-//   ② 固定字面量让「本轮被替换」在日志里可 grep，也便于与正常 user 内容区分。
-//   ContentBlocks 必须同时被替换成单条 text 块——buildCCRequest 优先读 ContentBlocks
-//   而非 Content，只改 Content 等于没修。
+//
+//	原因有二：
+//	① 上游 SenseNova 校验 user content 非空，空串/纯空白一律 400
+//	   "user content required"（09-12 加严，同字节序列此前 200）；
+//	② 固定字面量让「本轮被替换」在日志里可 grep，也便于与正常 user 内容区分。
+//	ContentBlocks 必须同时被替换成单条 text 块——buildCCRequest 优先读 ContentBlocks
+//	而非 Content，只改 Content 等于没修。
+//
 // @CONSTRAINT: 只作用于 role:user 且**没有任何文本块**的消息。image/file/audio 块属于
-//   可见内容，绝不能因"无文本"被顶成占位符（图片静默丢失）。assistant/system/tool
-//   消息不受影响：它们的内容语义由上游协议定义，空串是合法的。
+//
+//	可见内容，绝不能因"无文本"被顶成占位符（图片静默丢失）。assistant/system/tool
+//	消息不受影响：它们的内容语义由上游协议定义，空串是合法的。
+//
 // @RELATED: inputToMessages、itemToMessage、server/gateway.go buildCCRequest
 // @REASON: v0.2.109 起空 input 注入 "" 兜住了「只有 system 消息」的 400；
-//   09-12 上游加严校验后，Codex 用空 user item 标记"无新内容"的主编码轮次也变成 400。
+//
+//	09-12 上游加严校验后，Codex 用空 user item 标记"无新内容"的主编码轮次也变成 400。
 const prewarmPlaceholder = "[agent-proxy] continue"
+
+// doneUsageWait 是收到 finish 帧后，为等「usage-only 尾帧」额外等待的时间上限。
+//
+// @AI_GUARD: RESPONSES_USAGE_ONLY_FRAME - 必须保持短
+// @CONSTRAINT: 实测感诺的 finish 帧与 usage 尾帧连发（间隔 0ms），此超时不是
+//
+//	等待机制而是收尾兜底。放大会把每个正常流的收尾延迟拉长；放小（如 0）会在
+//	上游 usage 帧稍有排队时漏发 usage。100ms 是两端的折中。
+//
+// @REASON: usage 尾帧只可能在 case "done" 之后到达，而 case "done" 需要让出循环等它，
+//
+//	必须有一个上界保证「上游不发 usage」时仍能收尾（否则会永久挂住）。
+const doneUsageWait = 100 * time.Millisecond
 
 // fillEmptyUserMessage 把「无任何可见内容的 user 消息」替换成中性占位符。
 //
@@ -530,6 +548,7 @@ func responsesItemDigest(items []InputItem) string {
 	}
 	return strings.Join(parts, " ")
 }
+
 // codexReasoningArg 把 reasoning / temperature 的观测值统一成日志形态：
 // 缺失 → "absent"；有值 → "<值> (not forwarded to CC)"。固定后缀避免读日志时
 // 把"代理丢弃"和"代理传递"混为一谈。
@@ -549,7 +568,9 @@ func codexReasoningArg(raw json.RawMessage) string {
 // 读日志时容易和"缺失"混淆。这里解一次字符串类型化：字符串去掉成对外层引号，
 // 其余（数字/布尔/null）原样保留，解析失败则回退到去空白原文。
 // @REASON: v0.2.134 排障——RawMeta 存的是原始 JSON，直接插值打印出来是
-//   tool_choice=""auto""、store="false"，逐字比对时很容易误读成字段缺失。
+//
+//	tool_choice=""auto""、store="false"，逐字比对时很容易误读成字段缺失。
+//
 // @CONSTRAINT: 仅用于日志。返回值的形态不能反推回解析逻辑。
 func cleanScalarForLog(raw json.RawMessage) string {
 	if len(raw) == 0 {
@@ -564,15 +585,20 @@ func cleanScalarForLog(raw json.RawMessage) string {
 
 // @AI_GUARD: RESPONSES_REASONING_META - Codex 的 reasoning 参数只观测，不得据此改变出站行为
 // @CONSTRAINT: 返回值仅供日志。buildCCRequest 构造上游 CC 请求时**禁止**据此注入
-//   reasoning_effort 或其他推理字段——那会让代理替 Codex 决定上游推理强度，
-//   与 RESPONSES_INBOUND_META / RESPONSES_CODEX_SANDBOX_META 的观测护栏同一条约定。
+//
+//	reasoning_effort 或其他推理字段——那会让代理替 Codex 决定上游推理强度，
+//	与 RESPONSES_INBOUND_META / RESPONSES_CODEX_SANDBOX_META 的观测护栏同一条约定。
+//
 // @REASON: v0.2.139 生产日志三轮 reasoning_chars 均非 0（440/393/511），但入站
-//   {"reasoning":{"effort":"medium","summary":"auto"}} 与上游 CC 请求构造之间没有观测点，
-//   只能靠翻 WS frame 原文确认丢弃。该字段是 OpenAI 专有能力（summary 控制思考可见性），
-//   直接映射进 CC 请求体有 400 风险，观测优先。
+//
+//	{"reasoning":{"effort":"medium","summary":"auto"}} 与上游 CC 请求构造之间没有观测点，
+//	只能靠翻 WS frame 原文确认丢弃。该字段是 OpenAI 专有能力（summary 控制思考可见性），
+//	直接映射进 CC 请求体有 400 风险，观测优先。
+//
 // @RELATED: codexSandboxMode / detectToolCallInText（同属纯观测诊断点）
 // @REASON(格式): effort 是字符串枚举，summary 可能是数组或字符串两种形态；不建模结构，
-//   只拼 key=value 扁平串，避免对 Codex 版本演进过敏。
+//
+//	只拼 key=value 扁平串，避免对 Codex 版本演进过敏。
 func codexReasoningMeta(reasoningRaw json.RawMessage) string {
 	if len(reasoningRaw) == 0 {
 		return ""
@@ -600,12 +626,16 @@ func codexReasoningMeta(reasoningRaw json.RawMessage) string {
 
 // @AI_GUARD: RESPONSES_CODEX_SANDBOX_META - Codex 沙箱/审批模式只观测，不得据此改变出站行为
 // @CONSTRAINT: 返回值仅供日志。CC 路径不透传 sandbox/approval_policy，因此**禁止**用它
-//   推导"沙箱拦了写入"而改变出站工具集或审批行为——那会让代理替 Codex 做安全决策。
+//
+//	推导"沙箱拦了写入"而改变出站工具集或审批行为——那会让代理替 Codex 做安全决策。
+//
 // @REASON: 该字段藏在 client_metadata.x-codex-turn-metadata 里，且**那层本身也是 JSON
-//   编码的字符串**（三层嵌套：外层 JSON → 字符串 → 内层 JSON）。v0.2.134 排障时对
-//   转义 JSON 做了 3 次 grep 才定位到 sandbox_mode。它是区分"写入被沙箱拦截"与
-//   "模型压根没尝试写"的唯一直接证据，而 v0.2.134 的结论是后者（工具数组里没有
-//   任何能写文件的工具）。
+//
+//	编码的字符串**（三层嵌套：外层 JSON → 字符串 → 内层 JSON）。v0.2.134 排障时对
+//	转义 JSON 做了 3 次 grep 才定位到 sandbox_mode。它是区分"写入被沙箱拦截"与
+//	"模型压根没尝试写"的唯一直接证据，而 v0.2.134 的结论是后者（工具数组里没有
+//	任何能写文件的工具）。
+//
 // @RELATED: detectToolCallInText（同属 v0.2.134 的纯观测诊断点）
 func codexSandboxMode(clientMetadataRaw json.RawMessage) string {
 	if len(clientMetadataRaw) == 0 {
@@ -809,13 +839,17 @@ func emptyDeltaShapeSummary(counts map[string]int) string {
 
 // @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 检测模型把工具调用当纯文本吐出
 // @CONSTRAINT: 只观测并打日志，绝不据此改写输出、也绝不解析成真实工具调用。
-//   这是"只加观测、不改行为"的硬约束——擅自解析 Anthropic 语法会引入与上游协议
-//   不一致的行为分叉，且需要 CC 翻译器同步改。
+//
+//	这是"只加观测、不改行为"的硬约束——擅自解析 Anthropic 语法会引入与上游协议
+//	不一致的行为分叉，且需要 CC 翻译器同步改。
+//
 // @REASON: v0.2.134 排障——上游模型有 Anthropic 训练痕迹，会用 Anthropic 的
-//   <tool_use>/<parameter> 语法把工具调用写成纯文本。CC 的 TranslateStream 只能当
-//   choices[].delta.content 原样透传 → finish_reason="stop"、func_calls=0。Codex 收到
-//   纯文本不会解析成工具调用，整轮静默失败。agent-proxy-9091.log L1109 结尾是
-//   </tool_use>、L1857 结尾是 <parameter>…
+//
+//	<tool_use>/<parameter> 语法把工具调用写成纯文本。CC 的 TranslateStream 只能当
+//	choices[].delta.content 原样透传 → finish_reason="stop"、func_calls=0。Codex 收到
+//	纯文本不会解析成工具调用，整轮静默失败。agent-proxy-9091.log L1109 结尾是
+//	</tool_use>、L1857 结尾是 <parameter>…
+//
 // @RELATED: internal/protocol/chatcompletion/translator.go TranslateStream（无法解析该语法）
 func detectToolCallInText(text string) string {
 	if len(text) == 0 {
@@ -1377,12 +1411,12 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 				log.Printf("[CODEX-DEBUG] TranslateResponse tool_search_call: call_id=%q args_bytes=%d cleaned=%s",
 					callID, len(tc.Function.Arguments), string(b))
 				output = append(output, map[string]interface{}{
-					"id":         callID,
-					"type":       "tool_search_call",
-					"call_id":    callID,
-					"execution":  "client",
-					"status":     "completed",
-					"arguments":  cleaned,
+					"id":        callID,
+					"type":      "tool_search_call",
+					"call_id":   callID,
+					"execution": "client",
+					"status":    "completed",
+					"arguments": cleaned,
 				})
 				continue
 			}
@@ -2107,7 +2141,18 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		return output
 	}
 
+	// completedSent 标记 response.completed 是否已发出。
+	// @AI_GUARD: RESPONSES_COMPLETED_ONCE - response.completed 是全流唯一终态
+	// @CONSTRAINT: 只能发一次。case "done" 与 case "usage" 都可能触发 sendCompleted，
+	//   必须靠这个开关避免重发第二次 response.completed（Codex 状态机只认一个终态）。
+	// @REASON: OpenAI 系把 stream_options.include_usage 的统计量放在独立尾帧
+	//   （choices:[] + usage），位置在 finish 帧之后、[DONE] 之前，可能晚于 done 分支。
+	completedSent := false
 	sendCompleted := func() {
+		if completedSent {
+			return
+		}
+		completedSent = true
 		finishReason := lastFinishReason
 		if finishReason == "" {
 			if len(funcCallOrder) > 0 {
@@ -2257,7 +2302,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				//   汇总日志字段一致，grep 时不需要按路径分开处理。
 				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d ns_tools=%d ns_calls=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
 					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
-						emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
+					emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 					nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
 					event.Error.Code, event.Error.Type, event.Error.Message,
 					detectToolCallInText(accumulatedText.String()), responsesLogTail(accumulatedText.String()))
@@ -2352,8 +2397,70 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 						}
 					}
 				}
+				// @AI_GUARD: RESPONSES_USAGE_ONLY_FRAME - done 处先做有界等待，拿完 usage 再收尾
+				// @CONSTRAINT: 此处禁止直接 sendCompleted() + return。OpenAI 系（含感诺）把
+				//   stream_options.include_usage 的统计量放在独立尾帧 choices:[] + usage，
+				//   位置在 finish 帧之后、[DONE] 之前；直接 return 会让 usage 永久为 0。
+				//   正确做法是先在下方 select 做一次有界等待取尾帧，再统一 sendCompleted()。
+				// @REASON: 这是 Codex 历史无界增长的第二半根因。前半是 buildCCRequest 按上游
+				//   类型把 stream_options 置 nil（gateway.go CC_STREAM_OPTIONS_SENSENOVA，归因写错了），
+				//   后半是 quick.go/gateway.go 用 `len(ccChunk.Choices) == 0` 把这帧 continue 掉，
+				//   再叠加本分支原本的 sendCompleted()+return。三处任一不修，usage 都是 0。
+				//   Codex 的 auto_compact_scope_tokens 严格等于 total_usage_tokens
+				//   （实测 223/223 精确相等），所以 usage=0 → 阈值 0 → 自动压缩永不触发
+				//   → 历史无界增长 → 撞 body 上限。
+				// @CONSTRAINT: doneUsageWait 必须保持短（100ms）。实测感诺 finish 帧与 usage 帧
+				//   连发（间隔 0ms），正常路径 0ms 内取到尾帧；此超时只是「上游不发 usage」的
+				//   收尾兜底，绝不能成为正常流的额外延迟。
+				// @CONSTRAINT: ctx.Done 与 events 在下方 select 内竞争，断连时立即收尾、不等尾帧
+				//   （RESPONSES_STREAM_ERROR_TEARDOWN）。
+				select {
+				case <-ctx.Done():
+				case ev, ok := <-events:
+					// ok==false 表示上游流已结束（openai.go CallStream defer close(linesCh)），
+					// 没有更多尾帧，直接收尾。
+					if ok && ev.Type == "usage" && ev.Data != nil && ev.Data.Usage != nil {
+						if ev.Data.Model != "" {
+							lastModel = ev.Data.Model
+						}
+						lastUsage = &Usage{
+							InputTokens:  ev.Data.Usage.PromptTokens,
+							OutputTokens: ev.Data.Usage.CompletionTokens,
+							TotalTokens:  ev.Data.Usage.TotalTokens,
+						}
+					}
+				case <-time.After(doneUsageWait):
+				}
 				sendCompleted()
 				return
+
+			case "usage":
+				// @AI_GUARD: RESPONSES_USAGE_ONLY_FRAME - usage-only 尾帧可能是唯一 usage 来源
+				// @CONSTRAINT: 必须在此更新 lastUsage 并重发 response.completed。OpenAI 系
+				//   （含感诺 token.sensenova.cn）把 stream_options.include_usage 的统计量放在独立尾帧
+				//   choices:[] + usage，位置在 finish 帧之后、[DONE] 之前。正常路径下 case "done"
+				//   已在自己的有界 select 里拿过这一帧；本分支覆盖的是「上游未发 finish 帧、
+				//   只发 delta 后直接给 usage」的退化形态，负责补发终态。
+				// @REASON: 这是 Codex 历史无界增长的第二半根因。前半是 buildCCRequest 按上游类型把
+				//   stream_options 置 nil（gateway.go CC_STREAM_OPTIONS_SENSENOVA，归因写错了），
+				//   后半是 quick.go/gateway.go 用 `len(ccChunk.Choices) == 0` 把这帧 continue 掉。
+				//   两处任一不修，usage 都是 0。Codex 的 auto_compact_scope_tokens 严格等于
+				//   total_usage_tokens（实测 223/223 精确相等），所以 usage=0 → 阈值 0 → 永不压缩。
+				// @CONSTRAINT: sendCompleted 的 completedSent 开关保证 response.completed 只发一次；
+				//   done 分支已发过时本分支是空操作，不会给 Codex 发第二个终态。
+				if event.Data != nil && event.Data.Usage != nil {
+					next := &Usage{
+						InputTokens:  event.Data.Usage.PromptTokens,
+						OutputTokens: event.Data.Usage.CompletionTokens,
+						TotalTokens:  event.Data.Usage.TotalTokens,
+					}
+					if lastModel != "" && event.Data.Model != "" {
+						lastModel = event.Data.Model
+					}
+					lastUsage = next
+					sendCompleted()
+				}
+				continue
 			}
 		}
 	}

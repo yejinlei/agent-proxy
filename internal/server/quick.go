@@ -3042,7 +3042,39 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 				// OpenAI 兼容：解析 SSE delta 行（可能带 "data: " 前缀）
 				payload := strings.TrimPrefix(string(line), "data: ")
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
-				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+				if json.Unmarshal([]byte(payload), &ccChunk) != nil {
+					continue
+				}
+				// @AI_GUARD: CC_USAGE_ONLY_FRAME - usage-only 尾帧必须放行
+				// @CONSTRAINT: choices 为空但 usage 非空的帧必须单独发一条 Type:"usage" 事件，
+				//   绝不能 continue 跳过。OpenAI 系（含感诺）把 stream_options.include_usage 的
+				//   统计量放在独立尾帧：choices:[] + usage，位于 finish 帧之后、[DONE] 之前。
+				// @REASON: 这里曾是 `|| len(ccChunk.Choices) == 0` 直接 continue —— usage 唯一的来源
+				//   被静默丢掉，代理日志 13/13 条流全是 usage=&{0 0 0 0 0}。
+				//   Codex 侧 auto_compact_scope_tokens 严格等于 total_usage_tokens（实测 223/223 精确相等），
+				//   所以 usage 恒 0 → 自动压缩阈值恒 0 → 永不触发 → 历史无界增长 → 撞 body 上限。
+				// @CONSTRAINT: 该事件必须排在 start/delta/done 之后发出。Responses 翻译器的 done 分支
+				//   已经 sendCompleted() 并 return，usage-only 帧到不了 done，落到 case "usage" 才收得到；
+				//   排前面会被 continue 分支当作 keep-alive 吃掉。
+				// @RELATED: gateway.go handleStreamRequest（同一逻辑，必须保持同步）、
+				//   protocol/responses/translator.go TranslateStream case "usage"、
+				//   gateway.go buildCCRequest CC_STREAM_OPTIONS_SENSENOVA
+				if len(ccChunk.Choices) == 0 {
+					if ccChunk.Usage != nil {
+						usageModel := ccChunk.Model
+						if aliasModel != "" {
+							usageModel = aliasModel
+						}
+						events <- schema.InternalStreamEvent{
+							Type: "usage",
+							Data: &schema.InternalStreamChunk{
+								ID:      ccChunk.ID,
+								Model:   usageModel,
+								Usage:   mapInternalUsage(ccChunk.Usage),
+							},
+						}
+						accumulatedUsage = mapInternalUsage(ccChunk.Usage)
+					}
 					continue
 				}
 				// 首个有效 delta 事件前先发 start，Responses 入站翻译器据此生成 response.created
@@ -3316,7 +3348,16 @@ func (q *QuickGateway) handleStreamRequestAsNonStream(p provider.Provider, ctx c
 		} else {
 			// OpenAI 兼容：直接解析 SSE delta 行
 			var ccChunk chatcompletion.ChatCompletionStreamChunk
-			if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+			if json.Unmarshal([]byte(payload), &ccChunk) != nil {
+				continue
+			}
+			// usage-only 尾帧：choices:[] + usage（见 CC_USAGE_ONLY_FRAME）。
+			// 这里不能 continue——这条路径只靠它拿到最终 usage。
+			if len(ccChunk.Choices) == 0 {
+				if ccChunk.Usage != nil {
+					lastUsage = mapInternalUsage(ccChunk.Usage)
+					lastModel = ccChunk.Model
+				}
 				continue
 			}
 			choice := ccChunk.Choices[0]

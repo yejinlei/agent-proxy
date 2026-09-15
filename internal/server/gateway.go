@@ -1120,7 +1120,28 @@ func (g *Gateway) handleStreamRequest(ctx context.Context, w http.ResponseWriter
 			} else {
 				// OpenAI 兼容：解析 SSE delta 行
 				var ccChunk chatcompletion.ChatCompletionStreamChunk
-				if json.Unmarshal([]byte(payload), &ccChunk) != nil || len(ccChunk.Choices) == 0 {
+				if json.Unmarshal([]byte(payload), &ccChunk) != nil {
+					continue
+				}
+				// @AI_GUARD: CC_USAGE_ONLY_FRAME - 必须与 quick.go handleStreamRequest 逐行一致
+				// @CONSTRAINT: choices 为空但 usage 非空的帧单独发 Type:"usage" 事件，禁止 continue 跳过。
+				//   它是流式 usage 的唯一来源，丢掉 → 下游 usage 恒 0 → Codex 自动压缩永不触发。
+				// @RELATED: quick.go handleStreamRequest（本文件是复杂模式，必须同步）
+				if len(ccChunk.Choices) == 0 {
+					if ccChunk.Usage != nil {
+						usageModel := ccChunk.Model
+						if internalReq != nil && internalReq.AliasModel != "" {
+							usageModel = internalReq.AliasModel
+						}
+						events <- schema.InternalStreamEvent{
+							Type: "usage",
+							Data: &schema.InternalStreamChunk{
+								ID:    ccChunk.ID,
+								Model: usageModel,
+								Usage: mapInternalUsage(ccChunk.Usage),
+							},
+						}
+					}
 					continue
 				}
 				// 首个有效 delta 事件前先发 start，Responses 入站翻译器据此生成 response.created
@@ -1640,17 +1661,25 @@ func buildCCRequest(req *schema.InternalRequest, baseURL string) *chatcompletion
 		maxTokens = req.MaxTokens
 	}
 
-	// @AI_GUARD: CC_STREAM_OPTIONS_SENSENOVA - sensenova CC 端点不支持 stream_options
-	// @CONSTRAINT: stream_options:{include_usage:true} 必须无条件注入（Claude Code 依赖 usage），
-	//   但对 sensenova 上游会触发 HTTP 400 "Invalid request format"——sensenova 拒绝该未知字段。
-	// @REASON: Codex 翻译路径（Responses→CC，sensenova 端点）根因：buildCCRequest 无条件注入
-	//          stream_options，sensenova 直接 400。已通过生产日志确认两次请求均 "Invalid request format"，
-	//          body 尾部（formatJSON 20KB 截断）含 stream_options。
-	// @RELATED: 透传路径由 stripSensenovaRequestFields 处理；翻译路径无 DB upstreamType 判断，必须在此按 baseURL 检测。
+	// @AI_GUARD: CC_STREAM_OPTIONS_SENSENOVA - stream_options 必须对感诺上游同样注入
+	// @CONSTRAINT: stream_options:{include_usage:true} 必须无条件注入，包括感诺（token.sensenova.cn /
+	//   api.sensenova.com）。它是流式 usage 的唯一开关：不注入时上游不回 usage，
+	//   代理日志里 13/13 条流全是 usage=&{0 0 0 0 0}，Codex 侧 total_usage_tokens=0 →
+	//   auto_compact_scope_tokens=0 → 自动压缩永不触发。
+	// @CONSTRAINT: 禁止按上游类型把 streamOptions 置 nil。此前的实现这么做，注释归因是
+	//   "sensenova 拒绝该未知字段 → HTTP 400 Invalid request format"。该归因是错的：
+	//   直连实测（代理真实 buildCCRequest 输出体）F1 原样=200 无 usage，F2 加 stream_options=200
+	//   usage=Y，F3 把 system 改成 developer=400 "inference request is invalid"。
+	// @REASON: 感诺 400 的真凶是 role:"developer"，不是 stream_options。两个事实同时成立：
+	//   (1) stream_options 在所有开通模型上都被接受（glm-5.2 / sensenova-6.8 / deepseek-v4 /
+	//   kimi-k3 均 200 + usage），甚至容忍未知键；(2) 本函数第 1411 行写 "system"、
+	//   mapRoleToCC 把 "developer"→"system"，代理从不发 developer。
+	//   guard 的报错文本 "Invalid request format" 在感诺 0 次复现，实测 400 全是
+	//   "inference request is invalid"。v0.2.142 把 stream_options 判成元凶后一路置 nil，
+	//   从此感诺上游永远拿不到 usage——这是 Codex 历史无界增长的起点。
+	// @RELATED: mapRoleToCC（developer→system）、CC_TOP_P_AND_MAX_TOKENS_FILTER（真正的感诺 400 族）、
+	//   quick.go fixNullUsageInResponse（usage 兜底）、protocol/chatcompletion/translator.go:274（usage 读取）
 	streamOptions := &chatcompletion.StreamOptions{IncludeUsage: true}
-	if DetectUpstreamType(baseURL) == "sensenova" {
-		streamOptions = nil
-	}
 
 	return &chatcompletion.ChatCompletionRequest{
 		Model:          req.Model,
