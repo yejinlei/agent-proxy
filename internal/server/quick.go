@@ -94,6 +94,26 @@ func translationStreamRoute(downstreamReq json.RawMessage) bool {
 // 由 UPSTREAM_STALL_DETECT 的 @CONSTRAINT 定义取值依据，本处不重复。
 const upstreamStallTimeout = 60 * time.Second
 
+// nonStreamCallTimeout 是非流式 p.Call 的硬超时上限（与 upstreamStallTimeout 同值、不同语义）。
+// @AI_GUARD: NONSTREAM_CALL_TIMEOUT - 非流式 p.Call 必须有界，不能只靠 q.timeout（默认 300s）兜底
+// @CONSTRAINT: 非流式调用期间上游**全程零字节**——headers 要等完整 JSON 生成完才回。流式路径的
+//   idle 判据（stallTimeoutChan 包装 line channel）在这里不适用：没有 line，只有一个阻塞读。
+//   所以只能把 ctx 超时压到本常量，60s 静默即判死，语义与 UPSTREAM_STALL_DETECT 的 60s 一致。
+// @REASON: agent-proxy-9091.log v0.2.146 — 14:42:35 翻译路径大请求（downstream 215939 bytes）
+//   被 LARGE_BODY_SKIP_STREAM_TRANSLATION 降级到 handleNonStreamResponseAsSSE，该函数当时只有
+//   context.WithTimeout(ctx, q.timeout)，无 idle 检测。上游沉默，代理发出 600 个心跳、5 分钟零内容，
+//   14:47:35 才以 context deadline exceeded 收尾（[upstream] Call glm-5.2 → 5m0.000473289s）。
+//   同一台代理同一次运行里，14:42:34 的流式请求 15.005s 就返回 3405 字符。
+//   实测对照（2026-09-15，token.sensenova.cn 直连 glm-5.2，Codex 同形负载）：
+//   118KB 非流式 6.55s / 7.60s 两次；799KB 流式 first_byte 27.01s、36.90s 完整返回。
+//   即：大请求两种模式都能完成，且非流式明显更快。挂死是上游偶发行为，v0.2.144 的 502 也是
+//   同一批偶发故障的另一种表现——降级路由规避不了它，只能靠本超时有界收尾。
+// @CONSTRAINT: 取 60s 而非 30s：实测感诺 118KB 非流式 ~7.6s、799KB 流式 first_byte 27s，
+//   60s 覆盖最慢观测值的 2 倍以上，只杀真正的挂死。取 300s 就是回归本 bug。
+// @RELATED: UPSTREAM_STALL_DETECT（流式路径的 idle 判据）、LARGE_BODY_SKIP_STREAM_TRANSLATION、
+//   handleNonStreamResponseAsSSE、handlePassthroughNonStreamAsSSE
+const nonStreamCallTimeout = 60 * time.Second
+
 // stallTimeoutChan 包装上游 SSE 行 channel：连续 idle 超过 d 就关闭输出 channel。
 //
 // 关闭是让下游 `for line := range` 正常退出的信号——生产者 goroutine 的
@@ -2635,8 +2655,15 @@ func (q *QuickGateway) handlePassthroughNonStreamAsSSE(p provider.Provider, ctx 
 	// 在 Call 阻塞等待上游响应期间发送 SSE 心跳
 	callDone, callFinished := StartSSEHeartbeat(w, flusher, r.Context(), q.verboseLevel)
 
-	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	upstreamStart := time.Now()
+	// @AI_GUARD: NONSTREAM_CALL_TIMEOUT - 非流式 p.Call 的 ctx 必须压到 nonStreamCallTimeout
+	// @CONSTRAINT: 不能用 time.Duration(q.timeout)*time.Second——非流式调用期间上游全程零字节
+	//   （headers 等完整 JSON 生成完才回），idle 检测无处挂载，只有 ctx 超时能判死。用 q.timeout
+	//   （默认 300s）会把一次上游挂死拉成 5 分钟零内容 + 600 个心跳，见 NONSTREAM_CALL_TIMEOUT
+	//   的 @REASON。
+	// @RELATED: handleNonStreamResponseAsSSE（翻译路径，同一修复）、nonStreamCallTimeout、
+	//   UPSTREAM_STALL_DETECT
 	respBody, _, err := p.Call(callCtx, nsBody, callInfo)
 	cancel()
 	if q.verboseLevel >= 2 {
@@ -2843,8 +2870,16 @@ func (q *QuickGateway) handleNonStreamResponseAsSSE(p provider.Provider, ctx con
 	// 在 Call 阻塞等待上游响应期间发送 SSE 心跳
 	callDone, callFinished := StartSSEHeartbeat(w, flusher, ctx, q.verboseLevel)
 
-	callCtx, cancel := context.WithTimeout(ctx, time.Duration(q.timeout)*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	upstreamStart := time.Now()
+	// @AI_GUARD: NONSTREAM_CALL_TIMEOUT - 非流式 p.Call 的 ctx 必须压到 nonStreamCallTimeout
+	// @CONSTRAINT: 不能用 time.Duration(q.timeout)*time.Second——非流式调用期间上游全程零字节
+	//   （headers 等完整 JSON 生成完才回），idle 检测无处挂载，只有 ctx 超时能判死。用 q.timeout
+	//   （默认 300s）会把一次上游挂死拉成 5 分钟零内容 + 600 个心跳，见 NONSTREAM_CALL_TIMEOUT
+	//   的 @REASON。本函数由 LARGE_BODY_SKIP_STREAM_TRANSLATION 降级路由进入，是 v0.2.146 新增的
+	//   可达路径，历史上 0 调用方。
+	// @RELATED: handlePassthroughNonStreamAsSSE（透传路径，同一修复）、nonStreamCallTimeout、
+	//   UPSTREAM_STALL_DETECT
 	// @AI_GUARD: NONSTREAM_AS_SSE_STREAM_FLAG - 非流式调用前必须去掉 stream 标记 + 应用字段过滤
 	// @CONSTRAINT: p.Call 是非流式调用（等完整 JSON 返回），但调用方（LARGE_BODY_SKIP_STREAM_TRANSLATION
 	//   的降级路由）传进来的 downstreamReq 仍带 "stream":true——那是**客户端**的诉求，不是上游的。

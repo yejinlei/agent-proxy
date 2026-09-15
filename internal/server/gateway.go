@@ -324,9 +324,12 @@ func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request, ingressP
 	if stream {
 		// @AI_GUARD: LARGE_BODY_SKIP_STREAM_TRANSLATION - 翻译路径大请求诊断（仅日志，不降级）
 		// @CONSTRAINT: 与 quick.go 同名 guard 是**有意分叉**：quick.go 有大请求→非流式SSE
-		//   降级，gateway.go 没有 handleNonStreamResponseAsSSE 包装函数，无法降级，只能
-		//   打日志观测。与本文件透传路径的 LARGE_BODY_SKIP_STREAM（line ~269）同一模式。
-		//   要真正降级需先给 gateway.go 补 handleNonStreamResponseAsSSE，属独立工作量。
+		//   降级，本文件的翻译路径没有「p.Call + 非流式→SSE」的完整 handler 可以直接调
+		//   （writeNonStreamAsSSE 只是写帧辅助，用在下方流式 fallback 里，见 line ~578），
+		//   所以这里只能打日志观测。与本文件透传路径的 LARGE_BODY_SKIP_STREAM（line ~269）
+		//   同一模式。要真正降级需先给 gateway.go 补 handleNonStreamResponseAsSSE，属独立工作量。
+		//   注意：quick.go 的降级路径受 NONSTREAM_CALL_TIMEOUT（60s）约束，本路径若长期只靠
+		//   q.timeout 兜底，两个模式在大请求挂死时行为会不一致。
 		// @REASON: 见 quick.go 同名 guard 的 @REASON（v0.2.144 翻译路径 502 现场）。
 		// @RELATED: quick.go LARGE_BODY_SKIP_STREAM_TRANSLATION（真正降级的那一侧）、
 		//   本文件透传路径 LARGE_BODY_SKIP_STREAM（同为 log-only）
