@@ -318,6 +318,17 @@ func (t *ResponsesTranslator) TranslateRequest(ctx context.Context, rawReq json.
 //	09-12 上游加严校验后，Codex 用空 user item 标记"无新内容"的主编码轮次也变成 400。
 const prewarmPlaceholder = "[agent-proxy] continue"
 
+// noContentStallTimeout 是「连续 N 秒没有真实内容」判死的阈值。
+// 声明为包级 var 是为了让单测把阈值调到毫秒级——见 no_content_stall_test.go。
+//
+// @AI_GUARD: RESPONSES_NO_CONTENT_STALL - 判死逻辑在 TranslateStream 的 sendCompleted 内
+// @REASON: 详见 TranslateStream 内的 @AI_GUARD 注释（agent-proxy-9091.log 2026-09-15 20:13:39
+//
+//	案例：8925 空 delta / 5 分钟 / Codex 判成功空回合）。
+//
+// @RELATED: TranslateStream sendCompleted 内的 RESPONSES_NO_CONTENT_STALL 分支
+var noContentStallTimeout = 60 * time.Second
+
 // doneUsageWait 是收到 finish 帧后，为等「usage-only 尾帧」额外等待的时间上限。
 //
 // @AI_GUARD: RESPONSES_USAGE_ONLY_FRAME - 必须保持短
@@ -1298,16 +1309,9 @@ func (t *ResponsesTranslator) TranslateResponse(resp *schema.InternalResponse) (
 		toolCalls = append(toolCalls, choice.Message.ToolCalls...)
 	}
 
-	var usage *Usage
-	if resp.Usage != nil {
-		usage = &Usage{
-			InputTokens:         resp.Usage.PromptTokens,
-			OutputTokens:        resp.Usage.CompletionTokens,
-			TotalTokens:         resp.Usage.TotalTokens,
-			CacheCreationTokens: resp.Usage.CacheCreationTokens,
-			CacheReadTokens:     resp.Usage.CacheReadTokens,
-		}
-	}
+	// 嵌套 *_tokens_details 由 helper 统一生成，禁止内联只抄顶层三键
+	//（Codex 只读嵌套字段，顶层它根本不解析）。
+	usage := responsesUsageFromInternal(resp.Usage)
 
 	finishReason := "stop"
 	if len(resp.Choices) > 0 && resp.Choices[0].FinishReason != "" {
@@ -1566,6 +1570,49 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 	// 用于 END 日志的 delta_shapes 字段。只在 emptyThisDelta 分支写入。
 	emptyDeltaShapeCounts := make(map[string]int)
 	startedAt := time.Now()
+
+	// @AI_GUARD: RESPONSES_NO_CONTENT_STALL - 空 delta keepalive 循环必须判死
+	// @CONSTRAINT: 上游（感诺 glm-5.2）在模型挂死时会持续发送带 text:"" 的空 delta 帧维持
+	//   连接（~3/秒），line channel 判据（quick.go stallTimeoutChan，60s 静默断流）判不出来。
+	//   本翻译器正确地把这些空 delta 拦在出站之前，Codex 看到的只是"通道一直有心跳、
+	//   但没有任何真实内容"——直到 q.timeout（默认 300s）才收尾并发合法 response.completed
+	//   （finish_reason:"stop"），Codex 判 ThreadIdleCause::Completed + TurnComplete{error:None}
+	//   → 静默空回合，stream_max_retries=5 全程死代码（core/src/tasks/mod.rs:800）。
+	//
+	// @CONSTRAINT: 判据是「距离最后一次真实内容的时间」，不是「空 delta 数量」。空 delta 速率
+	//   随模型不同（1/秒到 30/秒），数量阈值要么误杀慢模型要么形同虚设；时间阈值稳。
+	//   「真实内容」包括 text delta、reasoning delta、tool call 参数 delta、tool_call item 本身
+	//   （模型决定调工具的瞬间）——reasoning-only 模型（o1、DeepSeek R1）先思考后说话，
+	//   几十秒只有 reasoning 是正常形态，不能误杀。
+	//
+	// @CONSTRAINT: 触发后发的是 **response.failed**，不是 response.completed + status:failed。
+	//   Codex 只对 response.failed 做 ApiError 映射（responses.rs:417）——非白名单错误码落到
+	//   ApiError::Retryable，触发 stream_max_retries=5 的重试循环，用户看到 Reconnecting 提示。
+	//   response.completed 无论 status 是什么都走 Ok(ResponseEvent::Completed)（responses.rs:483）
+	//   → ThreadIdleCause::Completed → 静默成功，重试不触发。error.code 必须避开 Codex 的
+	//   非重试白名单（context_length_exceeded / insufficient_quota / usage_not_included /
+	//   cyber_policy / misalignment_policy_violation / invalid_prompt / bio_policy /
+	//   server_is_overloaded / rate_limit_exceeded）；"upstream_timeout" 是安全的中性码。
+	//
+	// @CONSTRAINT: 阈值 60s，与 quick.go upstreamStallTimeout 同值同语义（都是"60s 无进展 = 挂死"），
+	//   但判据从「line channel 有无活动」换成「有无真实内容」。取 60 而非更小：实测感诺
+	//   冷启动首 token 2.4~12.0s、单轮长推理 10~35s，60s 是正常最长真实静默的 2 倍；
+	//   取 30s 会误杀长推理回合。取 300s（q.timeout）就是回归本 bug。
+	//
+	// @REASON: agent-proxy-9091.log 2026-09-15 20:13:39 — text_chars=0 text_deltas=0
+	//   empty_deltas=8925 n_delta_events=8925 took=5m0.001s usage=&{0 0 0 0 0}。
+	//   8925 空 delta / 300s = 3/秒的 keepalive 速率，上游全程在线但模型挂了 5 分钟。
+	//   代理正确拦下所有空 delta，Codex 只收到 created + output_item.added + 5s 一次的
+	//   WS 心跳；300s 后收到合法 response.completed（空 content），判成功空回合。
+	//
+	// @RELATED: UPSTREAM_STALL_DETECT（line channel 静默判死，互补覆盖）、
+	//   WS_HEARTBEAT_INTERVAL（心跳节奏）、responses.rs:417-465（Codex 错误码映射）
+	//
+	// 阈值 noContentStallTimeout 是包级 var（见文件顶部），单测可覆盖。
+
+	// lastRealContentAt 是最后一次收到真实内容的时刻。text delta、reasoning delta、
+	// tool_call item 都会更新它；纯空 delta 不更新。用于 noContentStallTimeout 判死。
+	lastRealContentAt := time.Now()
 	createdSent := false
 	itemAdded := false
 	textDoneSent := false
@@ -2153,6 +2200,55 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			return
 		}
 		completedSent = true
+
+		// @AI_GUARD: RESPONSES_NO_CONTENT_STALL - 无真实内容超时改发 response.failed
+		// @CONSTRAINT: 命中条件必须同时满足「长时间无真实内容」+「上游确实在流」（nDeltaEvents > 0）
+		//   + 「完全零内容」（无正文、无 reasoning、无工具调用）。三者缺一即误判：
+		//   - 只有时间条件：正常长推理回合会被误杀
+		//   - 只有零内容条件：上游静默断连（ctx.Done / channel close）会被误发 failed
+		//   - 只有 nDeltaEvents > 0：正常的短回答也会命中
+		//   nDeltaEvents > 0 是关键——上游在流说明不是网络层断连，是模型层挂死。
+		// @CONSTRAINT: 必须发 **response.failed** 而非 response.completed + status:failed。
+		//   Codex 只对 response.failed 做 ApiError 映射（responses.rs:417）；response.completed
+		//   无论 status 是什么都走 Ok(ResponseEvent::Completed) → ThreadIdleCause::Completed
+		//   → 静默成功。error.code 用 "upstream_timeout"（不在 Codex 非重试白名单：
+		//   context_length_exceeded / insufficient_quota / usage_not_included / cyber_policy /
+		//   misalignment_policy_violation / invalid_prompt / bio_policy / server_is_overloaded /
+		//   rate_limit_exceeded），Codex 映射为 ApiError::Retryable，触发 stream_max_retries=5
+		//   的重试循环。
+		// @CONSTRAINT: 不发 output_item.done——Codex 的 response.failed 分支不校验前序事件，
+		//   直接返回 Err（responses.rs:465）；多余事件反而会让 Codex 状态机进入未定义状态。
+		// @RELATED: RESPONSES_EMPTY_DELTA_SHAPE（观测判据来源）、
+		//   UPSTREAM_STALL_DETECT（互补覆盖：line channel 静默 vs 无真实内容静默）、
+		//   responses.rs:417-465（Codex 错误码→ApiError 映射）
+		if time.Since(lastRealContentAt) > noContentStallTimeout &&
+			nDeltaEvents > 0 &&
+			accumulatedText.Len() == 0 &&
+			reasoningChars == 0 &&
+			len(funcCallOrder) == 0 {
+			errObj := map[string]interface{}{
+				"type":    "upstream_error",
+				"code":    "upstream_timeout",
+				"message": "upstream produced no content for 60s",
+			}
+			respPayload := map[string]interface{}{
+				"id":     responseID,
+				"status": "failed",
+				"error":  errObj,
+			}
+			if lastModel != "" {
+				respPayload["model"] = lastModel
+			}
+			sendSSE("response.failed", map[string]interface{}{
+				"type":     "response.failed",
+				"response": respPayload,
+			})
+			log.Printf("[CODEX-DEBUG] TranslateStream END(no-content-stall): model=%q took=%s n_delta_events=%d empty_deltas=%d text_chars=0 reasoning_chars=0 func_calls=0 idle_since_last_content=%s",
+				lastModel, time.Since(startedAt).Round(time.Millisecond), nDeltaEvents,
+				nEmptyDeltas, time.Since(lastRealContentAt).Round(time.Second))
+			sendDoneSSE()
+			return
+		}
 		finishReason := lastFinishReason
 		if finishReason == "" {
 			if len(funcCallOrder) > 0 {
@@ -2210,7 +2306,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
 			emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 			nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
-			respPayload["usage"], strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
+			usageForLog(respPayload["usage"]), strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
 
 		sendDoneSSE()
 	}
@@ -2328,11 +2424,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 
 					if text := extractTextDelta(event, &accumulatedText); text != "" {
 						sendTextDelta(text)
+						// 真实内容：重置 no-content stall 计时器
+						lastRealContentAt = time.Now()
 					}
 
 					for i, tc := range choice.Message.ToolCalls {
 						fc := getFC(tc, i)
 						sendOutputItemAddedEarly(fc)
+						// 模型决定调工具的瞬间也算真实内容
+						lastRealContentAt = time.Now()
 						if tc.Function.Arguments != "" {
 							sendFuncArgsDelta(fc, tc.Function.Arguments)
 							fc.argsBuffer.WriteString(tc.Function.Arguments)
@@ -2344,6 +2444,9 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				// 由 quick.go / gateway.go 的 OpenAI 兼容分支写入；只计数，绝不进正文。
 				if n := extractReasoningChars(event); n > 0 {
 					reasoningChars += n
+					// reasoning-only 模型（o1、DeepSeek R1）先思考后说话，几十秒只有
+					// reasoning 是正常形态；必须重置计时器，否则误杀长推理回合。
+					lastRealContentAt = time.Now()
 				}
 
 				// 不变量：n_delta_events - text_deltas == n_empty_deltas。
@@ -2371,11 +2474,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 						lastModel = event.Data.Model
 					}
 					if event.Data.Usage != nil {
-						lastUsage = &Usage{
-							InputTokens:  event.Data.Usage.PromptTokens,
-							OutputTokens: event.Data.Usage.CompletionTokens,
-							TotalTokens:  event.Data.Usage.TotalTokens,
-						}
+						lastUsage = responsesUsageFromInternal(event.Data.Usage)
 					}
 					if len(event.Data.Choices) > 0 {
 						choice := event.Data.Choices[0]
@@ -2385,11 +2484,15 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 							if text != "" {
 								sendTextDelta(text)
 								accumulatedText.WriteString(text)
+								// 真实内容：重置 no-content stall 计时器
+								lastRealContentAt = time.Now()
 							}
 						}
 						for i, tc := range choice.Message.ToolCalls {
 							fc := getFC(tc, i)
 							sendOutputItemAddedEarly(fc)
+							// 模型决定调工具的瞬间也算真实内容
+							lastRealContentAt = time.Now()
 							if tc.Function.Arguments != "" {
 								sendFuncArgsDelta(fc, tc.Function.Arguments)
 								fc.argsBuffer.WriteString(tc.Function.Arguments)
@@ -2423,11 +2526,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 						if ev.Data.Model != "" {
 							lastModel = ev.Data.Model
 						}
-						lastUsage = &Usage{
-							InputTokens:  ev.Data.Usage.PromptTokens,
-							OutputTokens: ev.Data.Usage.CompletionTokens,
-							TotalTokens:  ev.Data.Usage.TotalTokens,
-						}
+						lastUsage = responsesUsageFromInternal(ev.Data.Usage)
 					}
 				case <-time.After(doneUsageWait):
 				}
@@ -2449,11 +2548,7 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				// @CONSTRAINT: sendCompleted 的 completedSent 开关保证 response.completed 只发一次；
 				//   done 分支已发过时本分支是空操作，不会给 Codex 发第二个终态。
 				if event.Data != nil && event.Data.Usage != nil {
-					next := &Usage{
-						InputTokens:  event.Data.Usage.PromptTokens,
-						OutputTokens: event.Data.Usage.CompletionTokens,
-						TotalTokens:  event.Data.Usage.TotalTokens,
-					}
+					next := responsesUsageFromInternal(event.Data.Usage)
 					if lastModel != "" && event.Data.Model != "" {
 						lastModel = event.Data.Model
 					}
@@ -2845,14 +2940,7 @@ func (t *ResponsesTranslator) TranslateStreamEvent(event *StreamEvent) *schema.I
 		}
 
 	case "response.completed":
-		var usage *schema.InternalUsage
-		if data.Usage != nil {
-			usage = &schema.InternalUsage{
-				PromptTokens:     data.Usage.InputTokens,
-				CompletionTokens: data.Usage.OutputTokens,
-				TotalTokens:      data.Usage.TotalTokens,
-			}
-		}
+		usage := internalUsageFromResponses(data.Usage)
 		return &schema.InternalStreamEvent{
 			Type: "done",
 			Data: &schema.InternalStreamChunk{
@@ -3081,4 +3169,88 @@ func ToCCStreamChunk(chunk *schema.InternalStreamChunk) json.RawMessage {
 		"choices": choices,
 	})
 	return raw
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Usage 嵌套 *_tokens_details 双向映射
+//
+//  @AI_GUARD: RESPONSES_USAGE_DETAILS_NESTED - Codex 只读嵌套 details
+//  @CONSTRAINT: responsesUsageFromInternal 是「出站 Usage」的唯一构造函数。所有 lastUsage
+//    赋值点（case "done" / done 尾帧有界等待 / case "usage"）与非流式 TranslateResponse
+//    都必须走它，禁止内联手搓 &Usage{...}——内联版本一旦漏写嵌套字段，Codex 侧
+//    cached / cache_write / reasoning 恒为 0，且解析不失败（usage 三键齐全），纯静默丢失。
+//  @CONSTRAINT: details 为 nil 时必须省略，不发 {"cached_tokens":0,...}。该对象是 Option
+//    语义，发空对象等于「上游明确声明无缓存」，比缺字段更容易被下游误读。
+//  @REASON: v0.2.148 及之前代理只写顶层 cache_creation_input_tokens / cache_read_input_tokens，
+//    Codex 的 serde 模型只认 usage.input_tokens_details.cached_tokens 与
+//    usage.output_tokens_details.reasoning_tokens，顶层键被静默忽略。
+//  @RELATED: types.go Usage/InputTokensDetails/OutputTokensDetails、
+//    schema/internal.go InternalUsage、chatcompletion/translator.go ToInternalUsage、
+//    server/gateway.go chatCompletionToInternal + mapInternalUsage
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// usageForLog 把出站 usage 压成单行可 grep 的形态。
+// 带 nested details 后 %v 打印的是 *Usage 指针（&{... 0xc00... 0xc00...}），
+// cache / reasoning 数字在日志里不可读——而「日志里读不到」正是本 bug 长期潜伏的前提。
+func usageForLog(v interface{}) string {
+	u, ok := v.(*Usage)
+	if !ok || u == nil {
+		return "nil"
+	}
+	b := fmt.Sprintf("%d/%d/%d", u.InputTokens, u.OutputTokens, u.TotalTokens)
+	if d := u.InputTokensDetails; d != nil {
+		b += fmt.Sprintf(" cached=%d cache_write=%d", d.CachedTokens, d.CacheWriteTokens)
+	}
+	if d := u.OutputTokensDetails; d != nil {
+		b += fmt.Sprintf(" reasoning=%d", d.ReasoningTokens)
+	}
+	return b
+}
+
+// responsesUsageFromInternal 中枢 InternalUsage → 出站 Responses Usage（带嵌套 details）。
+func responsesUsageFromInternal(u *schema.InternalUsage) *Usage {
+	if u == nil {
+		return nil
+	}
+	out := &Usage{
+		InputTokens:         u.PromptTokens,
+		OutputTokens:        u.CompletionTokens,
+		TotalTokens:         u.TotalTokens,
+		CacheCreationTokens: u.CacheWriteTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+	}
+	if u.CacheReadTokens != 0 || u.CacheWriteTokens != 0 {
+		out.InputTokensDetails = &InputTokensDetails{
+			CachedTokens:     u.CacheReadTokens,
+			CacheWriteTokens: u.CacheWriteTokens,
+		}
+	}
+	if u.ReasoningTokens != 0 {
+		out.OutputTokensDetails = &OutputTokensDetails{ReasoningTokens: u.ReasoningTokens}
+	}
+	return out
+}
+
+// internalUsageFromResponses 入站/上游 Responses Usage → 中枢 InternalUsage。
+// 嵌套 *_tokens_details 优先，旧格式顶层键兜底。
+func internalUsageFromResponses(u *Usage) *schema.InternalUsage {
+	if u == nil {
+		return nil
+	}
+	iu := &schema.InternalUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if d := u.InputTokensDetails; d != nil {
+		iu.CacheReadTokens = d.CachedTokens
+		iu.CacheWriteTokens = d.CacheWriteTokens
+	} else {
+		iu.CacheReadTokens = u.CacheReadTokens
+		iu.CacheWriteTokens = u.CacheCreationTokens
+	}
+	if d := u.OutputTokensDetails; d != nil {
+		iu.ReasoningTokens = d.ReasoningTokens
+	}
+	return iu
 }

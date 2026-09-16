@@ -88,21 +88,28 @@ const upstreamStallTimeout = 60 * time.Second
 // nonStreamCallTimeout 是非流式 p.Call 的硬超时上限（与 upstreamStallTimeout 同值、不同语义）。
 // @AI_GUARD: NONSTREAM_CALL_TIMEOUT - 非流式 p.Call 必须有界，不能只靠 q.timeout（默认 300s）兜底
 // @CONSTRAINT: 非流式调用期间上游**全程零字节**——headers 要等完整 JSON 生成完才回。流式路径的
-//   idle 判据（stallTimeoutChan 包装 line channel）在这里不适用：没有 line，只有一个阻塞读。
-//   所以只能把 ctx 超时压到本常量，60s 静默即判死，语义与 UPSTREAM_STALL_DETECT 的 60s 一致。
+//
+//	idle 判据（stallTimeoutChan 包装 line channel）在这里不适用：没有 line，只有一个阻塞读。
+//	所以只能把 ctx 超时压到本常量，60s 静默即判死，语义与 UPSTREAM_STALL_DETECT 的 60s 一致。
+//
 // @REASON: agent-proxy-9091.log v0.2.146 — 14:42:35 翻译路径大请求（downstream 215939 bytes）
-//   被 LARGE_BODY_SKIP_STREAM_TRANSLATION 降级到 handleNonStreamResponseAsSSE，该函数当时只有
-//   context.WithTimeout(ctx, q.timeout)，无 idle 检测。上游沉默，代理发出 600 个心跳、5 分钟零内容，
-//   14:47:35 才以 context deadline exceeded 收尾（[upstream] Call glm-5.2 → 5m0.000473289s）。
-//   同一台代理同一次运行里，14:42:34 的流式请求 15.005s 就返回 3405 字符。
-//   实测对照（2026-09-15，token.sensenova.cn 直连 glm-5.2，Codex 同形负载）：
-//   118KB 非流式 6.55s / 7.60s 两次；799KB 流式 first_byte 27.01s、36.90s 完整返回。
-//   即：大请求两种模式都能完成，且非流式明显更快。挂死是上游偶发行为，v0.2.144 的 502 也是
-//   同一批偶发故障的另一种表现——降级路由规避不了它，只能靠本超时有界收尾。
+//
+//	被 LARGE_BODY_SKIP_STREAM_TRANSLATION 降级到 handleNonStreamResponseAsSSE，该函数当时只有
+//	context.WithTimeout(ctx, q.timeout)，无 idle 检测。上游沉默，代理发出 600 个心跳、5 分钟零内容，
+//	14:47:35 才以 context deadline exceeded 收尾（[upstream] Call glm-5.2 → 5m0.000473289s）。
+//	同一台代理同一次运行里，14:42:34 的流式请求 15.005s 就返回 3405 字符。
+//	实测对照（2026-09-15，token.sensenova.cn 直连 glm-5.2，Codex 同形负载）：
+//	118KB 非流式 6.55s / 7.60s 两次；799KB 流式 first_byte 27.01s、36.90s 完整返回。
+//	即：大请求两种模式都能完成，且非流式明显更快。挂死是上游偶发行为，v0.2.144 的 502 也是
+//	同一批偶发故障的另一种表现——降级路由规避不了它，只能靠本超时有界收尾。
+//
 // @CONSTRAINT: 取 60s 而非 30s：实测感诺 118KB 非流式 ~7.6s、799KB 流式 first_byte 27s，
-//   60s 覆盖最慢观测值的 2 倍以上，只杀真正的挂死。取 300s 就是回归本 bug。
+//
+//	60s 覆盖最慢观测值的 2 倍以上，只杀真正的挂死。取 300s 就是回归本 bug。
+//
 // @RELATED: UPSTREAM_STALL_DETECT（流式路径的 idle 判据）、LARGE_BODY_SKIP_STREAM_TRANSLATION、
-//   handleNonStreamResponseAsSSE、handlePassthroughNonStreamAsSSE
+//
+//	handleNonStreamResponseAsSSE、handlePassthroughNonStreamAsSSE
 const nonStreamCallTimeout = 60 * time.Second
 
 // stallTimeoutChan 包装上游 SSE 行 channel：连续 idle 超过 d 就关闭输出 channel。
@@ -2660,6 +2667,22 @@ func writeNonStreamAsSSE(w http.ResponseWriter, flusher http.Flusher, respBody [
 			usageMap["input_tokens"] = usage.PromptTokens
 			usageMap["output_tokens"] = usage.CompletionTokens
 			usageMap["total_tokens"] = usage.TotalTokens
+			// @AI_GUARD: NONSTREAM_A2S_USAGE_DETAILS - 嵌套 details 必须与原生流式路径
+			//   形状一致（见 responses/translator.go responsesUsageFromInternal）。Codex 只读
+			//   usage.input_tokens_details.* / output_tokens_details.*，这里只写三键会让本路径
+			//   的 cached / reasoning 恒为 0，且解析不失败（usage 三键齐全）。details 为 nil
+			//   时必须省略：空对象等于「明确无缓存」，比缺字段更易被误读。
+			if usage.CacheReadTokens != 0 || usage.CacheWriteTokens != 0 {
+				usageMap["input_tokens_details"] = map[string]any{
+					"cached_tokens":      usage.CacheReadTokens,
+					"cache_write_tokens": usage.CacheWriteTokens,
+				}
+			}
+			if usage.ReasoningTokens != 0 {
+				usageMap["output_tokens_details"] = map[string]any{
+					"reasoning_tokens": usage.ReasoningTokens,
+				}
+			}
 		}
 		if !writeResponseEvent("response.completed", map[string]interface{}{
 			"response": map[string]interface{}{
@@ -3324,9 +3347,9 @@ func (q *QuickGateway) handleStreamRequest(p provider.Provider, ctx context.Cont
 						events <- schema.InternalStreamEvent{
 							Type: "usage",
 							Data: &schema.InternalStreamChunk{
-								ID:      ccChunk.ID,
-								Model:   usageModel,
-								Usage:   mapInternalUsage(ccChunk.Usage),
+								ID:    ccChunk.ID,
+								Model: usageModel,
+								Usage: mapInternalUsage(ccChunk.Usage),
 							},
 						}
 						accumulatedUsage = mapInternalUsage(ccChunk.Usage)
@@ -3968,6 +3991,21 @@ func (q *QuickGateway) logRequest(vctx verboseCtx, startTime time.Time, status i
 		if usage != nil {
 			usageStr = fmt.Sprintf("prompt=%d, completion=%d, total=%d",
 				usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+			// @AI_GUARD: USAGE_LOG_CACHE_REASONING - cache / reasoning 必须进 -v 日志
+			// @REASON: 这两笔数字在 v0.2.148 之前恒为 0，而唯一能观测到它们的 END 日志
+			//   只打印 %v(*Usage)——新增嵌套指针字段后数字在日志里彻底不可读，
+			//   「日志里读不到」正是该 bug 长期潜伏的前提。
+			extra := ""
+			if usage.CacheReadTokens != 0 {
+				extra += fmt.Sprintf(", cached=%d", usage.CacheReadTokens)
+			}
+			if usage.CacheWriteTokens != 0 {
+				extra += fmt.Sprintf(", cache_write=%d", usage.CacheWriteTokens)
+			}
+			if usage.ReasoningTokens != 0 {
+				extra += fmt.Sprintf(", reasoning=%d", usage.ReasoningTokens)
+			}
+			usageStr += extra
 		}
 		fmt.Printf("[请求 %s] 上游: %s  |  协议: %s → %s  |  模型: %s  |  状态: %d  |  耗时: %dms  |  Token: %s\n",
 			vctx.clientIP, vctx.upstream, ingressName, vctx.providerType, vctx.model, status, latency, usageStr)
@@ -4035,6 +4073,26 @@ func extractUsage(resp []byte) *schema.InternalUsage {
 	if v, ok := usageMap["total_tokens"].(float64); ok {
 		usage.TotalTokens = int(v)
 		foundAny = true
+	}
+	// OpenAI 系嵌套格式：cache / reasoning 统计量的唯一权威位置。
+	// @AI_GUARD: USAGE_EXTRACT_DETAILS - 只读顶层 cache_creation/cache_read 会漏掉
+	//   OpenAI 官方格式（prompt_tokens_details / completion_tokens_details），而嵌套字段是
+	//   Codex 唯一读的形态，日志与出站都会拿到 0。嵌套优先，顶层兜底。
+	if d, ok := usageMap["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := d["cached_tokens"].(float64); ok {
+			usage.CacheReadTokens = int(v)
+			foundAny = true
+		}
+		if v, ok := d["cache_write_tokens"].(float64); ok {
+			usage.CacheWriteTokens = int(v)
+			foundAny = true
+		}
+	}
+	if d, ok := usageMap["completion_tokens_details"].(map[string]any); ok {
+		if v, ok := d["reasoning_tokens"].(float64); ok {
+			usage.ReasoningTokens = int(v)
+			foundAny = true
+		}
 	}
 	if v, ok := usageMap["cache_creation_input_tokens"].(float64); ok {
 		usage.CacheCreationTokens = int(v)
@@ -4844,16 +4902,21 @@ const defaultMaxBodyBytes = 16 << 20
 //
 // @AI_GUARD: INBOUND_BODY_LIMIT - 入站 HTTPS 请求体上限
 // @CONSTRAINT: 必须与 WS 路径的 qwsMaxPayload / wsMaxPayload（64MiB）区分开，
-//   这是两条独立的上限：handleResponsesWebSocket 绕过 readBody，
-//   所以同一条请求走 WS 能过、走 HTTPS 会 413，排查「随机 413」先看请求走了哪条路。
+//
+//	这是两条独立的上限：handleResponsesWebSocket 绕过 readBody，
+//	所以同一条请求走 WS 能过、走 HTTPS 会 413，排查「随机 413」先看请求走了哪条路。
+//
 // @CONSTRAINT: 只允许在启动阶段调用 SetMaxBodyBytes，禁止在请求处理路径里改，
-//   否则并发的 readBody 会读到不同的值。
+//
+//	否则并发的 readBody 会读到不同的值。
+//
 // @REASON: 这里曾是 1<<20。Codex 每轮全量重发历史（不发 previous_response_id），
-//   请求体单调增长，v0.2.142 生产环境 09-14 15 时打出 58 次
-//   413 "got 1196624 bytes, limit 1048576"——非瞬时错误，5 次重试全失败，
-//   turn 彻底停住。这是「Codex 停住」的直接原因，与代理的转换逻辑无关。
-//   16MiB 给 13 倍余量；实测历史到 1.19MiB 时模型仍在工作，上限应覆盖
-//   正常会话长度而非贴住它。
+//
+//	请求体单调增长，v0.2.142 生产环境 09-14 15 时打出 58 次
+//	413 "got 1196624 bytes, limit 1048576"——非瞬时错误，5 次重试全失败，
+//	turn 彻底停住。这是「Codex 停住」的直接原因，与代理的转换逻辑无关。
+//	16MiB 给 13 倍余量；实测历史到 1.19MiB 时模型仍在工作，上限应覆盖
+//	正常会话长度而非贴住它。
 var maxBodyBytes = defaultMaxBodyBytes
 
 // SetMaxBodyBytes 设定入站请求体上限（字节）。n<=0 时回落到默认值。

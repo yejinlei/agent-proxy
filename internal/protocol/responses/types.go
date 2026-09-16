@@ -108,7 +108,7 @@ type InputItem struct {
 	//   否则入站侧只能靠 Content 里的 tool_calls/tool_result 兜底，客户端用标准 item 时上下文全丢。
 	// @REASON: v0.2.119 — 原先整个非 "message" item 被 inputToMessages 丢弃（26→18 条），
 	//   Codex 工具调用结果回灌历史时模型看不到真实输出，只能顺着幻觉编内容。
-	CallID    string         `json:"call_id,omitempty"`
+	CallID string `json:"call_id,omitempty"`
 	// Namespace 是命名空间工具调用的命名空间名（codex protocol/models.rs FunctionCall{
 	// namespace: Option<String>}，见 function_call_deserializes_optional_namespace）。
 	// @AI_GUARD: RESPONSES_NAMESPACE_TOOL - 入站必须读出来，否则下一轮出站无法还原
@@ -236,12 +236,38 @@ type ContentBlock struct {
 	ToolUseID string `json:"tool_call_id,omitempty"` // tool_result 引用
 }
 
+// @AI_GUARD: RESPONSES_USAGE_DETAILS_NESTED - Codex 只认嵌套的 *_tokens_details 字段
+// @CONSTRAINT: cached_tokens / cache_write_tokens / reasoning_tokens 必须写在嵌套对象里。
+//
+//	Codex 侧读 usage.input_tokens_details.cached_tokens / .cache_write_tokens 与
+//	usage.output_tokens_details.reasoning_tokens；顶层 cache_creation_input_tokens /
+//	cache_read_input_tokens 它完全不读（serde 反序列化时忽略未知字段，静默为 0）。
+//	顶层字段保留是因为它们不影响 Codex 解析，其他 OpenAI 兼容客户端仍可能读。
+//	details 为 nil 时禁止发出空对象 {}：Codex 按 Option<TokenDetails> 解析，缺字段即 None，
+//	发 {} 会解析成功但全为 0，语义上等于「明确没缓存」，比缺字段更容易被误读。
+//
+// @REASON: v0.2.148 前代理只发顶层字段，Codex 全程拿到 cached=0；解析不失败（三个必需键齐全），
+//
+//	所以是纯静默丢失，日志里看不出来。
 type Usage struct {
-	InputTokens         int `json:"input_tokens"`
-	OutputTokens        int `json:"output_tokens"`
-	TotalTokens         int `json:"total_tokens"`
-	CacheCreationTokens int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadTokens     int `json:"cache_read_input_tokens,omitempty"`
+	InputTokens         int                  `json:"input_tokens"`
+	OutputTokens        int                  `json:"output_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	CacheCreationTokens int                  `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadTokens     int                  `json:"cache_read_input_tokens,omitempty"`
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
+}
+
+// InputTokensDetails 对应 Codex 读的 usage.input_tokens_details
+type InputTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+// OutputTokensDetails 对应 Codex 读的 usage.output_tokens_details
+type OutputTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // StreamEvent Responses API 流式事件

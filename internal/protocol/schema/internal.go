@@ -75,8 +75,8 @@ type InternalMessage struct {
 	// 但下一轮出站时要用它把「上一轮 assistant 的展平调用」还原成带 namespace 的 function_call。
 	// @AI_GUARD: INTERNAL_MESSAGE_TOOL_NAMESPACE - 见 responses/namespace_tool.go
 	ToolCallNamespace string                 `json:"-"`
-	Name          string                 `json:"name,omitempty"`
-	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	Name              string                 `json:"name,omitempty"`
+	Metadata          map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // @AI_GUARD: INTERNAL_CONTENT_BLOCK - 多模态内容块，各协议图片/文件格式差异的汇聚点
@@ -178,8 +178,8 @@ type InternalFunction struct {
 }
 
 type InternalToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
+	ID   string `json:"id"`
+	Type string `json:"type"`
 	// Namespace 是 Responses 的命名空间工具调用的命名空间名（Codex MCP 工具）。
 	// 非空时出站必须写 function_call + namespace 字段；为 CC 上游展平时工具名要换成
 	// <namespace>_<toolname>，还原由 server 侧按下一次工具定义表完成（见 namespace_tool.go）。
@@ -309,17 +309,32 @@ type InternalChoice struct {
 // Usage 字段差异：
 //
 //	CC:        prompt_tokens, completion_tokens, total_tokens
-//	Responses: input_tokens, output_tokens, total_tokens (+ cache_creation/read)
+//	          (+ 嵌套 prompt_tokens_details / completion_tokens_details)
+//	Responses: input_tokens, output_tokens, total_tokens (+ 嵌套 *_tokens_details)
 //	Anthropic: input_tokens, output_tokens, total_tokens
+//	          (+ cache_creation_input_tokens / cache_read_input_tokens 顶层)
 //	Gemini:    prompt_token_count, candidates_token_count, total_token_count
 //
 // 统一策略：用通用字段名，翻译器做字段名映射
+//
+// @AI_GUARD: INTERNAL_USAGE_CACHE_REASONING - cache / reasoning 统计量的中枢承载
+// @CONSTRAINT: 四个平铺字段（CacheCreationTokens / CacheReadTokens / CacheWriteTokens /
+//
+//	ReasoningTokens）语义互不相同，禁止互相顶替。缓存写入与缓存读取是两笔独立记账，
+//	OpenAI 系上游放在 usage.prompt_tokens_details.cache_write_tokens / .cached_tokens；
+//	Anthropic 系上游放在 usage.cache_creation_input_tokens / .cache_read_input_tokens。
+//	各协议翻译器负责归一到这四个字段，出站翻译器负责按目标协议还原位置。
+//	ReasoningTokens 同理来自 usage.completion_tokens_details.reasoning_tokens。
+//	字段增删必须同步所有协议翻译器的 TranslateFromProvider / TranslateResponse /
+//	TranslateStreamEvent，漏一处就是该协议静默丢失（出站 omitempty 不报 400，Codex 读不到即 0）。
 type InternalUsage struct {
 	PromptTokens        int `json:"prompt_tokens"`
 	CompletionTokens    int `json:"completion_tokens"`
 	TotalTokens         int `json:"total_tokens"`
-	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"` // Responses 特有
-	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`     // Responses 特有
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens    int `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens     int `json:"reasoning_tokens,omitempty"`
 }
 
 // @AI_GUARD: INTERNAL_STREAM_EVENT - 流式事件，所有协议流式翻译的中转结构

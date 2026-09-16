@@ -330,6 +330,7 @@ func buildCCStreamChunk(chunk *schema.InternalStreamChunk) *ChatCompletionStream
 		usage.PromptTokens = chunk.Usage.PromptTokens
 		usage.CompletionTokens = chunk.Usage.CompletionTokens
 		usage.TotalTokens = chunk.Usage.TotalTokens
+		usage.PromptTokensDetails, usage.CompletionTokensDetails = detailsFromInternal(chunk.Usage)
 	}
 	return &ChatCompletionStreamChunk{
 		ID:      chunk.ID,
@@ -394,10 +395,13 @@ func InternalToCCResponse(resp *schema.InternalResponse) *ChatCompletionResponse
 	}
 
 	if resp.Usage != nil {
+		ptd, ctd := detailsFromInternal(resp.Usage)
 		ccResp.Usage = &Usage{
-			PromptTokens:     resp.Usage.PromptTokens,
-			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:      resp.Usage.TotalTokens,
+			PromptTokens:            resp.Usage.PromptTokens,
+			CompletionTokens:        resp.Usage.CompletionTokens,
+			TotalTokens:             resp.Usage.TotalTokens,
+			PromptTokensDetails:     ptd,
+			CompletionTokensDetails: ctd,
 		}
 	}
 
@@ -459,4 +463,74 @@ func buildCCResponseContentBlocks(blocks []schema.InternalContentBlock) []map[st
 		}
 	}
 	return ccBlocks
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Usage 嵌套 details 归一化
+//
+//  @AI_GUARD: CC_USAGE_DETAILS_MAPPING - cache / reasoning 统计量的双向映射
+//  @CONSTRAINT: ToInternalUsage 必须同时读「嵌套 *_tokens_details」和「旧格式顶层键」，
+//    嵌套优先。OpenAI 官方格式把 cached / cache_write / reasoning 放在嵌套对象里，
+//    Codex 也只读嵌套；部分上游仍发顶层 cache_creation_input_tokens / cache_read_input_tokens。
+//    只读一边，另一边就会静默丢（omitempty 不报 400）。
+//  @CONSTRAINT: detailsFromInternal 只在上游至少有一项非零时返回非 nil 指针。
+//    details 是 Option 语义：发 {"cached_tokens":0,"cache_write_tokens":0} 等于
+//    「明确声明无缓存」，比缺字段更容易被下游误读成「上游不支持缓存」。
+//  @REASON: v0.2.148 前代理只透传/生成顶层键，Codex 全程读到 cached=0，且解析不失败
+//    （usage 三个必需键齐全），所以是纯静默丢失，代理日志里完全看不出来。
+//  @RELATED: protocol/responses/types.go Usage、schema/internal.go InternalUsage、
+//    server/gateway.go mapInternalUsage、protocol/anthropic/translator.go TranslateFromProvider
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ToInternalUsage 将 CC Usage（上游格式）归一为中枢 InternalUsage。
+//
+// 包外可见：server/gateway.go 的 chatCompletionToInternal（非流式）与 mapInternalUsage
+// （流式 usage-only 尾帧）共用这一份映射，避免「非流式修了、流式没修」的单向回归。
+// 嵌套 *_tokens_details 优先，旧格式顶层键兜底。
+func ToInternalUsage(u *Usage) *schema.InternalUsage {
+	if u == nil {
+		return nil
+	}
+	iu := &schema.InternalUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if d := u.PromptTokensDetails; d != nil {
+		iu.CacheReadTokens = d.CachedTokens
+		iu.CacheWriteTokens = d.CacheWriteTokens
+	}
+	if d := u.CompletionTokensDetails; d != nil {
+		iu.ReasoningTokens = d.ReasoningTokens
+	}
+	// 嵌套缺失时退回旧格式顶层键（部分上游仍在发）
+	if u.PromptTokensDetails == nil {
+		if u.CacheReadTokens > 0 {
+			iu.CacheReadTokens = u.CacheReadTokens
+		}
+		if u.CacheCreationTokens > 0 {
+			iu.CacheWriteTokens = u.CacheCreationTokens
+		}
+	}
+	return iu
+}
+
+// detailsFromInternal 将中枢 InternalUsage 还原为 CC 的嵌套 *_tokens_details。
+// 全部为零时返回 (nil, nil)，保持 Option 语义。
+func detailsFromInternal(u *schema.InternalUsage) (*PromptTokensDetails, *CompletionTokensDetails) {
+	if u == nil {
+		return nil, nil
+	}
+	var prompt *PromptTokensDetails
+	if u.CacheReadTokens != 0 || u.CacheWriteTokens != 0 {
+		prompt = &PromptTokensDetails{
+			CachedTokens:     u.CacheReadTokens,
+			CacheWriteTokens: u.CacheWriteTokens,
+		}
+	}
+	var completion *CompletionTokensDetails
+	if u.ReasoningTokens != 0 {
+		completion = &CompletionTokensDetails{ReasoningTokens: u.ReasoningTokens}
+	}
+	return prompt, completion
 }

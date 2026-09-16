@@ -119,10 +119,34 @@ type CCMessage struct {
 	Name       string     `json:"name,omitempty"`
 }
 
+// @AI_GUARD: CC_USAGE_DETAILS - 上游 cache / reasoning 统计量在嵌套 *_tokens_details 里
+// @CONSTRAINT: 读 cached / cache_write / reasoning 必须走嵌套对象（OpenAI 2024-10 起格式）。
+//
+//	旧的顶层 cache_creation_input_tokens / cache_read_input_tokens 部分上游仍在发，
+//	但 OpenAI 官方客户端（含 Codex）只认嵌套形式，读顶层等于永远读到 0。
+//	两处解析路径都要用这个结构：非流式 ChatCompletionResponse.Usage、流式
+//	ChatCompletionStreamChunk.Usage（感诺把 stream_options.include_usage 的统计量放在
+//	choices:[] 的独立尾帧里，同样走本结构）。
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// 旧格式顶层键（仍可能有上游在发，与嵌套字段互补读取，不是替代品）
+	CacheCreationTokens     int                      `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadTokens         int                      `json:"cache_read_input_tokens,omitempty"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails 上游 usage.prompt_tokens_details（Codex 只读这里）
+type PromptTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+// CompletionTokensDetails 上游 usage.completion_tokens_details（Codex 只读这里）
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // ChatCompletionStreamChunk 流式块

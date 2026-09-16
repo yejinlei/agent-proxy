@@ -1809,14 +1809,9 @@ func chatCompletionToInternal(ccResp *chatcompletion.ChatCompletionResponse) *sc
 		})
 	}
 
-	var usage *schema.InternalUsage
-	if ccResp.Usage != nil {
-		usage = &schema.InternalUsage{
-			PromptTokens:     ccResp.Usage.PromptTokens,
-			CompletionTokens: ccResp.Usage.CompletionTokens,
-			TotalTokens:      ccResp.Usage.TotalTokens,
-		}
-	}
+	// 走 chatcompletion.ToInternalUsage：cache / reasoning 的嵌套 *_tokens_details
+	// 在这里归一到中枢字段，禁止内联只抄三个总数（否则 Codex 读到 cached=0）。
+	usage := chatcompletion.ToInternalUsage(ccResp.Usage)
 
 	return &schema.InternalResponse{
 		ID:      ccResp.ID,
@@ -1843,16 +1838,20 @@ func (g *Gateway) sendError(w http.ResponseWriter, protocol string, code int, er
 	w.Write(data)
 }
 
-// mapInternalUsage 将 CC Usage 映射为 InternalUsage
+// mapInternalUsage 将 CC Usage 映射为中枢 InternalUsage。
+//
+// @AI_GUARD: CC_USAGE_DETAILS_STREAM - 流式 usage 的嵌套 details 也必须归一
+// @CONSTRAINT: 必须委托 chatcompletion.ToInternalUsage，不能内联只抄三个总数。
+//
+//	流式路径的 usage 唯一来源是 choices:[] 的独立尾帧，该尾帧带
+//	usage.prompt_tokens_details / completion_tokens_details；内联映射会把这些嵌套
+//	字段静默丢掉，Codex 侧 cached / reasoning 恒为 0，且解析不报错（usage 三键齐全）。
+//
+// @RELATED: chatCompletionToInternal（非流式，同一函数），
+//
+//	protocol/chatcompletion/translator.go ToInternalUsage
 func mapInternalUsage(u *chatcompletion.Usage) *schema.InternalUsage {
-	if u == nil {
-		return nil
-	}
-	return &schema.InternalUsage{
-		PromptTokens:     u.PromptTokens,
-		CompletionTokens: u.CompletionTokens,
-		TotalTokens:      u.TotalTokens,
-	}
+	return chatcompletion.ToInternalUsage(u)
 }
 
 // recordRequest 记录请求到监控
