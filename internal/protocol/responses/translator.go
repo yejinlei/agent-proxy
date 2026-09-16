@@ -888,6 +888,7 @@ func detectToolCallInText(text string) string {
 		{"<parameter>", "anthropic parameter 裸标签"},
 		{"<parameter=", "anthropic parameter 等号式标签"},
 		{"antml:", "anthropic 工具语法前缀"},
+		{"arg_value", "o1 XML 风格参数值"},
 	}
 	var hits []string
 	for _, t := range tokens {
@@ -899,6 +900,108 @@ func detectToolCallInText(text string) string {
 		}
 	}
 	return strings.Join(hits, " | ")
+}
+
+// extractLeakedToolNames 从探测窗口里提取被泄漏的具体工具名，纯观测、不改行为。
+// 只用于 END 日志的 leaked_tools=[...] 字段；未识别就返回空列表，让 toolcall_in_text
+// 里的上下文窗口承担兜底说明。
+// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 本函数与 detectToolCallInText 同属纯观测通道，
+// 禁止据此生成 function_call item 或改写 response.output。
+// @REASON: v0.2.149 生产日志 3 次泄漏分别以三种语法写出（Claude Code tool_call / o1 反引号 /
+// o1 XML），toolcall_in_text 只给描述串和 80 字符上下文，肉眼要翻上下文才能看出模型想调什么；
+// 加 leaked_tools=[...] 后 grep 一行即可定位到具体工具名。
+func extractLeakedToolNames(text string) []string {
+	if len(text)==0 {
+		return nil
+	}
+	probe:=text
+	if len(probe)>1500 {
+		probe=probe[len(probe)-1500:]
+	}
+	var names []string
+	seen:=make(map[string]bool)
+	add:=func(name string) {
+		if name=="" || len(name)>128 || seen[name] {
+			return
+		}
+		seen[name]=true
+		names=append(names,name)
+	}
+
+	// Codex: <tool_call>NAME / <tool_call>`NAME` / <tool_call>"NAME"
+	for rest:=probe; ; {
+		i:=strings.Index(rest,"<tool_call>")
+		if i<0 {
+			break
+		}
+		tail:=rest[i+len("<tool_call>"):]
+		if len(tail)==0 {
+			break
+		}
+		if tail[0]=='"' || tail[0]=='`' {
+			end:=strings.IndexByte(tail[1:],tail[0])
+			if end>=0 {
+				add(tail[1:1+end])
+			}
+		} else {
+			j:=0
+			for j<len(tail) && (tail[j]==' ' || tail[j]=='\n' || tail[j]=='\t' ){
+				j++
+			}
+			end:=j
+			for end<len(tail) && (tail[end]!='<' && tail[end]!='>' && tail[end]!='"' && tail[end]!='\'' && tail[end]!='`' && tail[end]!=' ' && tail[end]!='\n' && tail[end]!='\t' && tail[end]!=')' && tail[end]!=']'){
+				end++
+			}
+			if end>j {
+				add(tail[j:end])
+			}
+		}
+		rest=tail
+	}
+
+	// o1 XML: <arg_value>NAME</arg_value>
+	for rest:=probe; ; {
+		i:=strings.Index(rest,"<arg_value>")
+		if i<0 {
+			break
+		}
+		tail:=rest[i+len("<arg_value>"):]
+		end:=strings.Index(tail,"</arg_value>")
+		if end>=0 {
+			add(tail[:end])
+		}
+		rest=tail
+	}
+
+	// Anthropic: <tool_use name="X"> — 工具名只在 name 属性里，<parameter> 里的
+	// 是参数名（command / arg_key），不是工具名，必须跳过。
+	for rest:=probe; ; {
+		i:=strings.Index(rest,"<tool_use")
+		if i<0 {
+			break
+		}
+		tail:=rest[i+len("<tool_use"):]
+		if len(tail)>0 && tail[0]!=' ' && tail[0]!='>' {
+			rest=rest[i+1:]
+			continue
+		}
+		ge:=strings.IndexByte(tail,'>')
+		if ge<0 {
+			break
+		}
+		tagBody:=tail[:ge]
+		nq:=strings.Index(tagBody,"name=\"")
+		if nq>=0 {
+			val:=tagBody[nq+len("name=\""):]
+			end:=strings.IndexByte(val,'"')
+			if end>=0 {
+				add(val[:end])
+			}
+		}
+		rest=tail[ge+1:]
+	}
+
+	return names
 }
 
 // digestCallID 空 call_id 会被 itemToMessage 现场合成，与历史里任何
@@ -2302,11 +2405,12 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 		//   这个字段是"模型为什么不再调工具"的唯一线索。命中即说明上游把工具调用写成了
 		//   纯文本（Anthropic </tool_use>/<parameter> 语法，或 Codex 原生 <tool_call>/<parameter=command>）；两种语法都只检测开标签，CC 翻译器只能原样透传。
 		injected := detectToolCallInText(endedText)
-		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d ns_tools=%d ns_calls=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q tail=%q",
+		leakedTools := extractLeakedToolNames(endedText)
+		log.Printf("[CODEX-DEBUG] TranslateStream END: model=%q finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d fc_args_deltas=%d ns_tools=%d ns_calls=%d took=%s usage=%v fcs=[%s] toolcall_in_text=%q leaked_tools=[%s] tail=%q",
 			lastModel, finishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
 			emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 			nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
-			usageForLog(respPayload["usage"]), strings.Join(fcDesc, " "), injected, responsesLogTail(endedText))
+			usageForLog(respPayload["usage"]), strings.Join(fcDesc, " "), injected, strings.Join(leakedTools, ","), responsesLogTail(endedText))
 
 		sendDoneSSE()
 	}
@@ -2396,12 +2500,12 @@ func (t *ResponsesTranslator) TranslateStream(ctx context.Context, events <-chan
 				})
 				// @AI_GUARD: RESPONSES_TOOLCALL_IN_TEXT - 错误路径同样检测，保证正常/失败两条
 				//   汇总日志字段一致，grep 时不需要按路径分开处理。
-				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d ns_tools=%d ns_calls=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q tail=%q",
+				log.Printf("[CODEX-DEBUG] TranslateStream END(err): model=%q status=failed finish_reason=%q text_chars=%d text_deltas=%d empty_deltas=%d reasoning_chars=%d delta_shapes=%q func_calls=%d n_delta_events=%d n_funcargs_deltas=%d ns_tools=%d ns_calls=%d took=%s http=%d upstream_type=%q upstream_msg=%.200s toolcall_in_text=%q leaked_tools=[%s] tail=%q",
 					lastModel, errFinishReason, accumulatedText.Len(), nTextDeltas, nEmptyDeltas, reasoningChars,
 					emptyDeltaShapeSummary(emptyDeltaShapeCounts), len(funcCallOrder),
 					nDeltaEvents, nFuncArgsDeltas, len(nsNames), nNamespaceCalls, time.Since(startedAt).Round(time.Millisecond),
 					event.Error.Code, event.Error.Type, event.Error.Message,
-					detectToolCallInText(accumulatedText.String()), responsesLogTail(accumulatedText.String()))
+					detectToolCallInText(accumulatedText.String()), strings.Join(extractLeakedToolNames(accumulatedText.String()), ","), responsesLogTail(accumulatedText.String()))
 				sendDoneSSE()
 				return
 
